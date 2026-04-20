@@ -236,6 +236,8 @@ def build_resume_cmd(argv0, args, src, dst, offset, block_count=None):
         parts.append('-N')
     if args.allow_smaller:
         parts.append('--allow-smaller')
+    if args.reread:
+        parts.append('--reread')
     bc = args.block_count if block_count is None else block_count
     if bc:
         parts += ['-n', str(bc)]
@@ -266,7 +268,7 @@ def build_ssh_cmd(remote_host, args):
 
 def do_sync(local_filename, remote_host, remote_filename, mode,
             blocksize, section_size, hashname,
-            start_offset=0, dry_run=False, block_count=0, allow_smaller=False, ssh_args=None):
+            start_offset=0, dry_run=False, block_count=0, allow_smaller=False, reread=False, ssh_args=None):
 
     ssh_args = ssh_args or {}
     fn_bytes = remote_filename.encode('utf-8')
@@ -349,7 +351,7 @@ def do_sync(local_filename, remote_host, remote_filename, mode,
                     local_dig  = hashlib.new(hashname, block).digest()
                     remote_dig = io.read(dig_size)
                     if local_dig != remote_dig:
-                        if mode == MODE_PUSH:
+                        if mode == MODE_PUSH and not reread:
                             diff_blocks.append((p, block))
                         else:
                             diff_positions.append(p)
@@ -381,7 +383,31 @@ def do_sync(local_filename, remote_host, remote_filename, mode,
                 newly = total_scanned - skipped_blocks
                 scan_remaining_eta = (t_xfer - t_start_scan) * (total_blocks - total_scanned) / max(1, newly)
 
-                if mode == MODE_PUSH:
+                if mode == MODE_PUSH and reread:
+                    send_count       = 0 if dry_run else len(diff_positions)
+                    total_copy_bytes = sum(min(blocksize, sync_size - rp) for rp in diff_positions)
+                    io.write(struct.pack('<Q', send_count))
+                    for wpos in diff_positions:
+                        if dry_run:
+                            break
+                        bl = min(blocksize, sync_size - wpos)
+                        f.seek(wpos)
+                        io.write(struct.pack('<Q', wpos))
+                        io.write(f.read(bl))
+                        written += bl
+                        now = time()
+                        if now - t_last_progress >= REPORT_INTERVAL:
+                            t_last_progress = now
+                            copy_elapsed = now - t_xfer
+                            speed = written / (copy_elapsed * 1024 + 1)
+                            eta   = copy_elapsed * (total_copy_bytes - written) / (written + 1) + scan_remaining_eta
+                            report('\r[%d/%d] copy %s/%s (%.0f KiB/s) %s (%s) ' % (
+                                cur_section, total_sections,
+                                format_size(written, floor=True),
+                                format_size(total_copy_bytes, floor=True),
+                                speed, fmt_time(now - t_start_scan), fmt_time(eta)))
+
+                elif mode == MODE_PUSH:
                     send_count      = 0 if dry_run else len(diff_blocks)
                     total_copy_bytes = sum(len(b) for _, b in diff_blocks)
                     io.write(struct.pack('<Q', send_count))
@@ -485,6 +511,10 @@ if __name__ == '__main__':
                         help='allow destination to be smaller than source; '
                              'syncs only the bytes that fit. '
                              'WARNING: data beyond destination size is not copied.')
+    parser.add_argument('--reread',                   action='store_true',
+                        help='push: re-read differing blocks from disk during '
+                             'transfer instead of buffering them in memory. '
+                             'Lower memory use at the cost of a second disk read pass.')
     parser.add_argument('-p', '--port',         default=22, type=int, metavar='PORT',
                         help='SSH port (default 22)')
     parser.add_argument('src', help='source — local path or HOST:path')
@@ -516,8 +546,10 @@ if __name__ == '__main__':
     start_offset = (args.resume_from // section_size) * section_size
     ssh_args     = vars(args)
 
-    # Cap section size to half available RAM; diff_blocks holds one full block per diff.
-    if mode == MODE_PUSH:
+    # For push without --reread, cap section size at half of available memory
+    # so that the diff_blocks list (one full block per diff) cannot exhaust RAM.
+    # With --reread (or pull), only 8-byte positions are stored, so no cap needed.
+    if mode == MODE_PUSH and not args.reread:
         avail = available_memory()
         if avail > 0:
             mem_limit = max(avail // 2, blocksize)
@@ -541,7 +573,7 @@ if __name__ == '__main__':
                     mode, blocksize, section_size, hashname,
                     start_offset=start_offset, dry_run=dry_run,
                     block_count=args.block_count, allow_smaller=args.allow_smaller,
-                    ssh_args=ssh_args)
+                    reread=args.reread, ssh_args=ssh_args)
                 break
             except ConnectionLost as exc:
                 if attempt < args.retries and not exc.interrupted:
