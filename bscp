@@ -39,6 +39,7 @@ HEADER_FMT  = '<QQQQQQB'
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 MODE_PUSH, MODE_PULL = 0, 1
 PUSH_PULL_MASK = 1
+ALLOW_SMALLER  = 2
 
 # Number of diff-block requests sent per round-trip in pull phase B.
 # Larger = fewer round-trips; too large risks filling SSH stdout window before
@@ -63,12 +64,14 @@ def _remote():
     HEADER_SIZE    = struct.calcsize(HEADER_FMT)
     MODE_PUSH, MODE_PULL = 0, 1
     PUSH_PULL_MASK = 1
+    ALLOW_SMALLER  = 2
 
     data = stdin.read(HEADER_SIZE)
     if len(data) < HEADER_SIZE:
         sys.exit(1)
     (size, blocksize, section_size, start_offset,
      filename_len, hashname_len, mode) = struct.unpack(HEADER_FMT, data)
+    allow_smaller = mode & ALLOW_SMALLER
     mode = mode & PUSH_PULL_MASK
 
     fn_bytes = stdin.read(filename_len)
@@ -93,9 +96,9 @@ def _remote():
         stdout.write(struct.pack('<Q', remote_size))
         stdout.flush()
 
-        if mode == MODE_PUSH and remote_size < size:
+        if mode == MODE_PUSH and not allow_smaller and remote_size < size:
             sys.exit(1)
-        sync_size = min(size, remote_size) if mode == MODE_PULL else size
+        sync_size = min(size, remote_size) if (mode == MODE_PULL or allow_smaller) else size
         eff_section  = section_size if section_size else sync_size
         if sync_size == 0 or eff_section == 0:
             sys.exit(0)
@@ -231,6 +234,8 @@ def build_resume_cmd(argv0, args, src, dst, offset, block_count=None):
         parts.append('-C')
     if args.dry_run:
         parts.append('-N')
+    if args.allow_smaller:
+        parts.append('--allow-smaller')
     bc = args.block_count if block_count is None else block_count
     if bc:
         parts += ['-n', str(bc)]
@@ -261,7 +266,7 @@ def build_ssh_cmd(remote_host, args):
 
 def do_sync(local_filename, remote_host, remote_filename, mode,
             blocksize, section_size, hashname,
-            start_offset=0, dry_run=False, block_count=0, ssh_args=None):
+            start_offset=0, dry_run=False, block_count=0, allow_smaller=False, ssh_args=None):
 
     ssh_args = ssh_args or {}
     fn_bytes = remote_filename.encode('utf-8')
@@ -279,7 +284,7 @@ def do_sync(local_filename, remote_host, remote_filename, mode,
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         io   = IOCounter(proc.stdout, proc.stdin)
 
-        mode_byte = mode
+        mode_byte = mode | (ALLOW_SMALLER if allow_smaller else 0)
         io.write(struct.pack(HEADER_FMT,
                              local_size, blocksize, section_size, start_offset,
                              len(fn_bytes), len(hn_bytes), mode_byte))
@@ -295,14 +300,23 @@ def do_sync(local_filename, remote_host, remote_filename, mode,
         if remote_size == 0:
             proc.wait()
             raise RuntimeError('Remote file not found or inaccessible')
-        if mode == MODE_PUSH and remote_size < local_size:
+        if mode == MODE_PUSH and not allow_smaller and remote_size < local_size:
             proc.wait()
             raise RuntimeError(
-                'Remote size %d < local size %d (%d vs %d blocks)' % (
+                'Remote size %d < local size %d (%d vs %d blocks - override with --allow-smaller option)' % (
                     remote_size, local_size,
                     remote_size // blocksize, local_size // blocksize))
+        if allow_smaller:
+            src_size  = remote_size if mode == MODE_PULL else local_size
+            dest_size = remote_size if mode == MODE_PUSH else local_size
+            if dest_size < src_size:
+                report('\nWarning: destination (%s) is smaller than source (%s); '
+                        'syncing first %s\n' % (
+                        format_size(dest_size, floor=True),
+                        format_size(src_size,  floor=True),
+                        format_size(dest_size, floor=True)))
 
-        sync_size = min(local_size, remote_size) if mode == MODE_PULL else local_size
+        sync_size = min(local_size, remote_size) if (mode == MODE_PULL or allow_smaller) else local_size
         eff_section  = section_size if section_size else sync_size
         total_blocks   = max(1, (sync_size + blocksize - 1) // blocksize)
         total_sections = max(1, (sync_size + eff_section - 1) // eff_section)
@@ -467,6 +481,10 @@ if __name__ == '__main__':
                         help='count differences only; do not update destination')
     parser.add_argument('-B', '--block-count',        default=0, type=int, metavar='N',
                         help='limit sync to first N blocks (default 0 = no limit)')
+    parser.add_argument('--allow-smaller',            action='store_true',
+                        help='allow destination to be smaller than source; '
+                             'syncs only the bytes that fit. '
+                             'WARNING: data beyond destination size is not copied.')
     parser.add_argument('-p', '--port',         default=22, type=int, metavar='PORT',
                         help='SSH port (default 22)')
     parser.add_argument('src', help='source — local path or HOST:path')
@@ -522,7 +540,8 @@ if __name__ == '__main__':
                     local_file, remote_host, remote_file,
                     mode, blocksize, section_size, hashname,
                     start_offset=start_offset, dry_run=dry_run,
-                    block_count=args.block_count, ssh_args=ssh_args)
+                    block_count=args.block_count, allow_smaller=args.allow_smaller,
+                    ssh_args=ssh_args)
                 break
             except ConnectionLost as exc:
                 if attempt < args.retries and not exc.interrupted:
