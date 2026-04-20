@@ -60,14 +60,14 @@ duplicated this way.
 
 ## Key protocol constants
 
-| Name | Value | Notes |
-|---|---|---|
-| `HEADER_FMT` | `'<QQQQQQB'` | 49-byte protocol header struct |
-| `MODE_PUSH` | `0` | Push/pull bit in mode byte (bit 0) |
-| `MODE_PULL` | `1` | Push/pull bit in mode byte (bit 0) |
-| `PUSH_PULL_MASK` | `1` | Mask to extract push/pull bit from mode byte |
-| `ALLOW_SMALLER` | `2` | Flag bit in mode byte (bit 1): allow destination smaller than source |
-| `PULL_WINDOW` | `128` | Batch size for pull phase B (see below) |
+| Name             | Value        | Notes                                                                |
+| ---------------- | ------------ | -------------------------------------------------------------------- |
+| `HEADER_FMT`     | `'<QQQQQQB'` | 49-byte protocol header struct                                       |
+| `MODE_PUSH`      | `0`          | Push/pull bit in mode byte (bit 0)                                   |
+| `MODE_PULL`      | `1`          | Push/pull bit in mode byte (bit 0)                                   |
+| `PUSH_PULL_MASK` | `1`          | Mask to extract push/pull bit from mode byte                         |
+| `ALLOW_SMALLER`  | `2`          | Flag bit in mode byte (bit 1): allow destination smaller than source |
+| `PULL_WINDOW`    | `128`        | Batch size for pull phase B (see below)                              |
 
 ## Protocol summary
 
@@ -113,7 +113,7 @@ stateless with respect to window size.
   and pull use `sync_size = min(local_size, remote_size)` and a warning is
   printed when the destination is the limiting factor.
 
-## PULL_WINDOW — why it exists and how to change it
+## PULL\_WINDOW — why it exists and how to change it
 
 Pull phase B sends positions to the server and receives blocks back on the
 **same SSH pipe**.  A naive "send all positions → receive all blocks" approach
@@ -135,11 +135,11 @@ If you increase `blocksize` significantly (e.g. to 1 MiB), consider reducing
 
 ## Memory model
 
-| Phase | Push (default) | Push (`--reread`) | Pull |
-|---|---|---|---|
-| Phase A (per section) | O(diff_blocks × blocksize) — diff_blocks list | O(diff_blocks × 8) — positions only | O(diff_blocks × 8) — positions only |
-| Phase B | consumed as sent | re-reads each block; O(1) | consumed as received |
-| Peak | ≤ section_size (all blocks differ) | negligible | negligible |
+| Phase                 | Push (default)                                  | Push (`--reread`)                    | Pull                                 |
+| --------------------- | ----------------------------------------------- | ------------------------------------ | ------------------------------------ |
+| Phase A (per section) | O(diff\_blocks × blocksize) — diff\_blocks list | O(diff\_blocks × 8) — positions only | O(diff\_blocks × 8) — positions only |
+| Phase B               | consumed as sent                                | re-reads each block; O(1)            | consumed as received                 |
+| Peak                  | ≤ section\_size (all blocks differ)             | negligible                           | negligible                           |
 
 Section size is the primary memory knob (`-s`).  Smaller sections use less
 memory at the cost of more phase-boundary round-trips.

@@ -97,9 +97,9 @@ The server opens the remote file, seeks to the end, and writes its size as a
 The effective number of bytes to sync:
 
 ```
-push:                sync_size = size                 (requires remote_size >= size)
+push:                 sync_size = size (requires remote_size >= size)
 push (allow_smaller): sync_size = min(size, remote_size)
-pull:                sync_size = min(size, remote_size)
+pull:                 sync_size = min(size, remote_size)
 ```
 
 ---
@@ -183,8 +183,8 @@ the full window before responding.
 
 ## 5. Termination
 
-After the section loop completes, the client closes the SSH stdin pipe.  The
-server's stdin read returns EOF and it exits normally.
+After the section loop completes, the client closes the SSH stdin pipe.
+The server's stdin read returns EOF and it exits normally.
 
 ---
 
@@ -196,8 +196,8 @@ If a transfer is interrupted, the client prints:
 connection lost — retry with: --resume-from <last_section_start>
 ```
 
-Restarting with `--resume-from N` sets `start_offset = N` (rounded down to
-the nearest section boundary).  Both sides skip directly to that offset.
+Restarting with `--resume-from N` sets `start_offset = N` (rounded down
+to the nearest section boundary).  Both sides skip directly to that offset.
 Reprocessing a section is always safe because phase A re-compares the actual
 content on both sides.
 

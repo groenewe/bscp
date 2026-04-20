@@ -29,19 +29,19 @@ large as the source.
 
 ### Options
 
-| Flag | Default | Description |
-|---|---|---|
-| `-b SIZE` / `--block-size` | `64K` | Comparison/transfer granularity. Supports `K`/`M`/`G` suffixes. |
-| `-s SIZE` / `--section-size` | `10G` | File is processed in sections of this size. Bounds peak memory to roughly `diff_blocks_per_section × blocksize`. |
-| `-a ALGO` / `--algorithm` | `sha256` | Hash algorithm. Any algorithm supported by Python's `hashlib` is accepted (e.g. `sha512`, `sha3-256`). |
-| `-r BYTES` / `--resume-from` | `0` | Skip ahead to this byte offset (rounded down to a section boundary). Use after an interrupted transfer. |
-| `--retries N` | `0` | Automatically retry on connection failure, up to N times, with exponential back-off. |
-| `-i FILE` / `--identity` | | SSH identity file (`-i FILE`). |
-| `-o OPT` / `--ssh-opt` | | Extra SSH option, repeatable (passed as `-o OPT`). |
-| `-C` / `--compress` | | Enable SSH compression. |
-| `-N` / `--dry-run` | | Count differing blocks only; do not update destination. |
-| `-n N` / `--block-count` | `0` | Limit sync to the first N blocks (0 = no limit). The destination will not be fully updated; use intentionally. |
-| `-p PORT` / `--port` | `22` | SSH port. |
+| Flag                         | Default  | Description                                                                                                      |
+| ---------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------- |
+| `-b SIZE` / `--block-size`   | `64K`    | Comparison/transfer granularity. Supports `K`/`M`/`G` suffixes.                                                  |
+| `-s SIZE` / `--section-size` | `10G`    | File is processed in sections of this size. Bounds peak memory to roughly `diff_blocks_per_section × blocksize`. |
+| `-a ALGO` / `--algorithm`    | `sha256` | Hash algorithm. Any algorithm supported by Python's `hashlib` is accepted (e.g. `sha512`, `sha3-256`).           |
+| `-r BYTES` / `--resume-from` | `0`      | Skip ahead to this byte offset (rounded down to a section boundary). Use after an interrupted transfer.          |
+| `--retries N`                | `0`      | Automatically retry on connection failure, up to N times, with exponential back-off.                             |
+| `-i FILE` / `--identity`     |          | SSH identity file (`-i FILE`).                                                                                   |
+| `-o OPT` / `--ssh-opt`       |          | Extra SSH option, repeatable (passed as `-o OPT`).                                                               |
+| `-C` / `--compress`          |          | Enable SSH compression.                                                                                          |
+| `-N` / `--dry-run`           |          | Count differing blocks only; do not update destination.                                                          |
+| `-n N` / `--block-count`     | `0`      | Limit sync to the first N blocks (0 = no limit). The destination will not be fully updated; use intentionally.   |
+| `-p PORT` / `--port`         | `22`     | SSH port.                                                                                                        |
 
 ### Examples
 
@@ -88,14 +88,14 @@ See [PROTOCOL.md](../PROTOCOL.md) for the full wire-format specification.
 
 ## Comparison with similar tools
 
-| Feature | bscp | blocksync.py | rsync |
-|---|---|---|---|
-| Block device support | ✓ | ✓ | Limited |
-| No server installation | ✓ | — | — |
-| Push and pull | ✓ | Push only | ✓ |
-| Default hash | SHA-256 | MD5 | MD4/MD5 |
-| Resume support | ✓ | — | Partial |
-| Memory bounded | ✓ (section size) | — | — |
+| Feature                | bscp             | blocksync.py | rsync   |
+| ---------------------- | ---------------- | ------------ | ------- |
+| Block device support   | ✓                | ✓            | Limited |
+| No server installation | ✓                | —            | —       |
+| Push and pull          | ✓                | Push only    | ✓       |
+| Default hash           | SHA-256          | MD5          | MD4/MD5 |
+| Resume support         | ✓                | —            | Partial |
+| Memory bounded         | ✓ (section size) | —            | —       |
 
 ## See also
 
