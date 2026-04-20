@@ -5,7 +5,7 @@ blocks that have changed.  It fills the gap where `rsync` fails — most
 notably when the source or destination is a raw block device.
 
 No server-side installation is required: the remote-side script is embedded
-in the client binary and executed via `python3 -c` over the SSH connection.
+in the client binary and executed via `python(/2/3) -c` over the SSH connection.
 
 ## Requirements
 

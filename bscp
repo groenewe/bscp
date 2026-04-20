@@ -215,7 +215,7 @@ def format_size(n, floor=False):
     floor=True: truncate to nearest unit (use for display values and resume offsets)."""
     for suffix, div in (('G', 1 << 30), ('M', 1 << 20), ('K', 1 << 10)):
         if floor:
-            if n >= div:
+            if n >= 9 * div:
                 return '%d%s' % (n // div, suffix)
         else:
             if n % div == 0 and n // div > 0:

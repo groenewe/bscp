@@ -158,7 +158,7 @@ stores diff positions (8 bytes each), so no cap is applied.
 
 `_remote()` is a normal Python function; its source is extracted with
 `inspect.getsource(_remote)` and passed to the remote shell as
-`python3 -O -B -c "..."` (double-quoted).  Inside a double-quoted shell
+`python(/2/3) -O -B -c "..."` (double-quoted).  Inside a double-quoted shell
 string, only `\$`, `` \` ``, `\"`, `\\`, and `\<newline>` are special.
 This means:
 
@@ -208,18 +208,18 @@ summary line with: `2>&1 | tr '\r' '\n' | grep '^in='`
 
 Progress format during scan:
 ```
-scan SCANNED/TOTAL (PCT%) diff=N (PCT%) (SPEED MiB/s) ELAPSED ~ETA
+scan SCANNED/TOTAL (PCT%) diff=N (PCT%) (SPEED MiB/s) ELAPSED (ETA)
 ```
 - `SCANNED/TOTAL` — cumulative blocks across all sections, not per-section
 - first `(PCT%)` — percentage of file scanned
 - `diff=N` — cumulative diff count; `(PCT%)` — diffs as fraction of blocks scanned
-- `ELAPSED` / `~ETA` — wall-clock elapsed and estimated remaining in `m:ss` format;
+- `ELAPSED` / `(ETA)` — wall-clock elapsed and estimated remaining in `m:ss` format;
   ETA is linear extrapolation based on scan throughput only (does not account for
   future copy phases, which is acceptable since scan dominates for typical workloads)
 
 Progress format during copy:
 ```
-[CUR_SECTION/TOTAL_SECTIONS] copy WRITTEN/SECTION_COPY_BYTES (SPEED KiB/s) ELAPSED ~ETA
+[CUR_SECTION/TOTAL_SECTIONS] copy WRITTEN/SECTION_COPY_BYTES (SPEED KiB/s) ELAPSED (ETA)
 ```
 
 ## Quiet and batch modes
