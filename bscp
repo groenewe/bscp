@@ -1,6 +1,6 @@
-#!/usr/bin/env python
+#!/usr/bin/env -S python3 -O -B
 
-# Copyright (C) 2012-2023  The Bscp Authors <https://github.com/bscp-tool/bscp/graphs/contributors>
+# Copyright (C) 2012-2024  The Bscp Authors <https://github.com/bscp-tool/bscp/graphs/contributors>
 #
 # Permission to use, copy, modify, and/or distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -14,176 +14,550 @@
 # ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
 # OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
+# Bscp copies a file or block device over SSH, transferring only changed
+# blocks.  Both push (local → remote) and pull (remote → local) are
+# supported.  The remote-side script is embedded and executed via
+# "python(/2/3) -c", so no installation on the remote host is required.
+# Features: section-based processing to bound memory use, single-pass
+# scan+copy, windowed pull to avoid SSH pipe deadlock, resume on failure,
+# automatic retry with exponential back-off, and dry-run mode.
+#
+# Changes from branch main-HG onward were made mostly by Claude (Anthropic).
+
+from argparse import ArgumentParser
 import hashlib
+import inspect
+import os
+import shlex
 import struct
 import subprocess
 import sys
+from time import sleep, time
 
-if sys.version_info < (3, 0):
-    range = xrange
+# Header: size(8), blocksize(8), section_size(8), start_offset(8), filename_len(8), hashname_len(8), mode(1) - 49 bytes total
+HEADER_FMT  = '<QQQQQQB'
+HEADER_SIZE = struct.calcsize(HEADER_FMT)
+MODE_PUSH, MODE_PULL = 0, 1
+PUSH_PULL_MASK = 1
 
-remote_script = r'''
-import hashlib
-import os
-import os.path
-import struct
-import sys
+# Number of diff-block requests sent per round-trip in pull phase B.
+# Larger = fewer round-trips; too large risks filling SSH stdout window before
+# the client drains it.  128 × 64 KiB = 8 MiB max in-flight, well within
+# OpenSSH's dynamic window.
+PULL_WINDOW = 128
 
-if sys.version_info < (3, 0):
-    stdin_buffer = sys.stdin
-    stdout_buffer = sys.stdout
-    range = xrange
-else:
-    stdin_buffer = sys.stdin.buffer
-    stdout_buffer = sys.stdout.buffer
+DEFAULT_BLOCK   = 64 * 1024
+DEFAULT_SECTION = 10 * 1024**3
 
-(size, blocksize, filename_len, hashname_len) = struct.unpack('<QQQQ', stdin_buffer.read(8+8+8+8))
-filename_bytes = stdin_buffer.read(filename_len)
-hashname_bytes = stdin_buffer.read(hashname_len)
-filename = filename_bytes.decode('utf-8')
-hashname = hashname_bytes.decode('ascii')
+REPORT_INTERVAL = 0.5 # status line should update after this many seconds have passed
+last_report_len = 0   # last progress or error length message on screen, if any; used by report()
 
-sanity_hash = hashlib.new(hashname, filename_bytes).digest()
-stdout_buffer.write(sanity_hash)
-stdout_buffer.flush()
-if stdin_buffer.read(2) != b'go':
-    sys.exit()
 
-if not os.path.exists(filename):
-    # Create sparse file
-    with open(filename, 'wb') as f:
-        f.truncate(size)
-    os.chmod(filename, 0o600)
+def _remote():
+    import hashlib, os, struct, sys  # noqa: F401 (standalone on remote host)
 
-with open(filename, 'rb+') as f:
-    f.seek(0, 2)
-    stdout_buffer.write(struct.pack('<Q', f.tell()))
-    readremain = size
-    rblocksize = blocksize
-    f.seek(0)
-    while True:
-        if readremain <= blocksize:
-            rblocksize = readremain
-        block = f.read(rblocksize)
-        if len(block) == 0:
-            break
-        digest = hashlib.new(hashname, block).digest()
-        stdout_buffer.write(digest)
-        readremain -= rblocksize
-        if readremain == 0:
-            break
-    stdout_buffer.flush()
-    while True:
-        position_s = stdin_buffer.read(8)
-        if len(position_s) == 0:
-            break
-        (position,) = struct.unpack('<Q', position_s)
-        block = stdin_buffer.read(blocksize)
-        f.seek(position)
-        f.write(block)
-    readremain = size
-    rblocksize = blocksize
-    hash_total = hashlib.new(hashname)
-    f.seek(0)
-    while True:
-        if readremain <= blocksize:
-            rblocksize = readremain
-        block = f.read(rblocksize)
-        if len(block) == 0:
-            break
-        hash_total.update(block)
-        readremain -= rblocksize
-        if readremain == 0:
-            break
-stdout_buffer.write(hash_total.digest())
-'''
+    stdin  = getattr(sys.stdin,  'buffer', sys.stdin)
+    stdout = getattr(sys.stdout, 'buffer', sys.stdout)
+
+    HEADER_FMT     = '<QQQQQQB'
+    HEADER_SIZE    = struct.calcsize(HEADER_FMT)
+    MODE_PUSH, MODE_PULL = 0, 1
+    PUSH_PULL_MASK = 1
+
+    data = stdin.read(HEADER_SIZE)
+    if len(data) < HEADER_SIZE:
+        sys.exit(1)
+    (size, blocksize, section_size, start_offset,
+     filename_len, hashname_len, mode) = struct.unpack(HEADER_FMT, data)
+    mode = mode & PUSH_PULL_MASK
+
+    fn_bytes = stdin.read(filename_len)
+    hashname = stdin.read(hashname_len).decode('ascii')
+    filename = fn_bytes.decode('utf-8')
+
+    stdout.write(hashlib.new(hashname, fn_bytes).digest())
+    stdout.flush()
+    if stdin.read(2) != b'go':
+        sys.exit(1)
+
+    try:
+        fobj = open(filename, 'rb+' if mode == MODE_PUSH else 'rb')
+    except OSError:
+        stdout.write(struct.pack('<Q', 0))
+        stdout.flush()
+        sys.exit(1)
+
+    with fobj as f:
+        f.seek(0, 2)
+        remote_size = f.tell()
+        stdout.write(struct.pack('<Q', remote_size))
+        stdout.flush()
+
+        if mode == MODE_PUSH and remote_size < size:
+            sys.exit(1)
+        sync_size = min(size, remote_size) if mode == MODE_PULL else size
+        eff_section  = section_size if section_size else sync_size
+        if sync_size == 0 or eff_section == 0:
+            sys.exit(0)
+
+        pos = start_offset
+        while pos < sync_size:
+            sec_end = min(pos + eff_section, sync_size)
+
+            p = pos
+            while p < sec_end:
+                bl = min(blocksize, sec_end - p)
+                f.seek(p)
+                stdout.write(hashlib.new(hashname, f.read(bl)).digest())
+                p += bl
+            stdout.flush()
+
+            (count,) = struct.unpack('<Q', stdin.read(8))
+
+            if mode == MODE_PUSH:
+                for _ in range(count):
+                    (wpos,) = struct.unpack('<Q', stdin.read(8))
+                    bl = min(blocksize, sync_size - wpos)
+                    f.seek(wpos)
+                    f.write(stdin.read(bl))
+            else:
+                for _ in range(count):
+                    (rpos,) = struct.unpack('<Q', stdin.read(8))
+                    bl = min(blocksize, sync_size - rpos)
+                    f.seek(rpos)
+                    stdout.write(f.read(bl))
+                if count:
+                    stdout.flush()
+
+            pos = sec_end
+
 
 class IOCounter:
     def __init__(self, in_stream, out_stream):
-        self.in_stream = in_stream
+        self.in_stream  = in_stream
         self.out_stream = out_stream
-        self.in_total = 0
-        self.out_total = 0
-    def read(self, size=None):
-        if size is None:
-            s = self.in_stream.read()
-        else:
-            s = self.in_stream.read(size)
-        self.in_total += len(s)
-        return s
-    def write(self, s):
-        self.out_stream.write(s)
-        self.out_total += len(s)
+        self.in_total   = 0
+        self.out_total  = 0
+
+    def read(self, n):
+        data = self.in_stream.read(n)
+        self.in_total += len(data)
+        return data
+
+    def write(self, data):
+        self.out_stream.write(data)
+        self.out_total += len(data)
         self.out_stream.flush()
 
-def bscp(local_filename, remote_host, remote_filename, blocksize, hashname):
-    remote_filename_bytes = remote_filename.encode('utf-8')
-    hashname_bytes = hashname.encode('ascii')
-    hash_total = hashlib.new(hashname)
-    with open(local_filename, 'rb') as f:
+
+class ConnectionLost(RuntimeError):
+    def __init__(self, offset, interrupted=False):
+        verb = 'Interrupted' if interrupted else 'Connection lost'
+        super().__init__('%s — resume with: --resume-from %d' % (verb, offset))
+        self.offset      = offset
+        self.interrupted = interrupted
+
+
+def report(msg):
+    global last_report_len
+
+    stt = 1 if (last_report_len == 0 and msg[:1] in ('\r', '\n')) else 0
+    lines = msg[stt:].split('\n')
+    first = lines[0]
+    if last_report_len > len(lines[0]):
+        lines[0] = first + ' ' * (last_report_len - len(first))
+    sys.stderr.write('\n'.join(lines))
+    sys.stderr.flush()
+    last_report_len = len(first)
+
+
+def parse_size(s):
+    s = s.strip()
+    if not s:
+        raise ValueError('empty size string')
+    suffixes = {'k': 1024, 'm': 1024**2, 'g': 1024**3}
+    if s[-1].lower() in suffixes:
+        return int(float(s[:-1]) * suffixes[s[-1].lower()])
+    return int(s)
+
+
+def available_memory():
+    try:
+        pages = os.sysconf('SC_AVPHYS_PAGES')
+        size  = os.sysconf('SC_PAGE_SIZE')
+        if pages > 0 and size > 0:
+            return pages * size
+    except (AttributeError, ValueError, OSError):
+        pass
+    return 0
+
+
+def fmt_time(seconds):
+    s = int(seconds)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    return '%d:%02d:%02d' % (h, m, s) if h else '%d:%02d' % (m, s)
+
+
+def format_size(n, floor=False):
+    """Return n as a human-readable size string.
+    floor=False (default): only convert when n is an exact multiple (use for CLI args).
+    floor=True: truncate to nearest unit (use for display values and resume offsets)."""
+    for suffix, div in (('G', 1 << 30), ('M', 1 << 20), ('K', 1 << 10)):
+        if floor:
+            if n >= div:
+                return '%d%s' % (n // div, suffix)
+        else:
+            if n % div == 0 and n // div > 0:
+                return '%d%s' % (n // div, suffix)
+    return str(n)
+
+
+def build_resume_cmd(argv0, args, src, dst, offset, block_count=None):
+    parts = [argv0]
+    if args.block_size != DEFAULT_BLOCK:
+        parts += ['-b', format_size(args.block_size)]
+    if args.section_size != DEFAULT_SECTION:
+        parts += ['-s', format_size(args.section_size)]
+    if args.algorithm != 'sha256':
+        parts += ['-a', args.algorithm]
+    if args.retries:
+        parts += ['--retries', str(args.retries)]
+    if args.identity:
+        parts += ['-i', args.identity]
+    for opt in (args.ssh_opt or []):
+        parts += ['-o', opt]
+    if args.compress:
+        parts.append('-C')
+    if args.dry_run:
+        parts.append('-N')
+    bc = args.block_count if block_count is None else block_count
+    if bc:
+        parts += ['-n', str(bc)]
+    if args.port != 22:
+        parts += ['-p', str(args.port)]
+    parts += ['-r', format_size(offset, floor=True)]
+    parts += [src, dst]
+    return ' '.join(shlex.quote(p) for p in parts)
+
+
+def build_ssh_cmd(remote_host, args):
+    cmd = ['ssh']
+    if args.get('compress'):
+        cmd.append('-C')
+    if args.get('port', 22) != 22:
+        cmd += ['-p', str(args['port'])]
+    if args.get('identity'):
+        cmd += ['-i', args['identity']]
+    for opt in (args.get('ssh_opt') or []):
+        cmd += ['-o', opt]
+    script = inspect.getsource(_remote) + '\n_remote()'
+    cmd += ['--', remote_host,
+            'for py in python3 python2 python; do '
+            'command -v "$py" >/dev/null 2>&1 && exec "$py" -O -B -c "%s"; '
+            'done' % script]
+    return cmd
+
+
+def do_sync(local_filename, remote_host, remote_filename, mode,
+            blocksize, section_size, hashname,
+            start_offset=0, dry_run=False, block_count=0, ssh_args=None):
+
+    ssh_args = ssh_args or {}
+    fn_bytes = remote_filename.encode('utf-8')
+    hn_bytes = hashname.encode('ascii')
+    dig_size = hashlib.new(hashname).digest_size
+
+    open_mode = 'rb+' if mode == MODE_PULL else 'rb'
+    with open(local_filename, open_mode) as f:
         f.seek(0, 2)
-        size = f.tell()
-        f.seek(0)
+        local_size = f.tell()
+        if block_count > 0:
+            local_size = min(local_size, start_offset + block_count * blocksize)
 
-        # Calculate number of blocks, including the last block which may be smaller
-        blockcount = int((size + blocksize - 1) / blocksize)
+        cmd  = build_ssh_cmd(remote_host, ssh_args)
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        io   = IOCounter(proc.stdout, proc.stdin)
 
-        remote_command = 'python -c "%s"' % (remote_script,)
-        command = ('ssh', '--', remote_host, remote_command)
-        p = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None)
-        io = IOCounter(p.stdout, p.stdin)
+        mode_byte = mode
+        io.write(struct.pack(HEADER_FMT,
+                             local_size, blocksize, section_size, start_offset,
+                             len(fn_bytes), len(hn_bytes), mode_byte))
+        io.write(fn_bytes)
+        io.write(hn_bytes)
 
-        io.write(struct.pack('<QQQQ', size, blocksize, len(remote_filename_bytes), len(hashname_bytes)))
-        io.write(remote_filename_bytes)
-        io.write(hashname_bytes)
-
-        sanity_digest = hashlib.new(hashname, remote_filename_bytes).digest()
-        remote_digest = io.read(len(sanity_digest))
-        if remote_digest != sanity_digest:
-            raise RuntimeError('Remote script failed to execute properly')
+        if io.read(dig_size) != hashlib.new(hashname, fn_bytes).digest():
+            proc.wait()
+            raise RuntimeError('Remote script failed to execute')
         io.write(b'go')
 
         (remote_size,) = struct.unpack('<Q', io.read(8))
-        if remote_size < size:
-            raise RuntimeError('Remote size less than local (local: %i, remote: %i)' % (size, remote_size))
-        remote_digest_list = [io.read(hash_total.digest_size) for i in range(blockcount)]
+        if remote_size == 0:
+            proc.wait()
+            raise RuntimeError('Remote file not found or inaccessible')
+        if mode == MODE_PUSH and remote_size < local_size:
+            proc.wait()
+            raise RuntimeError(
+                'Remote size %d < local size %d (%d vs %d blocks)' % (
+                    remote_size, local_size,
+                    remote_size // blocksize, local_size // blocksize))
 
-        for remote_digest in remote_digest_list:
-            position = f.tell()
-            block = f.read(blocksize)
-            hash_total.update(block)
-            digest = hashlib.new(hashname, block).digest()
-            if digest != remote_digest:
-                try:
-                    io.write(struct.pack('<Q', position))
-                    io.write(block)
-                except IOError:
-                    break
-        p.stdin.close()
+        sync_size = min(local_size, remote_size) if mode == MODE_PULL else local_size
+        eff_section  = section_size if section_size else sync_size
+        total_blocks   = max(1, (sync_size + blocksize - 1) // blocksize)
+        total_sections = max(1, (sync_size + eff_section - 1) // eff_section)
+        skipped_blocks = start_offset // blocksize
+        total_scanned  = skipped_blocks
+        t_start_scan   = time()
 
-        remote_digest_total = io.read()
-        p.wait()
-        if remote_digest_total != hash_total.digest():
-            raise RuntimeError('Checksum mismatch after transfer')
-    return (io.in_total, io.out_total, size)
+        total_diffs    = 0
+        total_written  = 0
+        last_sec_start = start_offset
+        cur_section    = start_offset // eff_section
+        t_last_progress = 0.0
+
+        try:
+            pos = start_offset
+            while pos < sync_size:
+                sec_end        = min(pos + eff_section, sync_size)
+                last_sec_start = pos
+                cur_section   += 1
+
+                # ── Phase A: hash exchange ────────────────────────────
+                diff_blocks    = []   # push: [(wpos, block)]
+                diff_positions = []   # pull: [rpos]
+
+                f.seek(pos)
+                p = pos
+                while p < sec_end:
+                    bl         = min(blocksize, sec_end - p)
+                    block      = f.read(bl)
+                    local_dig  = hashlib.new(hashname, block).digest()
+                    remote_dig = io.read(dig_size)
+                    if local_dig != remote_dig:
+                        if mode == MODE_PUSH:
+                            diff_blocks.append((p, block))
+                        else:
+                            diff_positions.append(p)
+                    p             += bl
+                    total_scanned += 1
+                    now = time()
+                    if now - t_last_progress >= REPORT_INTERVAL:
+                        t_last_progress = now
+                        ndiff        = total_diffs + len(diff_blocks) + len(diff_positions)
+                        pct_done     = total_scanned * 100.0 / total_blocks
+                        newly        = total_scanned - skipped_blocks
+                        pct_diff     = ndiff * 100.0 / max(1, newly)
+                        elapsed      = now - t_start_scan
+                        speed        = newly * blocksize / (elapsed * 1024**2 + 1)
+                        eta          = elapsed * (total_blocks - total_scanned) / max(1, newly)
+                        scanned_bytes = min(total_scanned * blocksize, sync_size)
+                        report('\rscan %s/%s (%.1f%%) diff blocks=%d (%.1f%%) (%.0f MiB/s) %s (%s) ' % (
+                            format_size(scanned_bytes, floor=True),
+                            format_size(sync_size, floor=True),
+                            pct_done, ndiff, pct_diff, speed,
+                            fmt_time(elapsed), fmt_time(eta)))
+
+                total_diffs += len(diff_blocks) + len(diff_positions)
+
+                # ── Phase B: transfer ─────────────────────────────────
+                t_xfer  = time()
+                written = 0
+                # Remaining scan time for future sections, based on rate so far.
+                newly = total_scanned - skipped_blocks
+                scan_remaining_eta = (t_xfer - t_start_scan) * (total_blocks - total_scanned) / max(1, newly)
+
+                if mode == MODE_PUSH:
+                    send_count      = 0 if dry_run else len(diff_blocks)
+                    total_copy_bytes = sum(len(b) for _, b in diff_blocks)
+                    io.write(struct.pack('<Q', send_count))
+                    for i, (wpos, wblock) in enumerate(diff_blocks):
+                        if dry_run:
+                            break
+                        io.write(struct.pack('<Q', wpos))
+                        io.write(wblock)
+                        written += len(wblock)
+                        now = time()
+                        if now - t_last_progress >= REPORT_INTERVAL:
+                            t_last_progress = now
+                            copy_elapsed = now - t_xfer
+                            speed = written / (copy_elapsed * 1024 + 1)
+                            eta   = copy_elapsed * (total_copy_bytes - written) / (written + 1) + scan_remaining_eta
+                            report('\r[%d/%d] copy %s/%s (%.0f KiB/s) %s (%s) ' % (
+                                cur_section, total_sections,
+                                format_size(written, floor=True),
+                                format_size(total_copy_bytes, floor=True),
+                                speed, fmt_time(now - t_start_scan), fmt_time(eta)))
+
+                else:  # pull — windowed to avoid two-pipe deadlock
+                    send_count       = 0 if dry_run else len(diff_positions)
+                    total_copy_bytes = sum(min(blocksize, sync_size - rp) for rp in diff_positions)
+                    io.write(struct.pack('<Q', send_count))
+                    if not dry_run:
+                        recv_idx = 0
+                        for batch_start in range(0, len(diff_positions), PULL_WINDOW):
+                            batch = diff_positions[batch_start:batch_start + PULL_WINDOW]
+                            for rpos in batch:
+                                io.write(struct.pack('<Q', rpos))
+                            for rpos in batch:
+                                bl    = min(blocksize, sync_size - rpos)
+                                block = io.read(bl)
+                                f.seek(rpos)
+                                f.write(block)
+                                written  += bl
+                                recv_idx += 1
+                                now = time()
+                                if now - t_last_progress >= REPORT_INTERVAL:
+                                    t_last_progress = now
+                                    copy_elapsed = now - t_xfer
+                                    speed = written / (copy_elapsed * 1024 + 1)
+                                    eta   = copy_elapsed * (total_copy_bytes - written) / (written + 1) + scan_remaining_eta
+                                    report('\r[%d/%d] copy %s/%s (%.0f KiB/s) %s (%s) ' % (
+                                        cur_section, total_sections,
+                                        format_size(written, floor=True),
+                                        format_size(total_copy_bytes, floor=True),
+                                        speed, fmt_time(now - t_start_scan), fmt_time(eta)))
+
+                total_written += written
+                pos = sec_end
+
+        except (BrokenPipeError, ConnectionResetError, EOFError) as exc:
+            proc.stdin.close()
+            proc.wait()
+            raise ConnectionLost(last_sec_start) from exc
+        except KeyboardInterrupt:
+            proc.stdin.close()
+            proc.wait()
+            raise ConnectionLost(last_sec_start, interrupted=True)
+
+        proc.stdin.close()
+        proc.wait()
+
+    return io.in_total, io.out_total, sync_size, total_diffs, total_written
+
 
 if __name__ == '__main__':
-    try:
-        local_filename = sys.argv[1]
-        (remote_host, remote_filename) = sys.argv[2].split(':')
-        if len(sys.argv) >= 4:
-            blocksize = int(sys.argv[3])
-        else:
-            blocksize = 64 * 1024
-        if len(sys.argv) >= 5:
-            hashname = sys.argv[4]
-        else:
-            hashname = 'sha256'
-        assert len(sys.argv) <= 5
-    except:
-        usage = 'bscp SRC HOST:DEST [BLOCKSIZE] [HASH]'
-        sys.stderr.write('Usage:\n\n    %s\n\n' % (usage,))
+    parser = ArgumentParser(
+        description='Binary Secure Copy — push or pull a local/remote file or block device, '
+                    'transferring only changed blocks over SSH.',
+        usage='%(prog)s [options] SRC DST\n'
+              '  push:  bscp [options] local_file   HOST:remote_file\n'
+              '  pull:  bscp [options] HOST:remote_file   local_file')
+    parser.add_argument('-b', '--block-size',   default=DEFAULT_BLOCK,
+                        type=parse_size, metavar='SIZE',
+                        help='block size (default 64K; supports K/M/G suffix)')
+    parser.add_argument('-s', '--section-size', default=DEFAULT_SECTION,
+                        type=parse_size, metavar='SIZE',
+                        help='section size (default 10G; bounds memory use per pass)')
+    parser.add_argument('-a', '--algorithm',    default='sha256',
+                        metavar='ALGO',
+                        help='hash algorithm (default sha256)')
+    parser.add_argument('-r', '--resume-from',  default=0,
+                        type=parse_size, metavar='BYTES',
+                        help='resume from byte offset (rounded down to section boundary)')
+    parser.add_argument('--retries',            default=0, type=int, metavar='N',
+                        help='auto-retry attempts on connection failure (default 0)')
+    parser.add_argument('-i', '--identity',     metavar='FILE',
+                        help='SSH identity file (-i FILE)')
+    parser.add_argument('-o', '--ssh-opt',      action='append', metavar='OPT',
+                        help='extra SSH option, repeatable (passed as -o OPT)')
+    parser.add_argument('-C', '--compress',     action='store_true',
+                        help='enable SSH compression')
+    parser.add_argument('-N', '--dry-run',      action='store_true',
+                        help='count differences only; do not update destination')
+    parser.add_argument('-B', '--block-count',        default=0, type=int, metavar='N',
+                        help='limit sync to first N blocks (default 0 = no limit)')
+    parser.add_argument('-p', '--port',         default=22, type=int, metavar='PORT',
+                        help='SSH port (default 22)')
+    parser.add_argument('src', help='source — local path or HOST:path')
+    parser.add_argument('dst', help='destination — HOST:path or local path')
+
+    if len(sys.argv) == 1:
+        parser.print_usage(sys.stderr)
+        sys.stderr.write('Use -h or --help for full option list.\n')
         sys.exit(1)
-    (in_total, out_total, size) = bscp(local_filename, remote_host, remote_filename, blocksize, hashname)
-    speedup = size * 1.0 / (in_total + out_total)
-    sys.stderr.write('in=%i out=%i size=%i speedup=%.2f\n' % (in_total, out_total, size, speedup))
+
+    args = parser.parse_args()
+
+    src, dst = args.src, args.dst
+    if ':' in src and ':' not in dst:
+        mode = MODE_PULL
+        remote_host, remote_file = src.split(':', 1)
+        local_file = dst
+    elif ':' in dst and ':' not in src:
+        mode = MODE_PUSH
+        local_file = src
+        remote_host, remote_file = dst.split(':', 1)
+    else:
+        parser.error('exactly one of SRC or DST must be HOST:path')
+
+    blocksize    = args.block_size
+    section_size = args.section_size
+    hashname     = args.algorithm
+    dry_run      = args.dry_run
+    start_offset = (args.resume_from // section_size) * section_size
+    ssh_args     = vars(args)
+
+    # Cap section size to half available RAM; diff_blocks holds one full block per diff.
+    if mode == MODE_PUSH:
+        avail = available_memory()
+        if avail > 0:
+            mem_limit = max(avail // 2, blocksize)
+            if section_size > mem_limit:
+                section_size = mem_limit
+                report('\nNote: section size reduced to %s (half of available memory)\n'
+                        % format_size(section_size, floor=True))
+
+    resume_cmd = lambda offset: build_resume_cmd(
+        sys.argv[0], args, src, dst, offset)
+
+    t_start  = time()
+    attempt  = 0
+
+    try:
+        while True:
+            try:
+                (in_total, out_total, sync_size,
+                 total_diffs, total_written) = do_sync(
+                    local_file, remote_host, remote_file,
+                    mode, blocksize, section_size, hashname,
+                    start_offset=start_offset, dry_run=dry_run,
+                    block_count=args.block_count, ssh_args=ssh_args)
+                break
+            except ConnectionLost as exc:
+                if attempt < args.retries and not exc.interrupted:
+                    delay = min(2 ** attempt, 60)
+                    report('\nConnection lost — retrying (%d/%d) in %ds...\n'
+                            'Resume manually with:\n  %s\n' % (
+                            attempt + 1, args.retries, delay,
+                            resume_cmd(exc.offset)))
+                    start_offset = exc.offset
+                    attempt += 1
+                    sleep(delay)
+                else:
+                    label = 'Interrupted' if exc.interrupted else 'Connection lost'
+                    report('\n%s - Resume with:\n  %s\n' % (
+                        label, resume_cmd(exc.offset)))
+                    sys.exit(130 if exc.interrupted else 1)
+            except RuntimeError as exc:
+                report('\nError: %s\n' % exc)
+                sys.exit(1)
+    except KeyboardInterrupt:
+        report('\nInterrupted - Resume with:\n  %s\n' % resume_cmd(start_offset))
+        sys.exit(130)
+
+    elapsed  = time() - t_start
+    xfer     = in_total + out_total
+    speedup  = sync_size / (xfer + 1)
+
+    if dry_run:
+        report('\rdry-run: %d diff blocks (+/- %s) (%.1f%%) (%s)\n' % (
+            total_diffs, format_size(total_diffs * blocksize, floor=True),
+            (100.0 * total_diffs * blocksize) / sync_size, fmt_time(elapsed)))
+    else:
+        report('\rin=%d out=%d size=%d diffs=%d speedup=%.2f (%s)\n' % (
+            in_total, out_total, sync_size, total_diffs, speedup, fmt_time(elapsed)))
+
+    if args.block_count:
+        report('Continue with:\n  %s\n' % build_resume_cmd(
+            sys.argv[0], args, src, dst, sync_size, block_count=0))
