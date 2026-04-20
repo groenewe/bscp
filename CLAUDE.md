@@ -149,6 +149,11 @@ memory at the cost of more phase-boundary round-trips.
 at `max(avail // 2, blocksize)`.  With `--reread` (or pull), the client only
 stores diff positions (8 bytes each), so no cap is applied.
 
+**Automatic re-read fallback:** if available memory is below `MIN_MEMORY_PUSH`
+(`64 × blocksize`, default 4 MiB), the push is automatically switched to
+`--reread` mode regardless of the user's flag.  A note is printed to stderr
+(suppressed by `--batch`).
+
 ## Remote script constraints
 
 `_remote()` is a normal Python function; its source is extracted with
@@ -216,6 +221,25 @@ Progress format during copy:
 ```
 [CUR_SECTION/TOTAL_SECTIONS] copy WRITTEN/SECTION_COPY_BYTES (SPEED KiB/s) ELAPSED ~ETA
 ```
+
+## Quiet and batch modes
+
+`-q` / `--quiet` suppresses the `\r`-terminated scan/copy progress lines.
+Errors, warnings, and the final summary line are still printed to stderr.
+
+`--batch` suppresses **all** stderr output (implies `-q`).  The caller must
+rely solely on the exit status:
+
+| Exit code | Meaning                                        |
+| --------- | ---------------------------------------------- |
+| `0`       | Success                                        |
+| `1`       | Fatal error (I/O failure, remote error, etc.)  |
+| `2`       | Bad arguments                                  |
+| `3`       | Connection lost — resume with `--resume-from`  |
+| `130`     | Interrupted (Ctrl+C)                           |
+
+Both flags are forwarded into the resume command printed by
+`build_resume_cmd()`, so a resumed invocation keeps the same verbosity level.
 
 ## Style conventions
 

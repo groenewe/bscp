@@ -49,6 +49,7 @@ PULL_WINDOW = 128
 
 DEFAULT_BLOCK   = 64 * 1024
 DEFAULT_SECTION = 10 * 1024**3
+MIN_MEMORY_PUSH = 64 * DEFAULT_BLOCK
 
 REPORT_INTERVAL = 0.5 # status line should update after this many seconds have passed
 last_report_len = 0   # last progress or error length message on screen, if any; used by report()
@@ -567,14 +568,18 @@ if __name__ == '__main__':
     # For push without --reread, cap section size at half of available memory
     # so that the diff_blocks list (one full block per diff) cannot exhaust RAM.
     # With --reread (or pull), only 8-byte positions are stored, so no cap needed.
-    if mode == MODE_PUSH and not args.reread:
+    reread = args.reread
+    if mode == MODE_PUSH and not reread:
         avail = available_memory()
-        if avail > 0:
+        if avail >= MIN_MEMORY_PUSH:
             mem_limit = max(avail // 2, blocksize)
             if section_size > mem_limit:
                 section_size = mem_limit
                 report('\nNote: section size reduced to %s (half of available memory)\n'
                         % format_size(section_size, floor=True))
+        else:
+            reread = True
+            report('\nNote: Dropping to re-read mode due to low amount of available memory)\n')
 
     resume_cmd = lambda offset: build_resume_cmd(
         sys.argv[0], args, src, dst, offset)
@@ -591,7 +596,7 @@ if __name__ == '__main__':
                     mode, blocksize, section_size, hashname,
                     start_offset=start_offset, dry_run=dry_run,
                     block_count=args.block_count, allow_smaller=args.allow_smaller,
-                    reread=args.reread, ssh_args=ssh_args)
+                    reread=reread, ssh_args=ssh_args)
                 break
             except ConnectionLost as exc:
                 if attempt < args.retries and not exc.interrupted:
