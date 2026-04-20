@@ -41,6 +41,8 @@ large as the source.
 | `-C` / `--compress`          |          | Enable SSH compression.                                                                                          |
 | `-N` / `--dry-run`           |          | Count differing blocks only; do not update destination.                                                          |
 | `-n N` / `--block-count`     | `0`      | Limit sync to the first N blocks (0 = no limit). The destination will not be fully updated; use intentionally.   |
+| `-q` / `--quiet`             |          | Suppress scan/copy progress lines. Errors and warnings are still shown.                                          |
+| `--batch`                    |          | Suppress all stderr output; use the exit status to detect errors (implies `-q`).                                 |
 | `-p PORT` / `--port`         | `22`     | SSH port.                                                                                                        |
 
 ### Examples
@@ -64,6 +66,16 @@ bscp --resume-from 42949672960 /dev/sda myhost:/dev/sda
 # Auto-retry up to 3 times on transient connection failures
 bscp --retries 3 /dev/sda myhost:/dev/sda
 ```
+
+### Exit status
+
+| Code  | Meaning                                                                          |
+| ----- | -------------------------------------------------------------------------------- |
+| `0`   | Transfer completed successfully (or dry-run finished).                           |
+| `1`   | Fatal error — remote file not accessible, size mismatch, or SSH failure.         |
+| `2`   | Bad arguments or usage error.                                                    |
+| `3`   | Connection lost — transfer incomplete; re-run with `--resume-from`.              |
+| `130` | Interrupted by user (Ctrl+C).                                                    |
 
 ## How it works
 
