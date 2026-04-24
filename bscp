@@ -1,5 +1,13 @@
 #!/usr/bin/env -S python3 -O -B
 
+# Create static binary bscp.nuitka:
+# sudo apt install patchelf && \
+# pyenv local 3.14.3 && \
+# python -m venv nuitka && source nuitka/bin/activate && \
+# pip install --upgrade pip wheel Nuitka[all] && \
+# ++ python -m nuitka bscp --mode=onefile --static-libpython=yes -o bscp.nuitka
+# -- python -m nuitka bscp --mode=standalone --static-libpython=yes -o bscp.nuitka
+
 # Copyright (C) 2012-2024  The Bscp Authors <https://github.com/bscp-tool/bscp/graphs/contributors>
 #
 # Permission to use, copy, modify, and/or distribute this software for any
@@ -56,7 +64,7 @@ last_report_len = 0   # last progress or error length message on screen, if any;
 quiet = False         # option -q or --quiet: suppress '\r' progress report line normally updated via stderr
 batch = False         # option --batch: suppress all stderr output, return only a suitable exit code (see help)
 
-
+remote_script = '''
 def _remote():
     import hashlib, os, struct, sys  # noqa: F401 (standalone on remote host)
 
@@ -136,7 +144,7 @@ def _remote():
                     stdout.flush()
 
             pos = sec_end
-
+'''
 
 class IOCounter:
     def __init__(self, in_stream, out_stream):
@@ -243,8 +251,8 @@ def build_resume_cmd(argv0, args, src, dst, offset, block_count=None):
         parts.append('-N')
     if args.allow_smaller:
         parts.append('--allow-smaller')
-    if args.reread:
-        parts.append('--reread')
+    if args.buffer:
+        parts.append('--buffer')
     bc = args.block_count if block_count is None else block_count
     if bc:
         parts += ['-n', str(bc)]
@@ -269,7 +277,7 @@ def build_ssh_cmd(remote_host, args):
         cmd += ['-i', args['identity']]
     for opt in (args.get('ssh_opt') or []):
         cmd += ['-o', opt]
-    script = inspect.getsource(_remote) + '\n_remote()'
+    script = remote_script + '\n_remote()'
     cmd += ['--', remote_host,
             'for py in python3 python2 python; do '
             'command -v "$py" >/dev/null 2>&1 && exec "$py" -O -B -c "%s"; '
@@ -279,7 +287,7 @@ def build_ssh_cmd(remote_host, args):
 
 def do_sync(local_filename, remote_host, remote_filename, mode,
             blocksize, section_size, hashname,
-            start_offset=0, dry_run=False, block_count=0, allow_smaller=False, reread=False, ssh_args=None):
+            start_offset=0, dry_run=False, block_count=0, allow_smaller=False, buffer=False, ssh_args=None):
 
     ssh_args = ssh_args or {}
     fn_bytes = remote_filename.encode('utf-8')
@@ -362,7 +370,7 @@ def do_sync(local_filename, remote_host, remote_filename, mode,
                     local_dig  = hashlib.new(hashname, block).digest()
                     remote_dig = io.read(dig_size)
                     if local_dig != remote_dig:
-                        if mode == MODE_PUSH and not reread:
+                        if mode == MODE_PUSH and buffer:
                             diff_blocks.append((p, block))
                         else:
                             diff_positions.append(p)
@@ -394,7 +402,7 @@ def do_sync(local_filename, remote_host, remote_filename, mode,
                 newly = total_scanned - skipped_blocks
                 scan_remaining_eta = (t_xfer - t_start_scan) * (total_blocks - total_scanned) / max(1, newly)
 
-                if mode == MODE_PUSH and reread:
+                if mode == MODE_PUSH and not buffer:
                     send_count       = 0 if dry_run else len(diff_positions)
                     total_copy_bytes = sum(min(blocksize, sync_size - rp) for rp in diff_positions)
                     io.write(struct.pack('<Q', send_count))
@@ -522,10 +530,10 @@ if __name__ == '__main__':
                         help='allow destination to be smaller than source; '
                              'syncs only the bytes that fit. '
                              'WARNING: data beyond destination size is not copied.')
-    parser.add_argument('--reread',                   action='store_true',
-                        help='push: re-read differing blocks from disk during '
-                             'transfer instead of buffering them in memory. '
-                             'Lower memory use at the cost of a second disk read pass.')
+    parser.add_argument('--buffer',                   action='store_true',
+                        help='push: buffer differing blocks in memory during '
+                             'transfer instead of re-reading them from disk. '
+                             'Higher memory use, but only one disk read pass needed. Experimental.')
     parser.add_argument('-q', '--quiet',              action='store_true',
                         help='suppress scan/copy progress lines; errors and warnings are still shown')
     parser.add_argument('--batch',                    action='store_true',
@@ -565,11 +573,11 @@ if __name__ == '__main__':
     start_offset = (args.resume_from // section_size) * section_size
     ssh_args     = vars(args)
 
-    # For push without --reread, cap section size at half of available memory
+    # For push with --buffer, cap section size at half of available memory
     # so that the diff_blocks list (one full block per diff) cannot exhaust RAM.
-    # With --reread (or pull), only 8-byte positions are stored, so no cap needed.
-    reread = args.reread
-    if mode == MODE_PUSH and not reread:
+    # Without --buffer (or while pulling), only 8-byte positions are stored, so no cap needed.
+    buffer = args.buffer
+    if mode == MODE_PUSH and buffer:
         avail = available_memory()
         if avail >= MIN_MEMORY_PUSH:
             mem_limit = max(avail // 2, blocksize)
@@ -578,8 +586,8 @@ if __name__ == '__main__':
                 report('\nNote: section size reduced to %s (half of available memory)\n'
                         % format_size(section_size, floor=True))
         else:
-            reread = True
-            report('\nNote: Dropping to re-read mode due to low amount of available memory)\n')
+            buffer = False
+            report('\nNote: Dropping buffer mode due to low amount of available memory)\n')
 
     resume_cmd = lambda offset: build_resume_cmd(
         sys.argv[0], args, src, dst, offset)
@@ -596,7 +604,7 @@ if __name__ == '__main__':
                     mode, blocksize, section_size, hashname,
                     start_offset=start_offset, dry_run=dry_run,
                     block_count=args.block_count, allow_smaller=args.allow_smaller,
-                    reread=reread, ssh_args=ssh_args)
+                    buffer=buffer, ssh_args=ssh_args)
                 break
             except ConnectionLost as exc:
                 if attempt < args.retries and not exc.interrupted:
