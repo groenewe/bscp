@@ -117,36 +117,44 @@ def _remote():
         if sync_size == 0:
             sys.exit(0)
 
-        pos = start_offset
-        while pos < sync_size:
-            sec_end = min(pos + eff_section, sync_size)
+        # If the client decides to abort after the handshake (e.g. its
+        # post-handshake truncate check fires) it closes its end of the
+        # pipe, which surfaces here as a short stdin read or a broken stdout
+        # write.  Treat both as a clean shutdown rather than letting Python
+        # spew a traceback over the user's stderr.
+        try:
+            pos = start_offset
+            while pos < sync_size:
+                sec_end = min(pos + eff_section, sync_size)
 
-            p = pos
-            while p < sec_end:
-                bl = min(blocksize, sec_end - p)
-                f.seek(p)
-                stdout.write(hashlib.new(hashname, f.read(bl)).digest())
-                p += bl
-            stdout.flush()
+                p = pos
+                while p < sec_end:
+                    bl = min(blocksize, sec_end - p)
+                    f.seek(p)
+                    stdout.write(hashlib.new(hashname, f.read(bl)).digest())
+                    p += bl
+                stdout.flush()
 
-            (count,) = struct.unpack('<Q', stdin.read(8))
+                (count,) = struct.unpack('<Q', stdin.read(8))
 
-            if mode == MODE_PUSH:
-                for _ in range(count):
-                    (wpos,) = struct.unpack('<Q', stdin.read(8))
-                    bl = min(blocksize, sync_size - wpos)
-                    f.seek(wpos)
-                    f.write(stdin.read(bl))
-            else:
-                for _ in range(count):
-                    (rpos,) = struct.unpack('<Q', stdin.read(8))
-                    bl = min(blocksize, sync_size - rpos)
-                    f.seek(rpos)
-                    stdout.write(f.read(bl))
-                if count:
-                    stdout.flush()
+                if mode == MODE_PUSH:
+                    for _ in range(count):
+                        (wpos,) = struct.unpack('<Q', stdin.read(8))
+                        bl = min(blocksize, sync_size - wpos)
+                        f.seek(wpos)
+                        f.write(stdin.read(bl))
+                else:
+                    for _ in range(count):
+                        (rpos,) = struct.unpack('<Q', stdin.read(8))
+                        bl = min(blocksize, sync_size - rpos)
+                        f.seek(rpos)
+                        stdout.write(f.read(bl))
+                    if count:
+                        stdout.flush()
 
-            pos = sec_end
+                pos = sec_end
+        except (struct.error, IOError, OSError):
+            sys.exit(1)
 '''
 
 class IOCounter:
@@ -343,7 +351,13 @@ def do_sync(local_filename, remote_host, remote_filename, mode,
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         io   = IOCounter(proc.stdout, proc.stdin)
 
-        mode_byte = mode | (ALLOW_TRUNCATE if allow_truncate else 0)
+        # The remote runs its own size-mismatch check on the wire-side `size`,
+        # which is the -B-capped local_size — so when -B is in use the remote
+        # would falsely refuse.  The client's check below is authoritative
+        # (it sees local_size_actual and the requested limit), so set the
+        # wire-side ALLOW_TRUNCATE bit whenever -B caps the wire size.
+        wire_truncate = allow_truncate or block_count > 0
+        mode_byte = mode | (ALLOW_TRUNCATE if wire_truncate else 0)
         io.write(struct.pack(HEADER_FMT,
                              local_size, blocksize, section_size, start_offset,
                              len(fn_bytes), len(hn_bytes), mode_byte))
@@ -365,31 +379,36 @@ def do_sync(local_filename, remote_host, remote_filename, mode,
 
         # In push, remote is destination; in pull, remote is source.
         if mode == MODE_PUSH:
-            src_label, src_size, dst_label, dst_size = 'local',  local_size,  'remote', remote_size
+            src_label, src_size, dst_label, dst_size = 'local',  local_size_actual, 'remote', remote_size
         else:
-            src_label, src_size, dst_label, dst_size = 'remote', remote_size, 'local',  local_size
+            src_label, src_size, dst_label, dst_size = 'remote', remote_size, 'local',  local_size_actual
 
+        # -B caps the source for the truncate check too: the user only wants
+        # to sync up to that much, so a smaller destination is only "truncating"
+        # if it can't fit even the requested amount.  An overshoot (-B asks for
+        # more than the source has) is just a warning.
+        eff_src = src_size
         if block_count > 0:
             requested = start_offset + block_count * blocksize
-            actual_src = local_size_actual if mode == MODE_PUSH else remote_size
-            if requested > actual_src:
+            if requested > src_size:
                 report('\nWarning: -B requests up to %s but %s source has only %s; '
                        'syncing only what is available\n' % (
                        format_size(requested, floor=True),
-                       'local' if mode == MODE_PUSH else 'remote',
-                       format_size(actual_src, floor=True)))
+                       src_label, format_size(src_size, floor=True)))
+            else:
+                eff_src = requested
 
-        if dst_size < src_size:
+        if dst_size < eff_src:
             if not allow_truncate:
                 fail('%s destination size %d (%d blocks) < %s source size %d (%d blocks); '
                      'override with --allow-truncate' % (
                      dst_label, dst_size, dst_size // blocksize,
-                     src_label, src_size, src_size // blocksize))
+                     src_label, eff_src,  eff_src // blocksize))
             dst_h = format_size(dst_size, floor=True)
             report('\nWarning: %s destination (%s) smaller than %s source (%s); '
                    'syncing only first %s\n' % (
                    dst_label, dst_h, src_label,
-                   format_size(src_size, floor=True), dst_h))
+                   format_size(eff_src, floor=True), dst_h))
 
         sync_size = min(local_size, remote_size)
         if sync_size == 0:
@@ -564,8 +583,7 @@ if __name__ == '__main__':
     parser.add_argument('-B', '--block-count',        default=0, type=parse_block_count, metavar='N',
                         help='limit sync to first N blocks (default 0 = no limit). '
                              'A K/M/G/T suffix interprets the value as bytes, '
-                             'rounded up to a whole number of blocks. '
-                             'Implies --allow-truncate.')
+                             'rounded up to a whole number of blocks.')
     parser.add_argument('--allow-truncate',           action='store_true',
                         help='allow destination to be smaller than source; '
                              'syncs only the bytes that fit. '
@@ -619,11 +637,6 @@ if __name__ == '__main__':
     # values; resolve to a block count now that blocksize is known.
     if args.block_count < 0:
         args.block_count = (-args.block_count + blocksize - 1) // blocksize
-    # -B explicitly limits how much to transfer; without --allow-truncate the
-    # implicit destination-smaller check would refuse pulls into a larger
-    # local file (and pushes to a smaller remote), defeating the option.
-    if args.block_count > 0:
-        args.allow_truncate = True
 
     # For push with --buffer, cap section size at half of available memory
     # so that the diff_blocks list (one full block per diff) cannot exhaust RAM.

@@ -157,15 +157,27 @@ test_block_count_size_suffix() {
     echo "$out" | grep -q -- '-r 4M' && cmp -n $((4 * 1024 * 1024)) "$SRC" "$DST"
 }
 
-test_block_count_implies_allow_truncate() {
+test_block_count_pull_no_truncate_needed() {
     make_src 10
     copy_src_to "$DST2"
     randomise_in "$DST2" 8 100
-    # Pull where local and remote are both 10 MiB; -B caps the sync to 4 MiB,
-    # so dst_size (capped) < src_size.  Without -B implying --allow-truncate
-    # the size-mismatch check would refuse with a non-zero exit.
+    # Pull where local and remote are both 10 MiB; -B caps the requested sync
+    # to 4 MiB.  Effective source (4 MiB) fits in the local destination, so no
+    # --allow-truncate should be required even though local would otherwise be
+    # "shorter" than what -B caps from the wire-side.
     "$BSCP" -s 2M -B 64 "localhost:$SRC" "$DST2" >/dev/null 2>&1 \
         && cmp -n $((4 * 1024 * 1024)) "$SRC" "$DST2"
+}
+
+test_block_count_truncate_still_required() {
+    make_src 10
+    make_blank "$DST" 4
+    # Push with -B 8M asks for more than the 4 MiB destination can hold.
+    # Without --allow-truncate this must refuse, and exit non-zero.
+    "$BSCP" -s 2M -B 8M "$SRC" "localhost:$DST" >/dev/null 2>&1 && return 1
+    # With --allow-truncate it proceeds and the first 4 MiB land.
+    "$BSCP" -s 2M -B 8M --allow-truncate "$SRC" "localhost:$DST" >/dev/null 2>&1 || return 1
+    cmp -n $((4 * 1024 * 1024)) "$SRC" "$DST"
 }
 
 test_block_count_overshoot_warns() {
@@ -257,7 +269,8 @@ run "--allow-truncate pull (smaller dst)"            test_allow_truncate_pull
 run "--batch is silent on success and exits 0"       test_batch_silent_success
 run "--block-count prints next-offset resume hint"   test_block_count_continue
 run "-B accepts K/M/G byte-size suffix"              test_block_count_size_suffix
-run "-B implies --allow-truncate"                    test_block_count_implies_allow_truncate
+run "-B pull within dst size needs no truncate flag" test_block_count_pull_no_truncate_needed
+run "-B beyond dst size still requires --truncate"   test_block_count_truncate_still_required
 run "-B overshoot prints warning, exits 0"           test_block_count_overshoot_warns
 run "exit 2 when neither side is HOST:path"          test_exit2_when_no_host
 run "friendly error when local file is missing"      test_friendly_error_for_missing_local

@@ -129,14 +129,19 @@ stateless with respect to window size.
   client treats 0 as an error.  This means a legitimately-empty remote file
   is indistinguishable from "not found" — known limitation, documented in
   `PROTOCOL.md`.
-- **Without `ALLOW_TRUNCATE`, destination size must be ≥ source size.**
+- **Without `ALLOW_TRUNCATE`, destination size must be ≥ effective source
+  size**, where `effective_src = min(src_size, requested)` and `requested =
+  start_offset + block_count * blocksize` if `-B` is in use (else `src_size`).
   In push the remote is the destination; in pull the local file is.  Both
   client and server enforce this from their respective side.  With the
   `ALLOW_TRUNCATE` flag set (`--allow-truncate`), `sync_size = min(local,
   remote)` and a warning is printed when the destination is the limiting
-  side.  `--block-count` (`-B`) implicitly sets `--allow-truncate` because
-  it deliberately caps `local_size` below the actual file/device size, and
-  in pull mode that would otherwise trip the destination-smaller check.
+  side.  `--block-count` (`-B`) and `--allow-truncate` are independent:
+  `-B` caps how much data flows through, but if its effective source still
+  exceeds the destination (e.g. push `-B 80M` to a 50M remote), the
+  destination-smaller check fires and `--allow-truncate` is required.
+  An overshoot — `-B` asking for more than the source actually has — is
+  only a warning.
 
 ## Symmetric size validation (do_sync / _remote)
 
@@ -279,7 +284,8 @@ to cover, plus a few that were easy to forget:
 | `--batch` is silent on success and exits 0      | no stderr leakage; exit-code-only contract        |
 | `--block-count` prints next-offset resume hint  | `Continue with: ... -r 4M` chaining               |
 | `-B` accepts K/M/G byte-size suffix             | suffixed -B is bytes, rounded up to whole blocks  |
-| `-B` implies `--allow-truncate`                 | pull with -B no longer refuses on size mismatch   |
+| `-B` pull within dst size needs no truncate flag | -B does not spuriously trip the truncate check   |
+| `-B` beyond dst size still requires `--truncate` | -B and --allow-truncate stay independent          |
 | `-B` overshoot prints warning, exits 0          | calculated size > actual source warns, syncs rest |
 | exit 2 when neither side is HOST:path           | argparse path                                     |
 | friendly error when local file is missing       | OSError → `Error: Cannot open local file ...`     |
