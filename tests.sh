@@ -192,7 +192,13 @@ test_friendly_error_for_missing_local() {
 }
 
 test_format_size_unit_tests() {
-    cp "$BSCP" "$WORK/bscp_mod.py"
+    # The unit tests `import` the helpers as a module, so we need Python source.
+    # When $BSCP points at a Nuitka binary, fall back to the checked-in source.
+    local mod_src=$BSCP
+    if ! head -1 "$BSCP" 2>/dev/null | grep -q '^#!.*python'; then
+        mod_src="$SCRIPT_DIR/bscp"
+    fi
+    cp "$mod_src" "$WORK/bscp_mod.py"
     PYTHONPATH="$WORK" python3 - <<'PY'
 import bscp_mod as m
 K, M, G, T = 1 << 10, 1 << 20, 1 << 30, 1 << 40
