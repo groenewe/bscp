@@ -196,7 +196,7 @@ def parse_size(s):
     s = s.strip()
     if not s:
         raise ValueError('empty size string')
-    suffixes = {'k': 1024, 'm': 1024**2, 'g': 1024**3}
+    suffixes = {'k': 1024, 'm': 1024**2, 'g': 1024**3, 't': 1024**4}
     if s[-1].lower() in suffixes:
         return int(float(s[:-1]) * suffixes[s[-1].lower()])
     return int(s)
@@ -222,15 +222,27 @@ def fmt_time(seconds):
 
 def format_size(n, floor=False):
     """Return n as a human-readable size string.
-    floor=False (default): only convert when n is an exact multiple (use for CLI args).
-    floor=True: truncate to nearest unit (use for display values and resume offsets)."""
-    for suffix, div in (('G', 1 << 30), ('M', 1 << 20), ('K', 1 << 10)):
-        if floor:
-            if n >= 9 * div:
-                return '%d%s' % (n // div, suffix)
-        else:
-            if n % div == 0 and n // div > 0:
-                return '%d%s' % (n // div, suffix)
+    floor=False (default): only emit a unit when n is an exact multiple of
+        it.  Round-trips losslessly through parse_size(); use for CLI args.
+    floor=True: truncate to the largest unit that keeps the count to four
+        digits or fewer; use for display values.  When the next unit up
+        would otherwise force a count of five or more digits, the count is
+        allowed to drop below ten — e.g. 9999M displays as "9999M" but
+        10000M (= 9.77G) becomes "9G", and 10240M (= 10G) becomes "10G"."""
+    if floor:
+        for suffix, div in (('',  1),
+                            ('K', 1 << 10),
+                            ('M', 1 << 20),
+                            ('G', 1 << 30),
+                            ('T', 1 << 40)):
+            count = n // div
+            if count <= 9999:
+                return '%d%s' % (count, suffix)
+        # n >= 10000 T (≈ 10 PiB) — fall back to T regardless of width.
+        return '%dT' % (n >> 40)
+    for suffix, div in (('T', 1 << 40), ('G', 1 << 30), ('M', 1 << 20), ('K', 1 << 10)):
+        if n % div == 0 and n // div > 0:
+            return '%d%s' % (n // div, suffix)
     return str(n)
 
 
@@ -500,7 +512,7 @@ if __name__ == '__main__':
               '  pull:  bscp [options] HOST:remote_file   local_file')
     parser.add_argument('-b', '--block-size',   default=DEFAULT_BLOCK,
                         type=parse_size, metavar='SIZE',
-                        help='block size (default 64K; supports K/M/G suffix)')
+                        help='block size (default 64K; supports K/M/G/T suffix)')
     parser.add_argument('-s', '--section-size', default=DEFAULT_SECTION,
                         type=parse_size, metavar='SIZE',
                         help='section size (default 10G; bounds memory use per pass)')
@@ -636,8 +648,11 @@ if __name__ == '__main__':
             total_diffs, format_size(total_diffs * blocksize, floor=True),
             (100.0 * total_diffs * blocksize) / sync_size, fmt_time(elapsed)))
     else:
-        report('\rin=%d out=%d size=%d diffs=%d speedup=%.2f (%s)\n' % (
-            in_total, out_total, sync_size, total_diffs, speedup, fmt_time(elapsed)))
+        report('\rin=%s out=%s size=%s diffs=%d speedup=%.2f (%s)\n' % (
+            format_size(in_total,  floor=True),
+            format_size(out_total, floor=True),
+            format_size(sync_size, floor=True),
+            total_diffs, speedup, fmt_time(elapsed)))
 
     if args.block_count:
         report('Continue with:\n  %s\n' % build_resume_cmd(

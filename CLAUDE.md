@@ -38,12 +38,19 @@ bscp (single file)
 │                        used to cap section size when --buffer is active.
 ├── fmt_time()         — formats seconds as "m:ss" / "h:mm:ss" for progress
 │                        display.
-├── format_size()      — converts a byte count to a human-readable string
-│                        (e.g. 8388608 → "8M").  floor=False (default) only
-│                        converts exact multiples and is the safe choice for
-│                        anything fed back to parse_size() (resume offsets,
-│                        rebuilt CLI args).  floor=True truncates to the
-│                        nearest unit and is for display only.
+├── format_size()      — converts a byte count to a human-readable string.
+│                        floor=False (default) only emits a unit when n is
+│                        an exact multiple of it; round-trips losslessly
+│                        through parse_size() and is the safe choice for
+│                        anything fed back to the CLI (resume offsets,
+│                        rebuilt argv).  floor=True is for display: pick
+│                        the largest unit that keeps the count to four
+│                        digits or fewer.  At unit boundaries this means
+│                        9999M shows as "9999M" but 10000M (= 9.77G) shows
+│                        as "9G", and 10240M (= 10G) as "10G" — the count
+│                        may drop below ten when the hard 4-digit cap
+│                        forces the next unit up.  Supported suffixes are
+│                        K, M, G, T (1024-based).
 ├── build_resume_cmd() — assembles a copy-pasteable resume command line from
 │                        the current argv and the failed section offset.
 ├── build_ssh_cmd()    — assembles the ssh argv list from ssh_args dict.
