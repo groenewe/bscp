@@ -146,6 +146,39 @@ test_block_count_continue() {
     echo "$out" | grep -q -- '-r 4M'
 }
 
+test_block_count_size_suffix() {
+    make_src 10
+    copy_src_to "$DST"
+    randomise_in "$DST" 8 200
+    # -B 4M should be equivalent to -B 64 at the default 64K block size.
+    local out
+    out=$("$BSCP" -s 2M -B 4M "$SRC" "localhost:$DST" 2>&1)
+    (( $? == 0 )) || return 1
+    echo "$out" | grep -q -- '-r 4M' && cmp -n $((4 * 1024 * 1024)) "$SRC" "$DST"
+}
+
+test_block_count_implies_allow_truncate() {
+    make_src 10
+    copy_src_to "$DST2"
+    randomise_in "$DST2" 8 100
+    # Pull where local and remote are both 10 MiB; -B caps the sync to 4 MiB,
+    # so dst_size (capped) < src_size.  Without -B implying --allow-truncate
+    # the size-mismatch check would refuse with a non-zero exit.
+    "$BSCP" -s 2M -B 64 "localhost:$SRC" "$DST2" >/dev/null 2>&1 \
+        && cmp -n $((4 * 1024 * 1024)) "$SRC" "$DST2"
+}
+
+test_block_count_overshoot_warns() {
+    make_src 4
+    copy_src_to "$DST"
+    randomise_in "$DST" 4 100
+    # -B 16M asks for more than the 4 MiB source — must warn, not fail.
+    local out
+    out=$("$BSCP" -s 2M -B 16M "$SRC" "localhost:$DST" 2>&1)
+    (( $? == 0 )) || return 1
+    echo "$out" | grep -q 'Warning: -B requests'
+}
+
 test_exit2_when_no_host() {
     "$BSCP" "$SRC" "$DST" >/dev/null 2>&1
     (( $? == 2 ))
@@ -217,6 +250,9 @@ run "--allow-truncate push (smaller dst)"            test_allow_truncate_push
 run "--allow-truncate pull (smaller dst)"            test_allow_truncate_pull
 run "--batch is silent on success and exits 0"       test_batch_silent_success
 run "--block-count prints next-offset resume hint"   test_block_count_continue
+run "-B accepts K/M/G byte-size suffix"              test_block_count_size_suffix
+run "-B implies --allow-truncate"                    test_block_count_implies_allow_truncate
+run "-B overshoot prints warning, exits 0"           test_block_count_overshoot_warns
 run "exit 2 when neither side is HOST:path"          test_exit2_when_no_host
 run "friendly error when local file is missing"      test_friendly_error_for_missing_local
 run "format_size + parse_size unit tests"            test_format_size_unit_tests

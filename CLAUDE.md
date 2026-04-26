@@ -134,7 +134,9 @@ stateless with respect to window size.
   client and server enforce this from their respective side.  With the
   `ALLOW_TRUNCATE` flag set (`--allow-truncate`), `sync_size = min(local,
   remote)` and a warning is printed when the destination is the limiting
-  side.
+  side.  `--block-count` (`-B`) implicitly sets `--allow-truncate` because
+  it deliberately caps `local_size` below the actual file/device size, and
+  in pull mode that would otherwise trip the destination-smaller check.
 
 ## Symmetric size validation (do_sync / _remote)
 
@@ -276,6 +278,9 @@ to cover, plus a few that were easy to forget:
 | `--allow-truncate` pull (smaller dst)           | symmetric pull behaviour                          |
 | `--batch` is silent on success and exits 0      | no stderr leakage; exit-code-only contract        |
 | `--block-count` prints next-offset resume hint  | `Continue with: ... -r 4M` chaining               |
+| `-B` accepts K/M/G byte-size suffix             | suffixed -B is bytes, rounded up to whole blocks  |
+| `-B` implies `--allow-truncate`                 | pull with -B no longer refuses on size mismatch   |
+| `-B` overshoot prints warning, exits 0          | calculated size > actual source warns, syncs rest |
 | exit 2 when neither side is HOST:path           | argparse path                                     |
 | friendly error when local file is missing       | OSError → `Error: Cannot open local file ...`     |
 | `format_size` + `parse_size` unit tests         | display 4-digit cap rule + lossless round-trip    |

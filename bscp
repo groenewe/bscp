@@ -202,6 +202,24 @@ def parse_size(s):
     return int(s)
 
 
+def parse_block_count(s):
+    """Parse -B value. Bare integer N -> N blocks. With K/M/G/T suffix -> byte
+    size, returned as a negative sentinel that main() resolves to a block
+    count once the (possibly user-overridden) block size is known."""
+    s = s.strip()
+    if not s:
+        raise ValueError('empty block-count value')
+    if s[-1].lower() in ('k', 'm', 'g', 't'):
+        v = parse_size(s)
+        if v < 0:
+            raise ValueError('block-count value must be non-negative')
+        return -v if v else 0
+    n = int(s)
+    if n < 0:
+        raise ValueError('block-count value must be non-negative')
+    return n
+
+
 def available_memory():
     try:
         pages = os.sysconf('SC_AVPHYS_PAGES')
@@ -270,7 +288,7 @@ def build_resume_cmd(argv0, args, src, dst, offset, block_count=None):
         parts.append('--buffer')
     bc = args.block_count if block_count is None else block_count
     if bc:
-        parts += ['-n', str(bc)]
+        parts += ['-B', str(bc)]
     if args.port != 22:
         parts += ['-p', str(args.port)]
     if args.quiet:
@@ -316,7 +334,8 @@ def do_sync(local_filename, remote_host, remote_filename, mode,
         raise RuntimeError('Cannot open local file %s: %s' % (local_filename, e))
     with f:
         f.seek(0, 2)
-        local_size = f.tell()
+        local_size_actual = f.tell()
+        local_size = local_size_actual
         if block_count > 0:
             local_size = min(local_size, start_offset + block_count * blocksize)
 
@@ -349,6 +368,16 @@ def do_sync(local_filename, remote_host, remote_filename, mode,
             src_label, src_size, dst_label, dst_size = 'local',  local_size,  'remote', remote_size
         else:
             src_label, src_size, dst_label, dst_size = 'remote', remote_size, 'local',  local_size
+
+        if block_count > 0:
+            requested = start_offset + block_count * blocksize
+            actual_src = local_size_actual if mode == MODE_PUSH else remote_size
+            if requested > actual_src:
+                report('\nWarning: -B requests up to %s but %s source has only %s; '
+                       'syncing only what is available\n' % (
+                       format_size(requested, floor=True),
+                       'local' if mode == MODE_PUSH else 'remote',
+                       format_size(actual_src, floor=True)))
 
         if dst_size < src_size:
             if not allow_truncate:
@@ -532,8 +561,11 @@ if __name__ == '__main__':
                         help='enable SSH compression')
     parser.add_argument('-N', '--dry-run',      action='store_true',
                         help='count differences only; do not update destination')
-    parser.add_argument('-B', '--block-count',        default=0, type=int, metavar='N',
-                        help='limit sync to first N blocks (default 0 = no limit)')
+    parser.add_argument('-B', '--block-count',        default=0, type=parse_block_count, metavar='N',
+                        help='limit sync to first N blocks (default 0 = no limit). '
+                             'A K/M/G/T suffix interprets the value as bytes, '
+                             'rounded up to a whole number of blocks. '
+                             'Implies --allow-truncate.')
     parser.add_argument('--allow-truncate',           action='store_true',
                         help='allow destination to be smaller than source; '
                              'syncs only the bytes that fit. '
@@ -582,6 +614,16 @@ if __name__ == '__main__':
     # only valid resume boundary is start_offset itself.
     start_offset = (args.resume_from // section_size) * section_size if section_size else args.resume_from
     ssh_args     = vars(args)
+
+    # parse_block_count() returns a negative sentinel for byte-suffixed -B
+    # values; resolve to a block count now that blocksize is known.
+    if args.block_count < 0:
+        args.block_count = (-args.block_count + blocksize - 1) // blocksize
+    # -B explicitly limits how much to transfer; without --allow-truncate the
+    # implicit destination-smaller check would refuse pulls into a larger
+    # local file (and pushes to a smaller remote), defeating the option.
+    if args.block_count > 0:
+        args.allow_truncate = True
 
     # For push with --buffer, cap section size at half of available memory
     # so that the diff_blocks list (one full block per diff) cannot exhaust RAM.
