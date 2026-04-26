@@ -261,38 +261,46 @@ any source-bundling tricks.
 
 ## Testing
 
-No automated test suite.  Manual functional tests:
+A bash regression harness lives at `tests.sh` in the repo root.  It runs
+against `localhost:` and exercises every code path the manual tests used
+to cover, plus a few that were easy to forget:
+
+| Test                                            | What it catches                                   |
+| ----------------------------------------------- | ------------------------------------------------- |
+| push: random 4K diffs in mid-file               | basic push round-trip, hash-exchange correctness  |
+| pull: random 4K diffs in mid-file               | basic pull round-trip, windowed phase B           |
+| dry-run leaves destination unchanged            | `-N` does not write; md5 before == after          |
+| resume from a mid-file section boundary         | `-r` aligns to section, only re-scans the tail    |
+| `--buffer` push                                 | the in-memory diff-block buffer path              |
+| `--allow-truncate` push (smaller dst)           | both refusal-without-flag and warning-with-flag   |
+| `--allow-truncate` pull (smaller dst)           | symmetric pull behaviour                          |
+| `--batch` is silent on success and exits 0      | no stderr leakage; exit-code-only contract        |
+| `--block-count` prints next-offset resume hint  | `Continue with: ... -r 4M` chaining               |
+| exit 2 when neither side is HOST:path           | argparse path                                     |
+| friendly error when local file is missing       | OSError → `Error: Cannot open local file ...`     |
+| `format_size` + `parse_size` unit tests         | display 4-digit cap rule + lossless round-trip    |
+
+Prerequisites: `python3` on PATH, and passwordless `ssh localhost`.  Run:
 
 ```bash
-# Setup
+./tests.sh
+# or, when testing a different binary:
+BSCP=./bscp.amd64 ./tests.sh
+```
+
+The script writes its fixtures into a `mktemp -d` directory and removes
+them on exit.  Exit status is `0` on success, `1` if any test failed (with
+the failing names listed at the end), or `2` on missing prerequisites.
+
+When investigating a single failure interactively, the manual idiom is
+still useful:
+
+```bash
 dd if=/dev/urandom of=/tmp/src.img bs=1M count=100
 cp /tmp/src.img /tmp/dst.img
 dd if=/dev/urandom of=/tmp/dst.img bs=4K count=50 seek=1000 conv=notrunc
-
-# Push
 python3 bscp -s 10M /tmp/src.img localhost:/tmp/dst.img
 diff /tmp/src.img /tmp/dst.img
-
-# Pull
-cp /tmp/src.img /tmp/dst2.img
-dd if=/dev/urandom of=/tmp/dst2.img bs=4K count=50 seek=2000 conv=notrunc
-python3 bscp -s 10M localhost:/tmp/src.img /tmp/dst2.img
-diff /tmp/src.img /tmp/dst2.img
-
-# Dry-run (check diff count, files must not change)
-python3 bscp -N -s 10M /tmp/src.img localhost:/tmp/dst.img
-
-# Resume (modify last section, resume from its start)
-python3 bscp -s 10M -r 90M /tmp/src.img localhost:/tmp/dst.img
-diff /tmp/src.img /tmp/dst.img
-
-# --allow-truncate: destination smaller than source
-truncate -s 50M /tmp/dst.img
-python3 bscp -s 10M --allow-truncate /tmp/src.img localhost:/tmp/dst.img
-cmp -n $((50 * 1024 * 1024)) /tmp/src.img /tmp/dst.img
-
-# --buffer: store diff blocks in memory instead of re-reading
-python3 bscp -s 10M --buffer /tmp/src.img localhost:/tmp/dst.img
 ```
 
 Progress output goes to stderr via `\r`-terminated lines.  Extract the
