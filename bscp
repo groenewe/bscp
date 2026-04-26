@@ -34,7 +34,6 @@
 
 from argparse import ArgumentParser
 import hashlib
-import inspect
 import os
 import shlex
 import struct
@@ -46,7 +45,6 @@ from time import sleep, time
 HEADER_FMT  = '<QQQQQQB'
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 MODE_PUSH, MODE_PULL = 0, 1
-PUSH_PULL_MASK = 1
 ALLOW_TRUNCATE = 2
 
 # Number of diff-block requests sent per round-trip in pull phase B.
@@ -107,13 +105,16 @@ def _remote():
         stdout.write(struct.pack('<Q', remote_size))
         stdout.flush()
 
-        if mode == MODE_PUSH and remote_size < size and not allow_truncate:
+        # In push, remote is destination; in pull, remote is source.
+        # Refuse to proceed if destination is smaller, unless --allow-truncate.
+        dst_size = remote_size if mode == MODE_PUSH else size
+        src_size = size        if mode == MODE_PUSH else remote_size
+        if dst_size < src_size and not allow_truncate:
             sys.exit(1)
-        if mode == MODE_PULL and size < remote_size and not allow_truncate:
-            sys.exit(1)
-        sync_size = min(size, remote_size) if (mode == MODE_PULL or allow_truncate) else size
-        eff_section  = section_size if section_size else sync_size
-        if sync_size == 0 or eff_section == 0:
+
+        sync_size = min(size, remote_size)
+        eff_section = section_size or sync_size
+        if sync_size == 0:
             sys.exit(0)
 
         pos = start_offset
@@ -264,7 +265,7 @@ def build_resume_cmd(argv0, args, src, dst, offset, block_count=None):
         parts.append('-q')
     if args.batch:
         parts.append('--batch')
-    parts += ['-r', format_size(offset, floor=True)]
+    parts += ['-r', format_size(offset)]
     parts += [src, dst]
     return ' '.join(shlex.quote(p) for p in parts)
 
@@ -297,7 +298,11 @@ def do_sync(local_filename, remote_host, remote_filename, mode,
     dig_size = hashlib.new(hashname).digest_size
 
     open_mode = 'rb+' if mode == MODE_PULL else 'rb'
-    with open(local_filename, open_mode) as f:
+    try:
+        f = open(local_filename, open_mode)
+    except OSError as e:
+        raise RuntimeError('Cannot open local file %s: %s' % (local_filename, e))
+    with f:
         f.seek(0, 2)
         local_size = f.tell()
         if block_count > 0:
@@ -314,39 +319,44 @@ def do_sync(local_filename, remote_host, remote_filename, mode,
         io.write(fn_bytes)
         io.write(hn_bytes)
 
-        if io.read(dig_size) != hashlib.new(hashname, fn_bytes).digest():
+        def fail(msg):
+            proc.stdin.close()
             proc.wait()
-            raise RuntimeError('Remote script failed to execute')
+            raise RuntimeError(msg)
+
+        if io.read(dig_size) != hashlib.new(hashname, fn_bytes).digest():
+            fail('Remote script failed to execute')
         io.write(b'go')
 
         (remote_size,) = struct.unpack('<Q', io.read(8))
         if remote_size == 0:
-            proc.wait()
-            raise RuntimeError('Remote file not found or inaccessible')
-        if mode == MODE_PUSH and remote_size < local_size and not allow_truncate:
-            proc.wait()
-            raise RuntimeError(
-                'Remote size %d < local size %d (%d vs %d blocks - override with --allow-truncate option)' % (
-                    remote_size, local_size,
-                    remote_size // blocksize, local_size // blocksize))
-        if mode == MODE_PULL and local_size < remote_size and not allow_truncate:
-            proc.wait()
-            raise RuntimeError(
-                'Local size %d < remote size %d (%d vs %d blocks - override with --allow-truncate option)' % (
-                    local_size, remote_size,
-                    local_size // blocksize, remote_size // blocksize))
-        if allow_truncate:
-            src_size  = remote_size if mode == MODE_PULL else local_size
-            dest_size = remote_size if mode == MODE_PUSH else local_size
-            if dest_size < src_size:
-                report('\nWarning: destination (%s) is smaller than source (%s); '
-                        'syncing only first %s\n' % (
-                        format_size(dest_size, floor=True),
-                        format_size(src_size,  floor=True),
-                        format_size(dest_size, floor=True)))
+            fail('Remote file not found or inaccessible')
 
-        sync_size = min(local_size, remote_size) if (mode == MODE_PULL or allow_truncate) else local_size
-        eff_section  = section_size if section_size else sync_size
+        # In push, remote is destination; in pull, remote is source.
+        if mode == MODE_PUSH:
+            src_label, src_size, dst_label, dst_size = 'local',  local_size,  'remote', remote_size
+        else:
+            src_label, src_size, dst_label, dst_size = 'remote', remote_size, 'local',  local_size
+
+        if dst_size < src_size:
+            if not allow_truncate:
+                fail('%s destination size %d (%d blocks) < %s source size %d (%d blocks); '
+                     'override with --allow-truncate' % (
+                     dst_label, dst_size, dst_size // blocksize,
+                     src_label, src_size, src_size // blocksize))
+            dst_h = format_size(dst_size, floor=True)
+            report('\nWarning: %s destination (%s) smaller than %s source (%s); '
+                   'syncing only first %s\n' % (
+                   dst_label, dst_h, src_label,
+                   format_size(src_size, floor=True), dst_h))
+
+        sync_size = min(local_size, remote_size)
+        if sync_size == 0:
+            # Server has already exited (matching `if sync_size == 0: sys.exit(0)`).
+            proc.stdin.close()
+            proc.wait()
+            return io.in_total, io.out_total, 0, 0, 0
+        eff_section    = section_size or sync_size
         total_blocks   = max(1, (sync_size + blocksize - 1) // blocksize)
         total_sections = max(1, (sync_size + eff_section - 1) // eff_section)
         skipped_blocks = start_offset // blocksize
@@ -410,58 +420,47 @@ def do_sync(local_filename, remote_host, remote_filename, mode,
                 newly = total_scanned - skipped_blocks
                 scan_remaining_eta = (t_xfer - t_start_scan) * (total_blocks - total_scanned) / max(1, newly)
 
+                def show_copy_progress():
+                    nonlocal t_last_progress
+                    now = time()
+                    if now - t_last_progress < REPORT_INTERVAL:
+                        return
+                    t_last_progress = now
+                    elapsed = now - t_xfer
+                    speed   = written / (elapsed * 1024 + 1)
+                    eta     = elapsed * (total_copy_bytes - written) / (written + 1) + scan_remaining_eta
+                    report('\r[%d/%d] copy %s/%s (%.0f KiB/s) %s (%s) ' % (
+                        cur_section, total_sections,
+                        format_size(written, floor=True),
+                        format_size(total_copy_bytes, floor=True),
+                        speed, fmt_time(now - t_start_scan), fmt_time(eta)))
+
                 if mode == MODE_PUSH and not buffer:
-                    send_count       = 0 if dry_run else len(diff_positions)
                     total_copy_bytes = sum(min(blocksize, sync_size - rp) for rp in diff_positions)
-                    io.write(struct.pack('<Q', send_count))
-                    for wpos in diff_positions:
-                        if dry_run:
-                            break
-                        bl = min(blocksize, sync_size - wpos)
-                        f.seek(wpos)
-                        io.write(struct.pack('<Q', wpos))
-                        io.write(f.read(bl))
-                        written += bl
-                        now = time()
-                        if now - t_last_progress >= REPORT_INTERVAL:
-                            t_last_progress = now
-                            copy_elapsed = now - t_xfer
-                            speed = written / (copy_elapsed * 1024 + 1)
-                            eta   = copy_elapsed * (total_copy_bytes - written) / (written + 1) + scan_remaining_eta
-                            report('\r[%d/%d] copy %s/%s (%.0f KiB/s) %s (%s) ' % (
-                                cur_section, total_sections,
-                                format_size(written, floor=True),
-                                format_size(total_copy_bytes, floor=True),
-                                speed, fmt_time(now - t_start_scan), fmt_time(eta)))
+                    io.write(struct.pack('<Q', 0 if dry_run else len(diff_positions)))
+                    if not dry_run:
+                        for wpos in diff_positions:
+                            bl = min(blocksize, sync_size - wpos)
+                            f.seek(wpos)
+                            io.write(struct.pack('<Q', wpos))
+                            io.write(f.read(bl))
+                            written += bl
+                            show_copy_progress()
 
                 elif mode == MODE_PUSH:
-                    send_count      = 0 if dry_run else len(diff_blocks)
                     total_copy_bytes = sum(len(b) for _, b in diff_blocks)
-                    io.write(struct.pack('<Q', send_count))
-                    for i, (wpos, wblock) in enumerate(diff_blocks):
-                        if dry_run:
-                            break
-                        io.write(struct.pack('<Q', wpos))
-                        io.write(wblock)
-                        written += len(wblock)
-                        now = time()
-                        if now - t_last_progress >= REPORT_INTERVAL:
-                            t_last_progress = now
-                            copy_elapsed = now - t_xfer
-                            speed = written / (copy_elapsed * 1024 + 1)
-                            eta   = copy_elapsed * (total_copy_bytes - written) / (written + 1) + scan_remaining_eta
-                            report('\r[%d/%d] copy %s/%s (%.0f KiB/s) %s (%s) ' % (
-                                cur_section, total_sections,
-                                format_size(written, floor=True),
-                                format_size(total_copy_bytes, floor=True),
-                                speed, fmt_time(now - t_start_scan), fmt_time(eta)))
+                    io.write(struct.pack('<Q', 0 if dry_run else len(diff_blocks)))
+                    if not dry_run:
+                        for wpos, wblock in diff_blocks:
+                            io.write(struct.pack('<Q', wpos))
+                            io.write(wblock)
+                            written += len(wblock)
+                            show_copy_progress()
 
                 else:  # pull — windowed to avoid two-pipe deadlock
-                    send_count       = 0 if dry_run else len(diff_positions)
                     total_copy_bytes = sum(min(blocksize, sync_size - rp) for rp in diff_positions)
-                    io.write(struct.pack('<Q', send_count))
+                    io.write(struct.pack('<Q', 0 if dry_run else len(diff_positions)))
                     if not dry_run:
-                        recv_idx = 0
                         for batch_start in range(0, len(diff_positions), PULL_WINDOW):
                             window = diff_positions[batch_start:batch_start + PULL_WINDOW]
                             for rpos in window:
@@ -471,19 +470,8 @@ def do_sync(local_filename, remote_host, remote_filename, mode,
                                 block = io.read(bl)
                                 f.seek(rpos)
                                 f.write(block)
-                                written  += bl
-                                recv_idx += 1
-                                now = time()
-                                if now - t_last_progress >= REPORT_INTERVAL:
-                                    t_last_progress = now
-                                    copy_elapsed = now - t_xfer
-                                    speed = written / (copy_elapsed * 1024 + 1)
-                                    eta   = copy_elapsed * (total_copy_bytes - written) / (written + 1) + scan_remaining_eta
-                                    report('\r[%d/%d] copy %s/%s (%.0f KiB/s) %s (%s) ' % (
-                                        cur_section, total_sections,
-                                        format_size(written, floor=True),
-                                        format_size(total_copy_bytes, floor=True),
-                                        speed, fmt_time(now - t_start_scan), fmt_time(eta)))
+                                written += bl
+                                show_copy_progress()
 
                 total_written += written
                 pos = sec_end
@@ -578,7 +566,9 @@ if __name__ == '__main__':
     section_size = args.section_size
     hashname     = args.algorithm
     dry_run      = args.dry_run
-    start_offset = (args.resume_from // section_size) * section_size
+    # section_size == 0 means whole-file-in-one-section, in which case the
+    # only valid resume boundary is start_offset itself.
+    start_offset = (args.resume_from // section_size) * section_size if section_size else args.resume_from
     ssh_args     = vars(args)
 
     # For push with --buffer, cap section size at half of available memory
@@ -587,15 +577,16 @@ if __name__ == '__main__':
     buffer = args.buffer
     if mode == MODE_PUSH and buffer:
         avail = available_memory()
-        if avail >= MIN_MEMORY_PUSH:
+        if avail < MIN_MEMORY_PUSH:
+            buffer = False
+            report('\nNote: dropping --buffer mode due to low available memory\n')
+        else:
             mem_limit = max(avail // 2, blocksize)
-            if section_size > mem_limit:
+            # section_size == 0 means "whole file as one section" — also clamp.
+            if section_size == 0 or section_size > mem_limit:
                 section_size = mem_limit
                 report('\nNote: section size reduced to %s (half of available memory)\n'
                         % format_size(section_size, floor=True))
-        else:
-            buffer = False
-            report('\nNote: Dropping buffer mode due to low amount of available memory)\n')
 
     resume_cmd = lambda offset: build_resume_cmd(
         sys.argv[0], args, src, dst, offset)

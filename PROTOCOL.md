@@ -62,8 +62,9 @@ Offset  Size  Field
     32     8  filename_len  — byte length of the remote filename
     40     8  hashname_len  — byte length of the hash algorithm name
     48     1  mode          — bit 0: 0 = push, 1 = pull
-                               bit 1: ALLOW_SMALLER flag (destination may be
-                                      smaller than source; use min size)
+                               bit 1: ALLOW_TRUNCATE flag (destination may
+                                      be smaller than source; sync only the
+                                      bytes that fit, i.e. use min size)
 Total: 49 bytes
 ```
 
@@ -87,20 +88,31 @@ The client then writes the 2-byte literal `go` to stdin.
 The server opens the remote file, seeks to the end, and writes its size as a
 `uint64`.
 
-- If the file cannot be opened, the server writes `0` and exits.
-- For **push** without `ALLOW_SMALLER`: the server exits if
-  `remote_size < size` (destination too small).
-- For **push** with `ALLOW_SMALLER`: proceeds even if `remote_size < size`.
-- For **pull** (with or without `ALLOW_SMALLER`): `sync_size = min(size,
-  remote_size)`.  Content beyond the smaller of the two sizes is not synced.
+- If the file cannot be opened, the server writes `0` and exits.  This
+  means a legitimately empty (0-byte) remote file is indistinguishable from
+  "not found" — known limitation.  The client treats `remote_size == 0` as
+  an error and prints `Remote file not found or inaccessible`.
+- In **push** the remote is the destination; in **pull** the remote is the
+  source.  Without `ALLOW_TRUNCATE`, the server exits if the destination is
+  smaller than the source (`dst_size < src_size`).
+- With `ALLOW_TRUNCATE`, both sides proceed and use `sync_size = min(size,
+  remote_size)`.  The client emits a warning if the destination is the
+  smaller side.
 
 The effective number of bytes to sync:
 
 ```
-push:                 sync_size = size (requires remote_size >= size)
-push (allow_smaller): sync_size = min(size, remote_size)
-pull:                 sync_size = min(size, remote_size)
+                          sync_size
+push, no ALLOW_TRUNCATE:  size           (requires remote_size >= size)
+push, ALLOW_TRUNCATE:     min(size, remote_size)
+pull, no ALLOW_TRUNCATE:  remote_size    (requires size >= remote_size)
+pull, ALLOW_TRUNCATE:     min(size, remote_size)
 ```
+
+The client computes `sync_size = min(local_size, remote_size)`
+unconditionally; this gives the correct value in every row above because
+the size-mismatch case has already been rejected unless `ALLOW_TRUNCATE` is
+set.
 
 ---
 
@@ -135,9 +147,9 @@ last:    [p,                    sec_end)   where sec_end - p ≤ blocksize
 The client simultaneously reads its local file block by block, computes
 digests, and compares them with the incoming remote digests.
 
-- **Push**: differing blocks are stored as `(offset, data)` pairs, unless
-  `--reread` is active, in which case only offsets are stored and blocks
-  are re-read from disk during phase B.
+- **Push**: by default, only differing block offsets are stored, and blocks
+  are re-read from disk during phase B.  With `--buffer`, blocks are
+  retained as `(offset, data)` pairs at the cost of higher peak memory.
 - **Pull**: differing block offsets are stored as a list.
 
 ### 4.2 Phase B — block transfer
@@ -224,3 +236,9 @@ correctness and to implement in a self-contained embedded script.
 **Why embed the server script?**  Embedding eliminates the need to install or
 update any software on the remote host.  The client and server are always the
 same protocol version.
+
+The server source is held client-side as a triple-quoted Python string
+(`remote_script`), not extracted from a real function via
+`inspect.getsource()`.  This keeps the file frozen-friendly: prebuilt
+single-file binaries (Nuitka onefile, PyInstaller, etc.) work because
+nothing needs to read the original `.py` file at runtime.

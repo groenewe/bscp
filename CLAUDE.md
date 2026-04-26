@@ -6,23 +6,27 @@
 over SSH, transferring only changed blocks.  It is intended for the use case
 where `rsync` fails — most commonly raw block devices.
 
-The entire codebase is in one file: `bscp`.  There are no external
-dependencies beyond Python 3 stdlib and an installed `ssh` binary.
+The whole client lives in one file: `bscp`.  There are no external
+dependencies beyond the Python 3 stdlib and an installed `ssh` binary.
+
+Two prebuilt single-file Nuitka binaries are checked in for hosts that have
+no Python interpreter installed: `bscp.amd64` (x86-64) and `bscp.arm64`
+(aarch64).  See [Nuitka builds](#nuitka-builds) below.
 
 ## Architecture
 
 ```
 bscp (single file)
-├── _remote()          — Remote-side logic as a real Python function.
-│                        inspect.getsource(_remote) extracts its source at
-│                        runtime; build_ssh_cmd() appends "\n_remote()" and
-│                        passes the result to the remote shell, which tries
-│                        python3, python2, python in order (first found wins,
-│                        via "command -v" + exec).  Client and server are
-│                        therefore always the same protocol version.
-│                        _remote is compatible with Python 2.6+ and 3.x.
-│                        inspect.getsource() reads the script file from disk,
-│                        so frozen/zipfile deployment is not supported.
+├── remote_script      — Triple-quoted Python source for the remote-side
+│                        process.  build_ssh_cmd() appends "\n_remote()"
+│                        and embeds the result inside a "$py" -O -B -c "..."
+│                        shell command.  The remote shell tries python3,
+│                        python2, python in order ("command -v" + exec; first
+│                        found wins), so client and server are always the
+│                        same protocol version.
+│                        The script body is compatible with Python 2.6+ and
+│                        3.x, so no inspect/getsource is needed and the file
+│                        works under Nuitka onefile builds.
 ├── IOCounter          — thin wrapper around subprocess stdin/stdout that
 │                        tracks total bytes sent/received.  Flushes after
 │                        every write to prevent buffering deadlocks.
@@ -31,16 +35,21 @@ bscp (single file)
 │                        False on pipe error).  Used for resume reporting.
 ├── parse_size()       — converts "64K" / "10G" strings to integer bytes.
 ├── available_memory() — queries OS for available physical RAM via sysconf;
-│                        used to cap push section size.
-├── fmt_time()         — formats seconds as "m:ss" for progress display.
+│                        used to cap section size when --buffer is active.
+├── fmt_time()         — formats seconds as "m:ss" / "h:mm:ss" for progress
+│                        display.
 ├── format_size()      — converts a byte count to a human-readable string
 │                        (e.g. 8388608 → "8M").  floor=False (default) only
-│                        converts exact multiples; floor=True truncates to
-│                        the nearest unit (used for display and resume offset).
+│                        converts exact multiples and is the safe choice for
+│                        anything fed back to parse_size() (resume offsets,
+│                        rebuilt CLI args).  floor=True truncates to the
+│                        nearest unit and is for display only.
 ├── build_resume_cmd() — assembles a copy-pasteable resume command line from
 │                        the current argv and the failed section offset.
 ├── build_ssh_cmd()    — assembles the ssh argv list from ssh_args dict.
-├── do_sync()          — all transfer logic for both push and pull.
+├── do_sync()          — all transfer logic for both push and pull.  Hosts
+│                        a `show_copy_progress` closure that all three
+│                        phase-B branches (push, push --buffer, pull) share.
 └── __main__           — argparse, push/pull auto-detection, retry loop.
 ```
 
@@ -50,13 +59,14 @@ bscp (single file)
 `__main__`) so that `build_resume_cmd()` can compare against them to decide
 which options to omit from the reconstructed command line.
 
-`MODE_PUSH`, `MODE_PULL`, `PUSH_PULL_MASK`, and `ALLOW_SMALLER` are also
-defined at module level for use throughout the client.  Because `_remote()` is
-extracted with `inspect.getsource()` and executed standalone on the remote
-host, any constants it needs must be **duplicated inside the function body** —
-the module scope is not available there.  `HEADER_FMT`, `HEADER_SIZE`,
-`MODE_PUSH`, `MODE_PULL`, `PUSH_PULL_MASK`, and `ALLOW_SMALLER` are currently
-duplicated this way.
+`MODE_PUSH`, `MODE_PULL`, and `ALLOW_TRUNCATE` are also defined at module
+level for use throughout the client.  Because the remote runs from a string
+literal extracted standalone on the remote host, any constants the remote
+needs must be **duplicated inside the script body** — the client module
+scope is not available there.  `HEADER_FMT`, `HEADER_SIZE`, `MODE_PUSH`,
+`MODE_PULL`, `PUSH_PULL_MASK`, and `ALLOW_TRUNCATE` are duplicated this way.
+The mask byte is split client-side into `mode | ALLOW_TRUNCATE`; the remote
+reverses this with `mode & PUSH_PULL_MASK` and `mode & ALLOW_TRUNCATE`.
 
 ## Key protocol constants
 
@@ -66,7 +76,7 @@ duplicated this way.
 | `MODE_PUSH`      | `0`          | Push/pull bit in mode byte (bit 0)                                   |
 | `MODE_PULL`      | `1`          | Push/pull bit in mode byte (bit 0)                                   |
 | `PUSH_PULL_MASK` | `1`          | Mask to extract push/pull bit from mode byte                         |
-| `ALLOW_SMALLER`  | `2`          | Flag bit in mode byte (bit 1): allow destination smaller than source |
+| `ALLOW_TRUNCATE` | `2`          | Flag bit in mode byte (bit 1): allow destination smaller than source |
 | `PULL_WINDOW`    | `128`        | Batch size for pull phase B (see below)                              |
 
 ## Protocol summary
@@ -79,19 +89,20 @@ See `PROTOCOL.md` for the full wire-format spec.  Short version:
 2. **Section loop**: file processed in `section_size`-byte chunks.  For each
    section:
    - **Phase A**: server streams one hash digest per block → client reads and
-     compares with local digests.  Push stores `(pos, block)` for diffs (or
-     `pos` only with `--reread`); pull stores `pos` only.
+     compares with local digests.  Default push and pull store diff
+     positions only (8 bytes each); push with `--buffer` stores
+     `(pos, block)` pairs so phase B can skip a re-read.
    - **Phase B** push: client sends `count` then `(pos, block)` for each
      diff; server writes them.
    - **Phase B** pull: client sends `count` then offsets in windows of
      `PULL_WINDOW`; server streams blocks back; client writes locally.
 3. Client closes stdin; server exits.
 
-### Critical: do not change without updating `_remote()`
+### Critical: keep client and remote constants in sync
 
-`HEADER_FMT`, `MODE_PUSH`, `MODE_PULL`, `PUSH_PULL_MASK`, and `ALLOW_SMALLER`
-are defined **in both** the client module and inside `_remote()`.  Any
-protocol change must be made in both places.
+`HEADER_FMT`, `MODE_PUSH`, `MODE_PULL`, `PUSH_PULL_MASK`, and
+`ALLOW_TRUNCATE` are defined **in both** the client module and inside the
+`remote_script` string.  Any protocol change must be made in both places.
 The `PULL_WINDOW` constant lives only in the client — the server is
 stateless with respect to window size.
 
@@ -104,14 +115,43 @@ stateless with respect to window size.
   `bl = min(blocksize, sync_size - pos)`.  Both sides compute this
   identically.  Sending the length explicitly would be a protocol break.
 - **`section_size = 0` means whole file as one section.**  The server
-  computes `eff_section = section_size if section_size else sync_size`.
+  computes `eff_section = section_size or sync_size`.  The client's main()
+  similarly skips the resume-rounding step when `section_size == 0`.
 - **Remote file must exist before sync.**  The tool does not create files.
   The server sends `remote_size = 0` when it cannot open the file; the
-  client treats 0 as an error.
-- **Push requires `remote_size >= local_size`** unless the `ALLOW_SMALLER`
-  flag is set in the mode byte (`--allow-smaller`).  With the flag, both push
-  and pull use `sync_size = min(local_size, remote_size)` and a warning is
-  printed when the destination is the limiting factor.
+  client treats 0 as an error.  This means a legitimately-empty remote file
+  is indistinguishable from "not found" — known limitation, documented in
+  `PROTOCOL.md`.
+- **Without `ALLOW_TRUNCATE`, destination size must be ≥ source size.**
+  In push the remote is the destination; in pull the local file is.  Both
+  client and server enforce this from their respective side.  With the
+  `ALLOW_TRUNCATE` flag set (`--allow-truncate`), `sync_size = min(local,
+  remote)` and a warning is printed when the destination is the limiting
+  side.
+
+## Symmetric size validation (do_sync / _remote)
+
+The push and pull size checks were originally written as four separate
+`if` branches.  They are now expressed as a single check on
+`(src_size, dst_size)`, derived from `mode`:
+
+```python
+if mode == MODE_PUSH:
+    src_label, src_size, dst_label, dst_size = 'local',  local_size,  'remote', remote_size
+else:
+    src_label, src_size, dst_label, dst_size = 'remote', remote_size, 'local',  local_size
+
+if dst_size < src_size:
+    if not allow_truncate:
+        fail('%s destination size %d (%d blocks) < %s source size %d (%d blocks); ...')
+    report('Warning: %s destination (%s) smaller than %s source (%s); ...')
+
+sync_size = min(local_size, remote_size)
+```
+
+`fail()` is a closure that closes `proc.stdin` and waits for the remote
+process before raising `RuntimeError`, so the remote cannot be left blocked
+on `stdin.read(2)` waiting for the `go` token after a failed handshake.
 
 ## PULL\_WINDOW — why it exists and how to change it
 
@@ -135,45 +175,82 @@ If you increase `blocksize` significantly (e.g. to 1 MiB), consider reducing
 
 ## Memory model
 
-| Phase                 | Push (default)                                  | Push (`--reread`)                    | Pull                                 |
-| --------------------- | ----------------------------------------------- | ------------------------------------ | ------------------------------------ |
-| Phase A (per section) | O(diff\_blocks × blocksize) — diff\_blocks list | O(diff\_blocks × 8) — positions only | O(diff\_blocks × 8) — positions only |
-| Phase B               | consumed as sent                                | re-reads each block; O(1)            | consumed as received                 |
-| Peak                  | ≤ section\_size (all blocks differ)             | negligible                           | negligible                           |
+| Phase                 | Push (default)                       | Push (`--buffer`)                              | Pull                                 |
+| --------------------- | ------------------------------------ | ---------------------------------------------- | ------------------------------------ |
+| Phase A (per section) | O(diff\_blocks × 8) — positions only | O(diff\_blocks × blocksize) — positions+blocks | O(diff\_blocks × 8) — positions only |
+| Phase B               | re-reads each block; O(1)            | consumed as sent                               | consumed as received                 |
+| Peak                  | negligible                           | ≤ section\_size (all blocks differ)            | negligible                           |
 
-Section size is the primary memory knob (`-s`).  Smaller sections use less
-memory at the cost of more phase-boundary round-trips.
+Section size (`-s`) is only a real memory knob when `--buffer` is in use.
+By default the client only retains 8-byte offsets, so a single section can
+cover the whole file without RAM impact.
 
-**Automatic clamping (push without `--reread`):** at startup, `available_memory()` is called
-(`os.sysconf('SC_AVPHYS_PAGES') × SC_PAGE_SIZE`) and `section_size` is capped
-at `max(avail // 2, blocksize)`.  With `--reread` (or pull), the client only
-stores diff positions (8 bytes each), so no cap is applied.
+**Automatic clamping (push with `--buffer`):** at startup,
+`available_memory()` is called (`os.sysconf('SC_AVPHYS_PAGES') ×
+SC_PAGE_SIZE`) and `section_size` is capped at `max(avail // 2, blocksize)`.
+A `section_size` of 0 (whole-file-in-one-section) is also clamped under
+`--buffer` so the buffered diff list cannot exhaust RAM.
 
-**Automatic re-read fallback:** if available memory is below `MIN_MEMORY_PUSH`
-(`64 × blocksize`, default 4 MiB), the push is automatically switched to
-`--reread` mode regardless of the user's flag.  A note is printed to stderr
-(suppressed by `--batch`).
+**Automatic disable of `--buffer`:** if available memory is below
+`MIN_MEMORY_PUSH` (`64 × DEFAULT_BLOCK`, i.e. 4 MiB), `--buffer` is
+silently disabled and a note is printed to stderr (suppressed by `--batch`).
+The transfer falls back to the default re-read mode.
 
 ## Remote script constraints
 
-`_remote()` is a normal Python function; its source is extracted with
-`inspect.getsource(_remote)` and passed to the remote shell as
+`remote_script` is a triple-quoted Python source string; it is concatenated
+with `\n_remote()` and passed to the remote shell as
 `python(/2/3) -O -B -c "..."` (double-quoted).  Inside a double-quoted shell
 string, only `\$`, `` \` ``, `\"`, `\\`, and `\<newline>` are special.
 This means:
 
-- **Do not use `"` (double quote) anywhere in `_remote`.**  Use single
+- **Do not use `"` (double quote) anywhere in `remote_script`.**  Use single
   quotes for all Python string literals (`b'go'`, `'rb+'`, `'utf-8'`, etc.).
 - **Backslash sequences are safe** as long as they are not one of the five
   special bash cases above.  Normal Python escape sequences (`\n`, `\t` etc.)
   are fine when needed.
+- **No `$` characters either** — the shell would expand them.  The current
+  source contains none.
+- **No `%` characters** — `remote_script` is interpolated into the shell
+  string with `'... -c "%s" ...' % script`, so a stray `%` would confuse
+  Python's percent-formatting.  The current source contains none.
 - **Newlines are literal** and are preserved by bash.
 - **`#` comments are safe** inside double-quoted strings.
-- Keep `_remote` self-contained: its imports cover everything it needs
+- Keep the body self-contained: its imports cover everything it needs
   (`hashlib`, `os`, `struct`, `sys`); no file I/O outside the sync loop.
 - **Python 2/3 binary I/O**: use `getattr(sys.stdin, 'buffer', sys.stdin)`;
   Python 3 wraps stdin in a text layer (`.buffer` gives raw bytes), Python 2
-  does not.  All other constructs in `_remote` are compatible with both.
+  does not.  All other constructs in the body are compatible with both.
+
+## Nuitka builds
+
+Two single-file binaries are checked in next to the source: `bscp.amd64`
+(x86-64) and `bscp.arm64` (aarch64).  Both were built with Nuitka in
+`--mode=onefile` against Python 3.14.3 and **do not require Python on the
+client host** (the binary embeds the interpreter and the `bscp` source).
+The remote side still needs `python3`, `python2`, or `python` on `PATH` —
+the binary only replaces the local interpreter, not the embedded protocol.
+
+Build environments:
+
+- `bscp.amd64`: Ubuntu 22.04 (amd64 desktop)
+- `bscp.arm64`: Ubuntu 24.04 (Raspberry Pi)
+
+To rebuild (see also the comment block at the top of `bscp`):
+
+```sh
+sudo apt install patchelf
+pyenv local 3.14.3
+python -m venv nuitka && source nuitka/bin/activate
+pip install --upgrade pip wheel Nuitka[all]
+python -m nuitka bscp --mode=onefile --static-libpython=yes -o bscp.nuitka
+```
+
+`--mode=onefile` produces a single self-extracting executable; the
+alternative `--mode=standalone` produces a directory tree and is **not**
+the supported configuration.  Because `remote_script` is a plain string
+literal (no `inspect.getsource()`), Nuitka's onefile mode works without
+any source-bundling tricks.
 
 ## Testing
 
@@ -201,6 +278,14 @@ python3 bscp -N -s 10M /tmp/src.img localhost:/tmp/dst.img
 # Resume (modify last section, resume from its start)
 python3 bscp -s 10M -r 90M /tmp/src.img localhost:/tmp/dst.img
 diff /tmp/src.img /tmp/dst.img
+
+# --allow-truncate: destination smaller than source
+truncate -s 50M /tmp/dst.img
+python3 bscp -s 10M --allow-truncate /tmp/src.img localhost:/tmp/dst.img
+cmp -n $((50 * 1024 * 1024)) /tmp/src.img /tmp/dst.img
+
+# --buffer: store diff blocks in memory instead of re-reading
+python3 bscp -s 10M --buffer /tmp/src.img localhost:/tmp/dst.img
 ```
 
 Progress output goes to stderr via `\r`-terminated lines.  Extract the
@@ -243,7 +328,8 @@ Both flags are forwarded into the resume command printed by
 
 ## Style conventions
 
-- Python 3.6+ only; no compatibility shims.
+- Python 3.6+ only on the client; no compatibility shims.
+- The remote script body must stay 2.6+/3.x compatible (see above).
 - No external dependencies.
 - No comments except where the *why* is non-obvious.
 - `remote_script` uses compact style (fewer blank lines) to keep the
