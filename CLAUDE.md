@@ -77,6 +77,7 @@ reverses this with `mode & PUSH_PULL_MASK` and `mode & ALLOW_TRUNCATE`.
 
 ## Key protocol constants
 
+| ---------------- | ------------ | -------------------------------------------------------------------- |
 | Name             | Value        | Notes                                                                |
 | ---------------- | ------------ | -------------------------------------------------------------------- |
 | `HEADER_FMT`     | `'<QQQQQQB'` | 49-byte protocol header struct                                       |
@@ -85,6 +86,7 @@ reverses this with `mode & PUSH_PULL_MASK` and `mode & ALLOW_TRUNCATE`.
 | `PUSH_PULL_MASK` | `1`          | Mask to extract push/pull bit from mode byte                         |
 | `ALLOW_TRUNCATE` | `2`          | Flag bit in mode byte (bit 1): allow destination smaller than source |
 | `PULL_WINDOW`    | `128`        | Batch size for pull phase B (see below)                              |
+| ---------------- | ------------ | -------------------------------------------------------------------- |
 
 ## Protocol summary
 
@@ -143,7 +145,7 @@ stateless with respect to window size.
   An overshoot — `-B` asking for more than the source actually has — is
   only a warning.
 
-## Symmetric size validation (do_sync / _remote)
+## Symmetric size validation (do\_sync / _remote)
 
 The push and pull size checks were originally written as four separate
 `if` branches.  They are now expressed as a single check on
@@ -189,11 +191,13 @@ If you increase `blocksize` significantly (e.g. to 1 MiB), consider reducing
 
 ## Memory model
 
+| --------------------- | ------------------------------------ | ---------------------------------------------- | ------------------------------------ |
 | Phase                 | Push (default)                       | Push (`--buffer`)                              | Pull                                 |
 | --------------------- | ------------------------------------ | ---------------------------------------------- | ------------------------------------ |
 | Phase A (per section) | O(diff\_blocks × 8) — positions only | O(diff\_blocks × blocksize) — positions+blocks | O(diff\_blocks × 8) — positions only |
 | Phase B               | re-reads each block; O(1)            | consumed as sent                               | consumed as received                 |
 | Peak                  | negligible                           | ≤ section\_size (all blocks differ)            | negligible                           |
+| --------------------- | ------------------------------------ | ---------------------------------------------- | ------------------------------------ |
 
 Section size (`-s`) is only a real memory knob when `--buffer` is in use.
 By default the client only retains 8-byte offsets, so a single section can
@@ -272,24 +276,26 @@ A bash regression harness lives at `tests.sh` in the repo root.  It runs
 against `localhost:` and exercises every code path the manual tests used
 to cover, plus a few that were easy to forget:
 
-| Test                                            | What it catches                                   |
-| ----------------------------------------------- | ------------------------------------------------- |
-| push: random 4K diffs in mid-file               | basic push round-trip, hash-exchange correctness  |
-| pull: random 4K diffs in mid-file               | basic pull round-trip, windowed phase B           |
-| dry-run leaves destination unchanged            | `-N` does not write; md5 before == after          |
-| resume from a mid-file section boundary         | `-r` aligns to section, only re-scans the tail    |
-| `--buffer` push                                 | the in-memory diff-block buffer path              |
-| `--allow-truncate` push (smaller dst)           | both refusal-without-flag and warning-with-flag   |
-| `--allow-truncate` pull (smaller dst)           | symmetric pull behaviour                          |
-| `--batch` is silent on success and exits 0      | no stderr leakage; exit-code-only contract        |
-| `--block-count` prints next-offset resume hint  | `Continue with: ... -r 4M` chaining               |
-| `-B` accepts K/M/G byte-size suffix             | suffixed -B is bytes, rounded up to whole blocks  |
-| `-B` pull within dst size needs no truncate flag | -B does not spuriously trip the truncate check   |
+| ------------------------------------------------ | ------------------------------------------------- |
+| Test                                             | What it catches                                   |
+| ------------------------------------------------ | ------------------------------------------------- |
+| push: random 4K diffs in mid-file                | basic push round-trip, hash-exchange correctness  |
+| pull: random 4K diffs in mid-file                | basic pull round-trip, windowed phase B           |
+| dry-run leaves destination unchanged             | `-N` does not write; md5 before == after          |
+| resume from a mid-file section boundary          | `-r` aligns to section, only re-scans the tail    |
+| `--buffer` push                                  | the in-memory diff-block buffer path              |
+| `--allow-truncate` push (smaller dst)            | both refusal-without-flag and warning-with-flag   |
+| `--allow-truncate` pull (smaller dst)            | symmetric pull behaviour                          |
+| `--batch` is silent on success and exits 0       | no stderr leakage; exit-code-only contract        |
+| `--block-count` prints next-offset resume hint   | `Continue with: ... -r 4M` chaining               |
+| `-B` accepts K/M/G byte-size suffix              | suffixed -B is bytes, rounded up to whole blocks  |
+| `-B` pull within dst size needs no truncate flag | -B does not spuriously trip the truncate check    |
 | `-B` beyond dst size still requires `--truncate` | -B and --allow-truncate stay independent          |
-| `-B` overshoot prints warning, exits 0          | calculated size > actual source warns, syncs rest |
-| exit 2 when neither side is HOST:path           | argparse path                                     |
-| friendly error when local file is missing       | OSError → `Error: Cannot open local file ...`     |
-| `format_size` + `parse_size` unit tests         | display 4-digit cap rule + lossless round-trip    |
+| `-B` overshoot prints warning, exits 0           | calculated size > actual source warns, syncs rest |
+| exit 2 when neither side is HOST:path            | argparse path                                     |
+| friendly error when local file is missing        | OSError → `Error: Cannot open local file ...`     |
+| `format_size` + `parse_size` unit tests          | display 4-digit cap rule + lossless round-trip    |
+| ------------------------------------------------ | ------------------------------------------------- |
 
 Prerequisites: `python3` on PATH, and passwordless `ssh localhost`.  Run:
 
@@ -341,6 +347,7 @@ Errors, warnings, and the final summary line are still printed to stderr.
 `--batch` suppresses **all** stderr output (implies `-q`).  The caller must
 rely solely on the exit status:
 
+| --------- | ---------------------------------------------- |
 | Exit code | Meaning                                        |
 | --------- | ---------------------------------------------- |
 | `0`       | Success                                        |
@@ -348,6 +355,7 @@ rely solely on the exit status:
 | `2`       | Bad arguments                                  |
 | `3`       | Connection lost — resume with `--resume-from`  |
 | `130`     | Interrupted (Ctrl+C)                           |
+| --------- | ---------------------------------------------- |
 
 Both flags are forwarded into the resume command printed by
 `build_resume_cmd()`, so a resumed invocation keeps the same verbosity level.

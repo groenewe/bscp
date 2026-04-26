@@ -9,7 +9,7 @@ in the client binary and executed via `python(/2/3) -c` over the SSH connection.
 
 ## Requirements
 
-Python 3 on both local and remote hosts.  SSH access to the remote host.
+Python 3 on the local host and Python 2 or 3 on the remote host.  SSH access to the remote host.
 
 ## Usage
 
@@ -24,11 +24,14 @@ pull:  bscp [options] HOST:remote_file   local_file
 Exactly one of them must be a `HOST:path` argument; which side carries the
 `HOST:` prefix determines the direction.
 
-The destination file or device **must already exist** and be at least as
-large as the source.
+The destination file or device **must already exist**.  By default it must
+also be at least as large as the source (or, when `-B` is used, at least as
+large as the requested limit); pass `--allow-truncate` to copy only the
+prefix that fits.
 
 ### Options
 
+| ---------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------- |
 | Flag                         | Default  | Description                                                                                                      |
 | ---------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------- |
 | `-b SIZE` / `--block-size`   | `64K`    | Comparison/transfer granularity. Supports `K`/`M`/`G` suffixes.                                                  |
@@ -40,10 +43,13 @@ large as the source.
 | `-o OPT` / `--ssh-opt`       |          | Extra SSH option, repeatable (passed as `-o OPT`).                                                               |
 | `-C` / `--compress`          |          | Enable SSH compression.                                                                                          |
 | `-N` / `--dry-run`           |          | Count differing blocks only; do not update destination.                                                          |
-| `-n N` / `--block-count`     | `0`      | Limit sync to the first N blocks (0 = no limit). The destination will not be fully updated; use intentionally.   |
+| `-B N` / `--block-count`     | `0`      | Limit sync to the first N blocks (0 = no limit). A `K`/`M`/`G`/`T` suffix interprets the value as bytes, rounded up to whole blocks (e.g. `-B 4M`). A warning is printed if the limit exceeds the source size. |
+| `--allow-truncate`           |          | Allow the destination to be smaller than the source (or, with `-B`, smaller than the requested limit); only the bytes that fit are copied. |
+| `--buffer`                   |          | Push: buffer differing blocks in memory during phase B instead of re-reading them from disk. Higher memory use, fewer disk reads. Experimental.  Auto-disabled if available memory is too low. |
 | `-q` / `--quiet`             |          | Suppress scan/copy progress lines. Errors and warnings are still shown.                                          |
 | `--batch`                    |          | Suppress all stderr output; use the exit status to detect errors (implies `-q`).                                 |
 | `-p PORT` / `--port`         | `22`     | SSH port.                                                                                                        |
+| ---------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------- |
 
 ### Examples
 
@@ -65,10 +71,17 @@ bscp --resume-from 42949672960 /dev/sda myhost:/dev/sda
 
 # Auto-retry up to 3 times on transient connection failures
 bscp --retries 3 /dev/sda myhost:/dev/sda
+
+# Limit a long sync to just the first 1 GiB (suffix is bytes, rounded up to blocks)
+bscp -B 1G /dev/sda myhost:/dev/sda
+
+# Sync only the prefix that fits when the destination is smaller than the source
+bscp --allow-truncate /var/backups/disk.img myhost:/data/disk-half.img
 ```
 
 ### Exit status
 
+| ----- | -------------------------------------------------------------------------------- |
 | Code  | Meaning                                                                          |
 | ----- | -------------------------------------------------------------------------------- |
 | `0`   | Transfer completed successfully (or dry-run finished).                           |
@@ -76,6 +89,7 @@ bscp --retries 3 /dev/sda myhost:/dev/sda
 | `2`   | Bad arguments or usage error.                                                    |
 | `3`   | Connection lost — transfer incomplete; re-run with `--resume-from`.              |
 | `130` | Interrupted by user (Ctrl+C).                                                    |
+| ----- | -------------------------------------------------------------------------------- |
 
 ## How it works
 
@@ -100,6 +114,7 @@ See [PROTOCOL.md](../PROTOCOL.md) for the full wire-format specification.
 
 ## Comparison with similar tools
 
+| ---------------------- | ---------------- | ------------ | ------- |
 | Feature                | bscp             | blocksync.py | rsync   |
 | ---------------------- | ---------------- | ------------ | ------- |
 | Block device support   | ✓                | ✓            | Limited |
@@ -108,6 +123,7 @@ See [PROTOCOL.md](../PROTOCOL.md) for the full wire-format specification.
 | Default hash           | SHA-256          | MD5          | MD4/MD5 |
 | Resume support         | ✓                | —            | Partial |
 | Memory bounded         | ✓ (section size) | —            | —       |
+| ---------------------- | ---------------- | ------------ | ------- |
 
 ## See also
 

@@ -54,17 +54,17 @@ the SSH command.  No prior installation on the remote host is required.
 ```
 Offset  Size  Field
      0     8  size          — bytes to sync (local file size for push;
-                               local destination size for pull)
+                              local destination size for pull)
      8     8  blocksize     — bytes per block (must be > 0)
     16     8  section_size  — bytes per section (0 = whole file in one pass)
     24     8  start_offset  — resume offset in bytes (0 for a fresh run;
-                               always a multiple of section_size)
+                              always a multiple of section_size)
     32     8  filename_len  — byte length of the remote filename
     40     8  hashname_len  — byte length of the hash algorithm name
     48     1  mode          — bit 0: 0 = push, 1 = pull
-                               bit 1: ALLOW_TRUNCATE flag (destination may
-                                      be smaller than source; sync only the
-                                      bytes that fit, i.e. use min size)
+                              bit 1: ALLOW_TRUNCATE flag (destination may
+                                     be smaller than source; sync only the
+                                     bytes that fit, i.e. use min size)
 Total: 49 bytes
 ```
 
@@ -138,10 +138,10 @@ one digest per block to stdout, then flushes.
 Block boundaries:
 
 ```
-block 0: [sec_start,            sec_start + blocksize)
+block 0: [sec_start,             sec_start + blocksize)
 block 1: [sec_start + blocksize, sec_start + 2×blocksize)
 ...
-last:    [p,                    sec_end)   where sec_end - p ≤ blocksize
+last:    [p,                     sec_end)   where sec_end - p ≤ blocksize
 ```
 
 The client simultaneously reads its local file block by block, computes
@@ -185,7 +185,7 @@ count (uint64)                   — total number of differing blocks
 For each window of up to 128 offsets:
   [client → server]  offset×W   — W uint64 byte offsets
   [server → client]  data×W     — W blocks, each min(blocksize,
-                                   sync_size - offset) bytes
+                                  sync_size - offset) bytes
 ```
 
 The server streams blocks as soon as it reads each offset; it does not buffer
