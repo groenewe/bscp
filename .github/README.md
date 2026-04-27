@@ -5,11 +5,13 @@ blocks that have changed.  It fills the gap where `rsync` fails — most
 notably when the source or destination is a raw block device.
 
 No server-side installation is required: the remote-side script is embedded
-in the client binary and executed via `python(/2/3) -c` over the SSH connection.
+in the client and executed via `python(/2/3) -c` over the SSH connection,
+with a Perl fallback for hosts that have no Python interpreter.
 
 ## Requirements
 
-Python 3 on the local host and Python 2 or 3 on the remote host.  SSH access to the remote host.
+Python 3 on the local host and Python 2/3 *or* Perl 5.10+ on the remote
+host.  SSH access to the remote host.
 
 ## Usage
 
@@ -37,7 +39,7 @@ prefix that fits.
 | `-b SIZE` / `--block-size`   | `64K`    | Comparison/transfer granularity. Supports `K`/`M`/`G` suffixes.                                                  |
 | `-s SIZE` / `--section-size` | `10G`    | File is processed in sections of this size. Bounds peak memory to roughly `diff_blocks_per_section × blocksize`. |
 | `-a ALGO` / `--algorithm`    | `sha256` | Hash algorithm. Any algorithm supported by Python's `hashlib` is accepted (e.g. `sha512`, `sha3-256`).           |
-| `-r BYTES` / `--resume-from` | `0`      | Skip ahead to this byte offset (rounded down to a section boundary). Use after an interrupted transfer.          |
+| `-r OFFSET` / `--resume-from`| `0`      | Skip ahead to this byte offset, or to `NN%` / `NN.N%` of the local file (rounded down to a section boundary).    |
 | `--retries N`                | `0`      | Automatically retry on connection failure, up to N times, with exponential back-off.                             |
 | `-i FILE` / `--identity`     |          | SSH identity file (`-i FILE`).                                                                                   |
 | `-o OPT` / `--ssh-opt`       |          | Extra SSH option, repeatable (passed as `-o OPT`).                                                               |
@@ -51,6 +53,7 @@ prefix that fits.
 |                              |          | Higher memory use, fewer disk reads. Experimental. Auto-disabled if available memory is too low.                 |
 | `-q` / `--quiet`             |          | Suppress scan/copy progress lines. Errors and warnings are still shown.                                          |
 | `--batch`                    |          | Suppress all stderr output; use the exit status to detect errors (implies `-q`).                                 |
+|                              |          | Cannot convey a resume offset — use `-q` instead if a caller needs to parse the "Resume with:" stderr line.      |
 | `-p PORT` / `--port`         | `22`     | SSH port.                                                                                                        |
 | ---------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------- |
 
@@ -71,6 +74,9 @@ bscp -s 1G /dev/sda myhost:/dev/sda
 
 # Resume an interrupted push from where it failed
 bscp --resume-from 42949672960 /dev/sda myhost:/dev/sda
+
+# Or, more conveniently, resume from a percentage of the local file
+bscp -r 50% /dev/sda myhost:/dev/sda
 
 # Auto-retry up to 3 times on transient connection failures
 bscp --retries 3 /dev/sda myhost:/dev/sda

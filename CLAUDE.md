@@ -13,6 +13,26 @@ Two prebuilt single-file Nuitka binaries are checked in for hosts that have
 no Python interpreter installed: `bscp.amd64` (x86-64) and `bscp.arm64`
 (aarch64).  See [Nuitka builds](#nuitka-builds) below.
 
+## Documentation map
+
+When a change to `bscp` alters externally-visible behaviour — new flag,
+changed default, new exit code, broader runtime requirements, etc. — the
+following docs must be updated alongside the code:
+
+- **`.github/README.md`** — the user-facing reference rendered on the
+  GitHub project page.  Update the options table, the requirements line,
+  the exit-status table, and add an example when a new flag deserves one.
+- **`CLAUDE.md`** (this file) — developer-facing architecture, protocol,
+  and constraints.  Update the architecture diagram, any affected
+  invariants, and the testing table when new tests land.
+- **`PROTOCOL.md`** — the wire-format spec.  Only touch this on actual
+  protocol changes (header layout, mode bits, phase A/B contract).
+- **`index.html`** — the public landing page.  Rarely needs updating;
+  refresh only when the headline pitch changes.
+
+A bug fix that does not change behaviour does not need doc updates.  A
+change that adds, removes, or alters a flag does.
+
 ## Architecture
 
 ```
