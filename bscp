@@ -220,6 +220,21 @@ def parse_block_count(s):
     return n
 
 
+def parse_resume_from(s):
+    """Parse -r value. Bare integer or K/M/G/T size string -> bytes (positive).
+    NN% or NN.N% (0..100 inclusive) -> negative permille sentinel that
+    main() resolves to a byte offset against the local file size."""
+    s = s.strip()
+    if not s:
+        raise ValueError('empty resume-from value')
+    if s.endswith('%'):
+        v = float(s[:-1])
+        if not (0 <= v <= 100):
+            raise ValueError('resume-from percentage must be between 0 and 100')
+        return -int(round(v * 10))
+    return parse_size(s)
+
+
 def available_memory():
     try:
         pages = os.sysconf('SC_AVPHYS_PAGES')
@@ -231,7 +246,7 @@ def available_memory():
     return 0
 
 
-def fmt_time(seconds):
+def format_time(seconds):
     s = int(seconds)
     h, s = divmod(s, 3600)
     m, s = divmod(s, 60)
@@ -466,7 +481,7 @@ def do_sync(local_filename, remote_host, remote_filename, mode,
                             format_size(scanned_bytes, floor=True),
                             format_size(sync_size, floor=True),
                             pct_done, ndiff, pct_diff, speed,
-                            fmt_time(elapsed), fmt_time(eta)))
+                            format_time(elapsed), format_time(eta)))
 
                 total_diffs += len(diff_blocks) + len(diff_positions)
 
@@ -490,7 +505,7 @@ def do_sync(local_filename, remote_host, remote_filename, mode,
                         cur_section, total_sections,
                         format_size(written, floor=True),
                         format_size(total_copy_bytes, floor=True),
-                        speed, fmt_time(now - t_start_scan), fmt_time(eta)))
+                        speed, format_time(now - t_start_scan), format_time(eta)))
 
                 if mode == MODE_PUSH and not buffer:
                     total_copy_bytes = sum(min(blocksize, sync_size - rp) for rp in diff_positions)
@@ -565,8 +580,10 @@ if __name__ == '__main__':
                         metavar='ALGO',
                         help='hash algorithm (default sha256)')
     parser.add_argument('-r', '--resume-from',  default=0,
-                        type=parse_size, metavar='BYTES',
-                        help='resume from byte offset (rounded down to section boundary)')
+                        type=parse_resume_from, metavar='OFFSET',
+                        help='resume from byte offset (K/M/G/T suffix accepted), '
+                             'or NN[.N]%% of the local file size; rounded down '
+                             'to section boundary')
     parser.add_argument('--retries',            default=0, type=int, metavar='N',
                         help='auto-retry attempts on connection failure (default 0)')
     parser.add_argument('-i', '--identity',     metavar='FILE',
@@ -594,7 +611,10 @@ if __name__ == '__main__':
     parser.add_argument('--batch',                    action='store_true',
                         help='suppress all stderr output; use exit status to detect errors (implies -q). '
                              'Exit 0=success, 1=fatal error, 2=bad arguments, '
-                             '3=connection lost (resume with --resume-from), 130=interrupted.')
+                             '3=connection lost (resume with --resume-from), 130=interrupted. '
+                             'Note: the exit code cannot convey the resume offset; '
+                             'callers that need to resume should use -q instead and '
+                             'parse the "Resume with:" line from stderr.')
     parser.add_argument('-p', '--port',         default=22, type=int, metavar='PORT',
                         help='SSH port (default 22)')
     parser.add_argument('src', help='source — local path or HOST:path')
@@ -625,9 +645,21 @@ if __name__ == '__main__':
     section_size = args.section_size
     hashname     = args.algorithm
     dry_run      = args.dry_run
+    # parse_resume_from() returns a negative permille sentinel for the NN%
+    # form; resolve against the local file size before section-boundary
+    # rounding.  If the file is missing, fall through with offset 0 — the
+    # friendlier 'Cannot open local file ...' error fires inside do_sync.
+    if args.resume_from < 0:
+        try:
+            local_size_for_pct = os.path.getsize(local_file)
+        except OSError:
+            local_size_for_pct = 0
+        resume_offset = (-args.resume_from) * local_size_for_pct // 1000
+    else:
+        resume_offset = args.resume_from
     # section_size == 0 means whole-file-in-one-section, in which case the
     # only valid resume boundary is start_offset itself.
-    start_offset = (args.resume_from // section_size) * section_size if section_size else args.resume_from
+    start_offset = (resume_offset // section_size) * section_size if section_size else resume_offset
     ssh_args     = vars(args)
 
     # parse_block_count() returns a negative sentinel for byte-suffixed -B
@@ -698,13 +730,13 @@ if __name__ == '__main__':
     if dry_run:
         report('\rdry-run: %d diff blocks (+/- %s) (%.1f%%) (%s)\n' % (
             total_diffs, format_size(total_diffs * blocksize, floor=True),
-            (100.0 * total_diffs * blocksize) / sync_size, fmt_time(elapsed)))
+            (100.0 * total_diffs * blocksize) / sync_size, format_time(elapsed)))
     else:
         report('\rin=%s out=%s size=%s diffs=%d speedup=%.2f (%s)\n' % (
             format_size(in_total,  floor=True),
             format_size(out_total, floor=True),
             format_size(sync_size, floor=True),
-            total_diffs, speedup, fmt_time(elapsed)))
+            total_diffs, speedup, format_time(elapsed)))
 
     if args.block_count:
         report('Continue with:\n  %s\n' % build_resume_cmd(

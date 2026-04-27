@@ -98,6 +98,16 @@ test_resume_from_section() {
         && cmp -s "$SRC" "$DST"
 }
 
+test_resume_from_percent() {
+    make_src 10
+    copy_src_to "$DST"
+    # Modify only the second half (5 MiB onward); -r 50% rounds down to
+    # the 4 MiB section boundary (-s 2M), still covering every diff.
+    randomise_in "$DST" 2 1500
+    "$BSCP" -s 2M -r 50% "$SRC" "localhost:$DST" >/dev/null 2>&1 \
+        && cmp -s "$SRC" "$DST"
+}
+
 test_buffer_push() {
     make_src 10
     copy_src_to "$DST"
@@ -279,6 +289,7 @@ run "push: random 4K diffs in mid-file"              test_push
 run "pull: random 4K diffs in mid-file"              test_pull
 run "dry-run leaves destination unchanged"           test_dryrun_does_not_modify
 run "resume from a mid-file section boundary"        test_resume_from_section
+run "resume from a percentage of local file size"    test_resume_from_percent
 run "--buffer push"                                  test_buffer_push
 run "--allow-truncate push (smaller dst)"            test_allow_truncate_push
 run "--allow-truncate pull (smaller dst)"            test_allow_truncate_pull

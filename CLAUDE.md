@@ -36,7 +36,7 @@ bscp (single file)
 ├── parse_size()       — converts "64K" / "10G" strings to integer bytes.
 ├── available_memory() — queries OS for available physical RAM via sysconf;
 │                        used to cap section size when --buffer is active.
-├── fmt_time()         — formats seconds as "m:ss" / "h:mm:ss" for progress
+├── format_time()      — formats seconds as "m:ss" / "h:mm:ss" for progress
 │                        display.
 ├── format_size()      — converts a byte count to a human-readable string.
 │                        floor=False (default) only emits a unit when n is
@@ -289,6 +289,7 @@ to cover, plus a few that were easy to forget:
 | pull: random 4K diffs in mid-file                | basic pull round-trip, windowed phase B           |
 | dry-run leaves destination unchanged             | `-N` does not write; md5 before == after          |
 | resume from a mid-file section boundary          | `-r` aligns to section, only re-scans the tail    |
+| resume from a percentage of local file size      | `-r NN%` resolves against local size, then rounds |
 | `--buffer` push                                  | the in-memory diff-block buffer path              |
 | `--allow-truncate` push (smaller dst)            | both refusal-without-flag and warning-with-flag   |
 | `--allow-truncate` pull (smaller dst)            | symmetric pull behaviour                          |
@@ -365,6 +366,21 @@ rely solely on the exit status:
 
 Both flags are forwarded into the resume command printed by
 `build_resume_cmd()`, so a resumed invocation keeps the same verbosity level.
+
+`--batch` is exit-code-only by design: there is no sensible way to convey a
+resume offset through an 8-bit status, so callers that need to resume on
+connection loss should use `-q` instead and parse the `Resume with: ...`
+line that goes to stderr.
+
+`-r` / `--resume-from` accepts either a byte offset (with optional K/M/G/T
+suffix) or a percentage (`NN%` / `NN.N%`, 0–100).  The percentage is
+resolved in `main()` against `os.path.getsize(local_file)` before
+section-boundary rounding, so it matches the displayed scan percentage in
+the common cases (push, or pull where local and remote are the same size).
+With `--allow-truncate` and a destination smaller than the source, the
+displayed percentage is against `sync_size = min(local, remote)` while
+`-r NN%` is against the local file size — use a byte offset for precision
+in that edge case.
 
 ## Style conventions
 
