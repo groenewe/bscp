@@ -459,40 +459,46 @@ def build_ssh_cmd(remote_host, args):
     return cmd
 
 
-def do_sync(local_filename, remote_host, remote_filename, mode,
+def do_sync(local_file, remote_host, remote_file, mode,
             blocksize, section_size, hashname,
             start_offset=0, dry_run=False, block_count=0, allow_truncate=False, buffer=False, ssh_args=None):
 
     ssh_args = ssh_args or {}
-    fn_bytes = remote_filename.encode('utf-8')
+    fn_bytes = remote_file.encode('utf-8')
     hn_bytes = hashname.encode('ascii')
     dig_size = hashlib.new(hashname).digest_size
 
+    # Local is the destination on pull (we write blocks back into it) and the
+    # source on push (read-only).  The remote uses the symmetric inverse —
+    # see the open() in remote_script / remote_perl.
     open_mode = 'rb+' if mode == MODE_PULL else 'rb'
     try:
-        f = open(local_filename, open_mode)
+        f = open(local_file, open_mode)
     except OSError as e:
-        raise RuntimeError('Cannot open local file %s: %s' % (local_filename, e))
+        raise RuntimeError('Cannot open local file %s: %s' % (local_file, e))
     with f:
         f.seek(0, 2)
-        local_size_actual = f.tell()
-        local_size = local_size_actual
+        local_size = f.tell()
+        # wire_size is what we ship in the header — the source size as seen
+        # by the protocol, after -B capping.  The unmodified local_size is
+        # still used below for the authoritative truncate check.
+        wire_size = local_size
         if block_count > 0:
-            local_size = min(local_size, start_offset + block_count * blocksize)
+            wire_size = min(wire_size, start_offset + block_count * blocksize)
 
         cmd  = build_ssh_cmd(remote_host, ssh_args)
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         io   = IOCounter(proc.stdout, proc.stdin)
 
         # The remote runs its own size-mismatch check on the wire-side `size`,
-        # which is the -B-capped local_size — so when -B is in use the remote
-        # would falsely refuse.  The client's check below is authoritative
-        # (it sees local_size_actual and the requested limit), so set the
-        # wire-side ALLOW_TRUNCATE bit whenever -B caps the wire size.
+        # which is wire_size (the -B-capped local size) — so when -B is in use
+        # the remote would falsely refuse.  The client's check below is
+        # authoritative (it sees the real local_size and the requested limit),
+        # so set the wire-side ALLOW_TRUNCATE bit whenever -B caps wire_size.
         wire_truncate = allow_truncate or block_count > 0
         mode_byte = mode | (ALLOW_TRUNCATE if wire_truncate else 0)
         io.write(struct.pack(HEADER_FMT,
-                             local_size, blocksize, section_size, start_offset,
+                             wire_size, blocksize, section_size, start_offset,
                              len(fn_bytes), len(hn_bytes), mode_byte))
         io.write(fn_bytes)
         io.write(hn_bytes)
@@ -517,9 +523,9 @@ def do_sync(local_filename, remote_host, remote_filename, mode,
 
         # In push, remote is destination; in pull, remote is source.
         if mode == MODE_PUSH:
-            src_label, src_size, dst_label, dst_size = 'local',  local_size_actual, 'remote', remote_size
+            src_label, src_size, dst_label, dst_size = 'local',  local_size,  'remote', remote_size
         else:
-            src_label, src_size, dst_label, dst_size = 'remote', remote_size, 'local',  local_size_actual
+            src_label, src_size, dst_label, dst_size = 'remote', remote_size, 'local',  local_size
 
         # -B caps the source for the truncate check too: the user only wants
         # to sync up to that much, so a smaller destination is only "truncating"
@@ -548,7 +554,7 @@ def do_sync(local_filename, remote_host, remote_filename, mode,
                    dst_label, dst_h, src_label,
                    format_size(eff_src, floor=True), dst_h))
 
-        sync_size = min(local_size, remote_size)
+        sync_size = min(wire_size, remote_size)
         if sync_size == 0:
             # Server has already exited (matching `if sync_size == 0: sys.exit(0)`).
             proc.stdin.close()
