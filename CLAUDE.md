@@ -257,10 +257,10 @@ the binary only replaces the local interpreter, not the embedded protocol.
 
 Build environments:
 
-- `bscp.amd64`: Ubuntu 22.04 (amd64 desktop)
+- `bscp.amd64`: Ubuntu 22.04 (amd64 desktop) (produced binary works on Ubuntu Jammy installs and higher)
 - `bscp.arm64`: Ubuntu 24.04 (Raspberry Pi)
 
-To rebuild (see also the comment block at the top of `bscp`):
+To rebuild:
 
 ```sh
 sudo apt install patchelf
