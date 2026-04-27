@@ -17,10 +17,12 @@
 # Bscp copies a file or block device over SSH, transferring only changed
 # blocks.  Both push (local → remote) and pull (remote → local) are
 # supported.  The remote-side script is embedded and executed via
-# "python(/2/3) -c", so no installation on the remote host is required.
+# "python(/2/3) -c", with a Perl fallback for hosts without Python, so
+# no installation on the remote host is required.
 # Features: section-based processing to bound memory use, single-pass
-# scan+copy, windowed pull to avoid SSH pipe deadlock, resume on failure,
-# automatic retry with exponential back-off, and dry-run mode.
+# scan+copy, windowed pull to avoid SSH pipe deadlock, resume on failure
+# (byte offset or percentage of source), automatic retry with exponential
+# back-off, and dry-run mode.
 #
 # Changes from branch main-HG onward were made mostly by Claude (Anthropic).
 

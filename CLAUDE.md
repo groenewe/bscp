@@ -19,6 +19,9 @@ When a change to `bscp` alters externally-visible behaviour — new flag,
 changed default, new exit code, broader runtime requirements, etc. — the
 following docs must be updated alongside the code:
 
+- **`bscp`** itself — the comment block at the top of the file is a short
+  highlights-only summary (remote-execution model, key features).  Keep
+  it short; refresh only when one of those highlights changes.
 - **`.github/README.md`** — the user-facing reference rendered on the
   GitHub project page.  Update the options table, the requirements line,
   the exit-status table, and add an example when a new flag deserves one.
