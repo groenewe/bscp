@@ -149,6 +149,120 @@ def _remote():
             sys.exit(1)
 '''
 
+# Perl fallback for hosts that have no Python.  Functionally identical to
+# remote_script above; see CLAUDE.md ("Remote script constraints") for why
+# this exists as a hex-pack-eval payload rather than an inline -c argument.
+remote_perl = '''
+use strict; use warnings;
+binmode STDIN; binmode STDOUT;
+
+my $HEADER_FMT     = 'Q< Q< Q< Q< Q< Q< C';
+my $HEADER_SIZE    = 49;
+my ($MODE_PUSH, $MODE_PULL) = (0, 1);
+my $PUSH_PULL_MASK = 1;
+my $ALLOW_TRUNCATE = 2;
+
+sub r {
+    my $n = shift;
+    my $buf = '';
+    while (length($buf) < $n) {
+        my $chunk;
+        my $got = read(STDIN, $chunk, $n - length($buf));
+        die "short read\\n" unless defined($got) && $got > 0;
+        $buf .= $chunk;
+    }
+    return $buf;
+}
+
+sub make_hash {
+    my $name = lc(shift);
+    if ($name eq 'md5') {
+        require Digest::MD5;
+        return \\&Digest::MD5::md5;
+    }
+    if ($name =~ /^sha(1|224|256|384|512)\\z/) {
+        require Digest::SHA;
+        my $bits = $1;
+        return sub { Digest::SHA->new($bits)->add($_[0])->digest };
+    }
+    die "unsupported hash algorithm: $name\\n";
+}
+
+eval {
+    my $data = r($HEADER_SIZE);
+    my ($size, $blocksize, $section_size, $start_offset,
+        $filename_len, $hashname_len, $mode_byte) = unpack($HEADER_FMT, $data);
+    my $allow_truncate = $mode_byte & $ALLOW_TRUNCATE;
+    my $mode           = $mode_byte & $PUSH_PULL_MASK;
+
+    my $fn_bytes = r($filename_len);
+    my $hashname = r($hashname_len);
+
+    my $hashfn = make_hash($hashname);
+    print STDOUT $hashfn->($fn_bytes);
+    STDOUT->flush;
+
+    exit 1 unless r(2) eq 'go';
+
+    my $fh;
+    unless (open($fh, $mode == $MODE_PUSH ? '+<:raw' : '<:raw', $fn_bytes)) {
+        print STDOUT pack('Q<', 0); STDOUT->flush; exit 1;
+    }
+    seek($fh, 0, 2);
+    my $remote_size = tell($fh);
+    print STDOUT pack('Q<', $remote_size); STDOUT->flush;
+
+    my $dst_size = $mode == $MODE_PUSH ? $remote_size : $size;
+    my $src_size = $mode == $MODE_PUSH ? $size        : $remote_size;
+    exit 1 if $dst_size < $src_size && !$allow_truncate;
+
+    my $sync_size   = $size < $remote_size ? $size : $remote_size;
+    my $eff_section = $section_size || $sync_size;
+    exit 0 if $sync_size == 0;
+
+    my $pos = $start_offset;
+    while ($pos < $sync_size) {
+        my $sec_end = $pos + $eff_section;
+        $sec_end = $sync_size if $sec_end > $sync_size;
+
+        my $p = $pos;
+        while ($p < $sec_end) {
+            my $bl = $blocksize < $sec_end - $p ? $blocksize : $sec_end - $p;
+            seek($fh, $p, 0);
+            my $buf; read($fh, $buf, $bl);
+            print STDOUT $hashfn->($buf);
+            $p += $bl;
+        }
+        STDOUT->flush;
+
+        my ($count) = unpack('Q<', r(8));
+
+        if ($mode == $MODE_PUSH) {
+            for (1..$count) {
+                my ($wpos) = unpack('Q<', r(8));
+                my $bl = $blocksize < $sync_size - $wpos ? $blocksize : $sync_size - $wpos;
+                my $blk = r($bl);
+                seek($fh, $wpos, 0);
+                print $fh $blk;
+            }
+        } else {
+            for (1..$count) {
+                my ($rpos) = unpack('Q<', r(8));
+                my $bl = $blocksize < $sync_size - $rpos ? $blocksize : $sync_size - $rpos;
+                seek($fh, $rpos, 0);
+                my $buf; read($fh, $buf, $bl);
+                print STDOUT $buf;
+            }
+            STDOUT->flush if $count;
+        }
+        $pos = $sec_end;
+    }
+};
+exit 1 if $@;
+exit 0;
+'''
+
+
 class IOCounter:
     def __init__(self, in_stream, out_stream):
         self.in_stream  = in_stream
@@ -325,11 +439,21 @@ def build_ssh_cmd(remote_host, args):
         cmd += ['-i', args['identity']]
     for opt in (args.get('ssh_opt') or []):
         cmd += ['-o', opt]
-    script = remote_script + '\n_remote()'
-    cmd += ['--', remote_host,
-            'for py in python3 python2 python; do '
-            'command -v "$py" >/dev/null 2>&1 && exec "$py" -O -B -c "%s"; '
-            'done' % script]
+    script_py = remote_script + '\n_remote()'
+    hex_pl    = remote_perl.encode('utf-8').hex()
+    # BSCP_FORCE_PERL skips the Python branch — used by tests.sh to exercise
+    # the Perl fallback on a host that has both interpreters.
+    py_branch = '' if os.environ.get('BSCP_FORCE_PERL') else (
+        'for py in python3 python2 python; do '
+        'command -v "$py" >/dev/null 2>&1 && exec "$py" -O -B -c "%s"; '
+        'done; ' % script_py)
+    wrapper = (
+        py_branch +
+        "command -v perl >/dev/null 2>&1 && "
+        "exec perl -e 'eval pack(qq{H*}, q{%s})'; "
+        'echo "bscp: no python or perl found on remote" >&2; exit 127'
+    ) % hex_pl
+    cmd += ['--', remote_host, wrapper]
     return cmd
 
 

@@ -108,6 +108,26 @@ test_resume_from_percent() {
         && cmp -s "$SRC" "$DST"
 }
 
+# BSCP_FORCE_PERL=1 makes build_ssh_cmd skip the Python branch, exercising
+# the Perl fallback against a host that has both interpreters.
+test_perl_remote_push() {
+    command -v perl >/dev/null || return 0   # skip on hosts without perl
+    make_src 4
+    copy_src_to "$DST"
+    randomise_in "$DST" 20 300
+    BSCP_FORCE_PERL=1 "$BSCP" "$SRC" "localhost:$DST" >/dev/null 2>&1 \
+        && cmp -s "$SRC" "$DST"
+}
+
+test_perl_remote_pull() {
+    command -v perl >/dev/null || return 0
+    make_src 4
+    copy_src_to "$DST"
+    randomise_in "$DST" 20 400
+    BSCP_FORCE_PERL=1 "$BSCP" "localhost:$SRC" "$DST" >/dev/null 2>&1 \
+        && cmp -s "$SRC" "$DST"
+}
+
 test_buffer_push() {
     make_src 10
     copy_src_to "$DST"
@@ -290,6 +310,8 @@ run "pull: random 4K diffs in mid-file"              test_pull
 run "dry-run leaves destination unchanged"           test_dryrun_does_not_modify
 run "resume from a mid-file section boundary"        test_resume_from_section
 run "resume from a percentage of local file size"    test_resume_from_percent
+run "perl remote: push (BSCP_FORCE_PERL=1)"          test_perl_remote_push
+run "perl remote: pull (BSCP_FORCE_PERL=1)"          test_perl_remote_pull
 run "--buffer push"                                  test_buffer_push
 run "--allow-truncate push (smaller dst)"            test_allow_truncate_push
 run "--allow-truncate pull (smaller dst)"            test_allow_truncate_pull

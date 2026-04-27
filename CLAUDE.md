@@ -27,6 +27,13 @@ bscp (single file)
 │                        The script body is compatible with Python 2.6+ and
 │                        3.x, so no inspect/getsource is needed and the file
 │                        works under Nuitka onefile builds.
+├── remote_perl        — Triple-quoted Perl translation of remote_script,
+│                        used as a fallback when no Python interpreter is
+│                        on the remote.  Hex-encoded by build_ssh_cmd() and
+│                        decoded with `perl -e 'eval pack(qq{H*}, q{...})'`,
+│                        which sidesteps the no-$, no-%, no-" rules that
+│                        apply to remote_script.  Requires Perl 5.10+ for
+│                        little-endian Q< pack format.
 ├── IOCounter          — thin wrapper around subprocess stdin/stdout that
 │                        tracks total bytes sent/received.  Flushes after
 │                        every write to prevent buffering deadlocks.
@@ -246,14 +253,55 @@ This means:
   Python 3 wraps stdin in a text layer (`.buffer` gives raw bytes), Python 2
   does not.  All other constructs in the body are compatible with both.
 
+## Perl fallback (`remote_perl`)
+
+`remote_perl` is a functional twin of `remote_script` for hosts that have
+no Python interpreter on `PATH`.  It speaks the same wire protocol — any
+change to `HEADER_FMT`, the mode bits, or the section/phase-A/phase-B
+contract must be made in **three** places now: client constants,
+`remote_script`, and `remote_perl`.
+
+Unlike the Python remote, `remote_perl` is **not** subject to the no-`$` /
+no-`%` / no-`"` rules.  `build_ssh_cmd()` hex-encodes the source and the
+remote shell runs it via:
+
+```sh
+perl -e 'eval pack(qq{H*}, q{<hex>})'
+```
+
+The bash single-quotes protect against bash; the hex alphabet is inert in
+any quoting context; Perl's `q{...}` accepts the hex string with no
+escaping; `pack 'H*', ...` decodes; `eval` runs.  Cost: the encoded form
+is 2× the source size, currently ~6.5 KB on the SSH command line — well
+within `ARG_MAX`.
+
+Perl version requirements: 5.10+ (2007) for the `Q<` little-endian pack
+format and the `\z` regex anchor.  The body uses `Digest::SHA` (core since
+5.9.3) and `Digest::MD5` (core since 5.7.3); both are universal in modern
+Perl distributions.
+
+The wrapper tries Python first, then Perl, then prints
+`bscp: no python or perl found on remote` and exits 127.  Setting
+`BSCP_FORCE_PERL=1` in the **client** environment makes `build_ssh_cmd()`
+skip the Python branch entirely; this is the hook tests.sh uses to
+exercise the Perl path on a host where both interpreters are installed.
+
+When editing `remote_perl`, remember the file is read by Python first:
+backslashes that need to reach Perl (e.g. `\n`, `\&`, `\z` in regex)
+must be doubled (`\\n`, `\\&`, `\\z`) in the Python triple-quoted string
+literal.  Single quotes in the Perl source are fine — the outer Python
+container is also single-quoted via `'''...'''`, so embedded `'` is a
+literal quote, not a delimiter.
+
 ## Nuitka builds
 
 Two single-file binaries are checked in next to the source: `bscp.amd64`
 (x86-64) and `bscp.arm64` (aarch64).  Both were built with Nuitka in
 `--mode=onefile` against Python 3.14.3 and **do not require Python on the
 client host** (the binary embeds the interpreter and the `bscp` source).
-The remote side still needs `python3`, `python2`, or `python` on `PATH` —
-the binary only replaces the local interpreter, not the embedded protocol.
+The remote side still needs `python3`, `python2`, `python`, or `perl` on
+`PATH` (the binary embeds both `remote_script` and `remote_perl`); it
+only replaces the local interpreter, not the embedded protocol.
 
 Build environments:
 
@@ -290,6 +338,8 @@ to cover, plus a few that were easy to forget:
 | dry-run leaves destination unchanged             | `-N` does not write; md5 before == after          |
 | resume from a mid-file section boundary          | `-r` aligns to section, only re-scans the tail    |
 | resume from a percentage of local file size      | `-r NN%` resolves against local size, then rounds |
+| perl remote: push (`BSCP_FORCE_PERL=1`)          | wire compatibility of the Perl fallback (push)    |
+| perl remote: pull (`BSCP_FORCE_PERL=1`)          | wire compatibility of the Perl fallback (pull)    |
 | `--buffer` push                                  | the in-memory diff-block buffer path              |
 | `--allow-truncate` push (smaller dst)            | both refusal-without-flag and warning-with-flag   |
 | `--allow-truncate` pull (smaller dst)            | symmetric pull behaviour                          |
