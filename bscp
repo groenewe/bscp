@@ -1,13 +1,5 @@
 #!/usr/bin/env -S python3 -O -B
 
-# Create static binary bscp.nuitka:
-# sudo apt install patchelf && \
-# pyenv local 3.14.3 && \
-# python -m venv nuitka && source nuitka/bin/activate && \
-# pip install --upgrade pip wheel Nuitka[all] && \
-# ++ python -m nuitka bscp --mode=onefile --static-libpython=yes -o bscp.nuitka
-# -- python -m nuitka bscp --mode=standalone --static-libpython=yes -o bscp.nuitka
-
 # Copyright (C) 2012-2024  The Bscp Authors <https://github.com/bscp-tool/bscp/graphs/contributors>
 #
 # Permission to use, copy, modify, and/or distribute this software for any
