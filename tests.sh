@@ -191,6 +191,22 @@ test_block_count_overshoot_warns() {
     echo "$out" | grep -q 'Warning: -B requests'
 }
 
+test_block_count_overshoot_smaller_dst_no_hang() {
+    # Pre-fix this deadlocked: -B sets the wire-side ALLOW_TRUNCATE bit so the
+    # remote starts streaming Phase-A hashes, the client then refuses on its
+    # own check, and proc.wait() blocks against the remote's blocked stdout
+    # write.  sync_size needs to be large enough (>= ~128 MiB at default 64 KiB
+    # blocks / sha256) for the digest stream to fill the OS pipe buffer; sparse
+    # files keep the test cheap.  Output must mention --allow-truncate.
+    truncate -s 256M "$SRC"
+    truncate -s 128M "$DST"
+    local out rc
+    out=$(timeout 30 "$BSCP" -B 512M "$SRC" "localhost:$DST" 2>&1)
+    rc=$?
+    # rc 124 = timeout = bug still present.
+    (( rc != 0 && rc != 124 )) && grep -q -- '--allow-truncate' <<<"$out"
+}
+
 test_exit2_when_no_host() {
     "$BSCP" "$SRC" "$DST" >/dev/null 2>&1
     (( $? == 2 ))
@@ -272,6 +288,7 @@ run "-B accepts K/M/G byte-size suffix"              test_block_count_size_suffi
 run "-B pull within dst size needs no truncate flag" test_block_count_pull_no_truncate_needed
 run "-B beyond dst size still requires --truncate"   test_block_count_truncate_still_required
 run "-B overshoot prints warning, exits 0"           test_block_count_overshoot_warns
+run "-B overshoot + smaller dst exits without hang"  test_block_count_overshoot_smaller_dst_no_hang
 run "exit 2 when neither side is HOST:path"          test_exit2_when_no_host
 run "friendly error when local file is missing"      test_friendly_error_for_missing_local
 run "format_size + parse_size unit tests"            test_format_size_unit_tests

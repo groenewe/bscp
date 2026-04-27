@@ -165,9 +165,15 @@ if dst_size < src_size:
 sync_size = min(local_size, remote_size)
 ```
 
-`fail()` is a closure that closes `proc.stdin` and waits for the remote
-process before raising `RuntimeError`, so the remote cannot be left blocked
-on `stdin.read(2)` waiting for the `go` token after a failed handshake.
+`fail()` is a closure that closes both `proc.stdin` and `proc.stdout` and
+waits for the remote process before raising `RuntimeError`.  Closing stdin
+unblocks the remote if it is waiting on `stdin.read()` (e.g. the post-go
+read-2 in the handshake).  Closing stdout unblocks it if it is mid-stream
+on `stdout.write()` — which happens when the wire-side `ALLOW_TRUNCATE`
+bit is set (any `-B` use) but the client's authoritative check then
+refuses, so the remote has already started streaming Phase-A hashes that
+the client never reads.  Without closing stdout, `proc.wait()` would
+deadlock against the remote's blocked write.
 
 ## PULL\_WINDOW — why it exists and how to change it
 

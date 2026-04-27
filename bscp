@@ -365,7 +365,12 @@ def do_sync(local_filename, remote_host, remote_filename, mode,
         io.write(hn_bytes)
 
         def fail(msg):
+            # Closing stdout too unblocks the remote if it is mid-stream on
+            # stdout.write() (e.g. streaming hashes after we told it
+            # ALLOW_TRUNCATE on the wire but then refuse on our side); without
+            # it proc.wait() would deadlock against the remote's blocked write.
             proc.stdin.close()
+            proc.stdout.close()
             proc.wait()
             raise RuntimeError(msg)
 

@@ -43,9 +43,12 @@ prefix that fits.
 | `-o OPT` / `--ssh-opt`       |          | Extra SSH option, repeatable (passed as `-o OPT`).                                                               |
 | `-C` / `--compress`          |          | Enable SSH compression.                                                                                          |
 | `-N` / `--dry-run`           |          | Count differing blocks only; do not update destination.                                                          |
-| `-B N` / `--block-count`     | `0`      | Limit sync to the first N blocks (0 = no limit). A `K`/`M`/`G`/`T` suffix interprets the value as bytes, rounded up to whole blocks (e.g. `-B 4M`). A warning is printed if the limit exceeds the source size. |
-| `--allow-truncate`           |          | Allow the destination to be smaller than the source (or, with `-B`, smaller than the requested limit); only the bytes that fit are copied. |
-| `--buffer`                   |          | Push: buffer differing blocks in memory during phase B instead of re-reading them from disk. Higher memory use, fewer disk reads. Experimental.  Auto-disabled if available memory is too low. |
+| `-B N` / `--block-count`     | `0`      | Limit sync to the first N blocks (0 = no limit). A `K`/`M`/`G`/`T` suffix interprets the value as bytes,         |
+|                              |          | rounded up to whole blocks (e.g. `-B 4M`). A warning is printed if the limit exceeds the source size.            |
+| `--allow-truncate`           |          | Allow the destination to be smaller than the source (or, with `-B`, smaller than the requested limit);           |
+|                              |          | only the bytes that fit are copied.                                                                              |
+| `--buffer`                   |          | Push: buffer differing blocks in memory during phase B instead of re-reading them from disk.                     |
+|                              |          | Higher memory use, fewer disk reads. Experimental. Auto-disabled if available memory is too low.                 |
 | `-q` / `--quiet`             |          | Suppress scan/copy progress lines. Errors and warnings are still shown.                                          |
 | `--batch`                    |          | Suppress all stderr output; use the exit status to detect errors (implies `-q`).                                 |
 | `-p PORT` / `--port`         | `22`     | SSH port.                                                                                                        |
