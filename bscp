@@ -767,7 +767,11 @@ def do_sync(local_file, remote_host, remote_file, mode,
             proc.wait()
             raise ConnectionLost(last_sec_start) from exc
         except KeyboardInterrupt:
+            # Mirror the BrokenPipeError path: close stdout too, otherwise a
+            # remote blocked mid-write (pull phase B, or any phase A) keeps
+            # proc.wait() hanging forever and the user sees no resume hint.
             proc.stdin.close()
+            proc.stdout.close()
             proc.wait()
             raise ConnectionLost(last_sec_start, interrupted=True)
 
