@@ -28,6 +28,7 @@
 
 from argparse import ArgumentParser
 import hashlib
+import math
 import os
 import select
 import shlex
@@ -648,25 +649,90 @@ def do_sync(local_file, remote_host, remote_file, mode,
         # expected diff volume in the unscanned tail (using the diff-density
         # observed so far) at the observed copy rate.  No regime flip at the
         # phase A → phase B boundary; ETA is stable across sections.
-        t_overall_start      = time()
-        total_scan_time      = 0.0
-        total_copy_time      = 0.0
-        prev_eta             = None     # display-side downward-rate clamp
-        prev_eta_t           = 0.0
-        eta_have_real_sample = False    # smoothing anchor — see smoothed_eta
+        t_overall_start = time()
+        total_scan_time = 0.0
+        total_copy_time = 0.0
 
         # Pre-copy bootstrap: copy throughput is typically 1–2 orders of
-        # magnitude below scan throughput.  This factor is replaced by the
-        # measured copy_rate as soon as the first phase B records bytes,
-        # so it only affects the first few ticks of the very first section.
+        # magnitude below scan throughput.  Used until the first phase B
+        # produces a real copy-rate measurement.
         BOOTSTRAP_COPY_RATIO = 50.0
 
-        # Diff-density EMA: per-section fraction of differing blocks, smoothed
-        # across completed sections.  Lets ETA track varying diff rates
-        # (e.g. only one region of the file changed) without becoming jumpy.
-        # Higher α reacts faster but is noisier; 0.4 is a balanced default.
+        # Minimum cumulative scan/copy time before the rate is considered
+        # reliable enough to drop the `~` bootstrap marker.  The very first
+        # tick fires after a single block in microseconds, so the rate is
+        # noise-dominated; before this threshold we display `~m:ss` to
+        # signal low confidence.  Copy also has a byte-volume gate so fast
+        # transfers (localhost, 10 GbE) — where the whole copy can finish
+        # in under a second — still seed the EMA from real data instead of
+        # being marked bootstrap-quality forever.
+        RATE_RELIABLE_SECS  = 1.0
+        RATE_RELIABLE_BYTES = 4 * 1024 * 1024
+
+        # Diff-density EMA: per-section fraction of differing blocks,
+        # smoothed across completed sections.  α=0.4 balanced.
         DIFF_EMA_ALPHA = 0.4
         ema_diff_frac  = None
+
+        # Scan/copy rate EMAs — time-weighted to track real throughput
+        # changes mid-run (HDD outer↔inner geometry, varying compressibility
+        # under -C, network jitter).  RATE_EMA_TAU is the exponential decay
+        # constant in seconds-of-phase-time; with REPORT_INTERVAL=0.5s, τ=5s
+        # gives an effective ~10-sample window — long enough to ignore
+        # per-tick noise, short enough to react to genuine rate changes
+        # within a few seconds.  Rates are bootstrapped from the cumulative
+        # average at the first sample where the phase has accumulated at
+        # least RATE_RELIABLE_SECS of time, which sidesteps the bogus
+        # first-block measurement entirely.
+        RATE_EMA_TAU         = 5.0
+        ema_scan_rate        = None   # blocks/sec
+        ema_copy_rate        = None   # bytes/sec
+        rate_prev_scan_secs  = 0.0
+        rate_prev_scanned    = skipped_blocks
+        rate_prev_copy_secs  = 0.0
+        rate_prev_written    = 0
+
+        def update_scan_rate_ema(scan_secs_now):
+            nonlocal ema_scan_rate, rate_prev_scan_secs, rate_prev_scanned
+            if scan_secs_now < RATE_RELIABLE_SECS:
+                return
+            if ema_scan_rate is None:
+                # Seed from cumulative — bypasses first-tick noise entirely.
+                ema_scan_rate       = (total_scanned - skipped_blocks) / scan_secs_now
+                rate_prev_scan_secs = scan_secs_now
+                rate_prev_scanned   = total_scanned
+                return
+            dt    = scan_secs_now - rate_prev_scan_secs
+            delta = total_scanned - rate_prev_scanned
+            if dt <= 0 or delta <= 0:
+                return
+            inst          = delta / dt
+            w             = 1.0 - math.exp(-dt / RATE_EMA_TAU)
+            ema_scan_rate = (1 - w) * ema_scan_rate + w * inst
+            rate_prev_scan_secs = scan_secs_now
+            rate_prev_scanned   = total_scanned
+
+        def update_copy_rate_ema(copy_secs_now, written_now):
+            nonlocal ema_copy_rate, rate_prev_copy_secs, rate_prev_written
+            if written_now <= 0:
+                return
+            if (copy_secs_now < RATE_RELIABLE_SECS
+                    and written_now < RATE_RELIABLE_BYTES):
+                return
+            if ema_copy_rate is None:
+                ema_copy_rate       = written_now / copy_secs_now
+                rate_prev_copy_secs = copy_secs_now
+                rate_prev_written   = written_now
+                return
+            dt    = copy_secs_now - rate_prev_copy_secs
+            delta = written_now - rate_prev_written
+            if dt <= 0 or delta <= 0:
+                return
+            inst          = delta / dt
+            w             = 1.0 - math.exp(-dt / RATE_EMA_TAU)
+            ema_copy_rate = (1 - w) * ema_copy_rate + w * inst
+            rate_prev_copy_secs = copy_secs_now
+            rate_prev_written   = written_now
 
         def estimate_eta(now, live_diffs=0, live_written=0,
                          scan_active_since=None, copy_active_since=None,
@@ -676,7 +742,12 @@ def do_sync(local_file, remote_host, remote_file, mode,
                 scan_secs += now - scan_active_since
 
             scan_blocks_done = max(1, total_scanned - skipped_blocks)
-            scan_rate = scan_blocks_done / scan_secs if scan_secs > 0 else 0.0
+            if ema_scan_rate is not None:
+                scan_rate = ema_scan_rate
+            elif scan_secs > 0:
+                scan_rate = scan_blocks_done / scan_secs
+            else:
+                scan_rate = 0.0
             unscanned = max(0, total_blocks - total_scanned)
             remaining_scan_time = unscanned / scan_rate if scan_rate > 0 else 0.0
 
@@ -690,7 +761,9 @@ def do_sync(local_file, remote_host, remote_file, mode,
                 copy_secs += now - copy_active_since
 
             written_cum = total_written + live_written
-            if written_cum > 0 and copy_secs > 0:
+            if ema_copy_rate is not None:
+                copy_rate = ema_copy_rate
+            elif written_cum > 0 and copy_secs > 0:
                 copy_rate = written_cum / copy_secs
             else:
                 copy_rate = max(1.0, scan_rate * blocksize / BOOTSTRAP_COPY_RATIO)
@@ -720,31 +793,6 @@ def do_sync(local_file, remote_host, remote_file, mode,
 
             remaining_copy_time = remaining_copy / copy_rate if copy_rate > 0 else 0.0
             return remaining_scan_time + remaining_copy_time
-
-        def smoothed_eta(raw, now, confident):
-            # Bootstrap (no copy_rate sample yet) is a wild guess — never
-            # smooth against it; let raw show through so the display can
-            # converge fast as soon as real data arrives.  The first
-            # confident tick also re-anchors prev_eta, otherwise the
-            # bootstrap-inflated value would leak into the floor clamp and
-            # the display would crawl down at 1s per wall-clock second from
-            # the bogus initial estimate.  Subsequent confident ticks
-            # clamp downward speed: ETA may never drop faster than wall
-            # clock, so a fast section does not make the next section's
-            # correction look like a jump up.
-            nonlocal prev_eta, prev_eta_t, eta_have_real_sample
-            if not confident or prev_eta is None or not eta_have_real_sample:
-                prev_eta   = raw
-                prev_eta_t = now
-                if confident:
-                    eta_have_real_sample = True
-                return raw
-            dt          = max(0.0, now - prev_eta_t)
-            min_allowed = max(0.0, prev_eta - dt)
-            eta         = raw if raw >= prev_eta else max(raw, min_allowed)
-            prev_eta    = eta
-            prev_eta_t  = now
-            return eta
 
         try:
             pos = start_offset
@@ -782,17 +830,25 @@ def do_sync(local_file, remote_host, remote_file, mode,
                         elapsed      = now - t_overall_start
                         scan_secs    = total_scan_time + (now - t_phase_a_start)
                         speed        = newly * blocksize / (scan_secs * 1024**2 + 1)
-                        # Dry-run has no copy phase, so the scan-only ETA is
-                        # immediately authoritative — no bootstrap to flag.
-                        confident    = dry_run or total_written > 0
+                        update_scan_rate_ema(scan_secs)
+                        # Copy phase is not currently running, but earlier
+                        # sections' phase B may have written bytes — sample
+                        # the EMA from the cumulative totals so it can seed
+                        # without waiting for the next copy tick.
+                        update_copy_rate_ema(total_copy_time, total_written)
+                        # `~` marker means "low confidence" — rate samples
+                        # are still bootstrap-quality.  Drops once both
+                        # rate EMAs are seeded (or scan-only is seeded
+                        # under --dry-run).
+                        confident    = ema_scan_rate is not None and (
+                                           dry_run or ema_copy_rate is not None)
                         sec_blk_done = (p   - pos + blocksize - 1) // blocksize
                         sec_blk_tot  = (sec_end - pos + blocksize - 1) // blocksize
-                        raw_eta      = estimate_eta(now,
+                        eta          = estimate_eta(now,
                                                     live_diffs=sec_diffs,
                                                     scan_active_since=t_phase_a_start,
                                                     sec_blocks_scanned=sec_blk_done,
                                                     sec_blocks_total=sec_blk_tot)
-                        eta          = smoothed_eta(raw_eta, now, confident)
                         eta_mark     = '' if confident else '~'
                         scanned_bytes = min(total_scanned * blocksize, sync_size)
                         report('\rscan %s/%s (%.1f%%) diff blocks=%d (%.1f%%) (%.0f MiB/s) %s (%s%s) ' % (
@@ -823,19 +879,22 @@ def do_sync(local_file, remote_host, remote_file, mode,
                     t_last_progress = now
                     sec_elapsed = max(1e-6, now - t_phase_b_start)
                     speed       = written / (sec_elapsed * 1024 + 1)
-                    confident   = (total_written + written) > 0
-                    raw_eta     = estimate_eta(now,
+                    copy_secs   = total_copy_time + (now - t_phase_b_start)
+                    update_copy_rate_ema(copy_secs, total_written + written)
+                    eta         = estimate_eta(now,
                                                live_written=written,
                                                copy_active_since=t_phase_b_start)
-                    eta         = smoothed_eta(raw_eta, now, confident)
+                    confident   = ema_scan_rate is not None and ema_copy_rate is not None
+                    eta_mark    = '' if confident else '~'
                     pct_pos     = wpos * 100.0 / sync_size
                     pct_sec     = blocks_done * 100.0 / max(1, section_diff_count)
                     cum_blocks  = total_blocks_copied + blocks_done
-                    report('\rcopy %s/%s (%.1f%%) block %d/%d (%.1f%%) (%.0f KiB/s) %s (%s) ' % (
+                    report('\rcopy %s/%s (%.1f%%) block %d/%d (%.1f%%) (%.0f KiB/s) %s (%s%s) ' % (
                         format_size(wpos, floor=True),
                         format_size(sync_size, floor=True),
                         pct_pos, cum_blocks, total_diffs, pct_sec,
-                        speed, format_time(now - t_overall_start), format_time(eta)))
+                        speed, format_time(now - t_overall_start),
+                        eta_mark, format_time(eta)))
 
                 if mode == MODE_PUSH and not buffer:
                     io.write(struct.pack('<Q', 0 if dry_run else len(diff_positions)))

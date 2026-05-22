@@ -466,11 +466,22 @@ copy WPOS/TOTAL (PCT%) block C/N (SEC_PCT%) (SPEED KiB/s) ELAPSED (ETA)
 ETA = `remaining_scan_time + remaining_copy_time`, evaluated at every progress
 tick from cumulative counters that survive section boundaries:
 
-- `scan_rate = (total_scanned - skipped_blocks) / total_scan_time` (blocks/s)
-- `copy_rate = total_written / total_copy_time` (bytes/s); before the first
-  phase B records bytes the rate is bootstrapped as
-  `scan_rate * blocksize / BOOTSTRAP_COPY_RATIO` (default ratio 50:1 — copy is
-  typically 1–2 orders of magnitude slower than scan)
+- `scan_rate` — time-weighted EMA over phase-A throughput; seeded from the
+  cumulative average at the first sample where `total_scan_time` ≥
+  `RATE_RELIABLE_SECS` (default 1.0s), then updated at every progress tick
+  with `w = 1 − exp(−dt / RATE_EMA_TAU)` (default τ = 5s).  Lets ETA track
+  real rate changes mid-run — HDD outer↔inner cylinder geometry, varying
+  block-device queue depth, network jitter.
+- `copy_rate` — same EMA construction over phase-B bytes/sec; seeded once
+  cumulative copy time has reached `RATE_RELIABLE_SECS` **or** cumulative
+  written has reached `RATE_RELIABLE_BYTES` (default 4 MiB), so fast
+  transfers (localhost, 10 GbE) still seed from real data instead of staying
+  in bootstrap forever.  Before the EMA is seeded the rate is bootstrapped
+  as `scan_rate * blocksize / BOOTSTRAP_COPY_RATIO` (default ratio 50:1).
+  Updated both at copy ticks (live) and at scan ticks (using cumulative
+  `total_copy_time` / `total_written`, since copy phases are interleaved
+  with longer scan phases and we don't want to wait until the next copy
+  tick to seed).
 - `diff_frac` — per-section diff-density EMA, blended with the in-progress
   section by its completion ratio.  Completed sections contribute their final
   fraction via `ema = α·sec_frac + (1−α)·ema` (`DIFF_EMA_ALPHA = 0.4`); within
@@ -484,9 +495,12 @@ tick from cumulative counters that survive section boundaries:
 - `remaining_copy_time  = remaining_copy_bytes / copy_rate`
 
 When `--dry-run` is in effect, no blocks are transferred — `remaining_copy_time`
-is forced to zero and the ETA collapses to scan-only.  The `~` bootstrap marker
-is suppressed in dry-run since the scan-only estimate is authoritative on the
-first tick.
+is forced to zero and the ETA collapses to scan-only.
+
+The `~m:ss` bootstrap marker is displayed until the rate EMAs have been
+seeded from real data (both `scan_rate` and `copy_rate`, or just `scan_rate`
+under `--dry-run`).  Once seeded, the marker drops and the displayed ETA
+reflects measured rates.
 
 `total_scan_time` and `total_copy_time` accumulate strictly within their
 respective phases (`t_phase_a_start` / `t_phase_b_start` deltas), so the two
@@ -494,14 +508,16 @@ rates do not contaminate each other.  During the live phase the active
 timer is folded in via the `scan_active_since` / `copy_active_since`
 arguments to `estimate_eta()`.
 
-The displayed value is passed through `smoothed_eta()`, which **clamps
-downward speed**: once smoothing is engaged, ETA may never drop faster than
-wall clock (`prev_eta - dt`).  Going up is unconstrained (new information).
-Smoothing is bypassed while the copy rate is still in bootstrap, and the
-first confident tick (after the first phase B records bytes) re-anchors
-`prev_eta` to the real value — otherwise the bootstrap-inflated estimate
-would leak into the floor clamp and the display would crawl down at 1s
-per wall-clock second from a wildly inflated initial guess.
+There is no display-side smoothing of the ETA itself.  The three EMAs
+(`scan_rate`, `copy_rate`, `diff_frac`) damp their respective inputs; the
+ETA expression is then evaluated and shown as-is.  An earlier design had a
+"downward floor clamp" (ETA may never drop faster than 1s per wall-clock
+second), but this prevented bootstrap overestimates from ever being
+corrected — once the floor anchored to an inflated initial value, the
+display would crawl down at 1s/s for the entire run.  Trusting the input
+EMAs and showing the raw ETA gives faster correction at the cost of mild
+tick-to-tick wiggle (a few seconds), which is the right trade since an
+honest, self-correcting estimate beats a stuck-high one.
 
 Why this design: the old ETA was scan-only during phase A and
 section-only-plus-future-scan during phase B, which made it jump at every
