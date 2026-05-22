@@ -13,6 +13,13 @@ with a Perl fallback for hosts that have no Python interpreter.
 Python 3 on the local host and Python 2/3 *or* Perl 5.10+ on the remote
 host.  SSH access to the remote host.
 
+By default bscp passes `-o ServerAliveInterval=15 -o ServerAliveCountMax=4`
+to ssh so a silently-dropped TCP connection is detected within about 60
+seconds instead of hanging indefinitely; combined with `--retries N` this
+auto-recovers from transient network failures.  Override with your own
+`-o ServerAliveInterval=...` (or set it to `0` to disable) if needed —
+user-supplied `-o` takes precedence.
+
 ## Usage
 
 ```
@@ -40,9 +47,9 @@ prefix that fits.
 | `-s SIZE` / `--section-size` | `10G`    | File is processed in sections of this size. Bounds peak memory to roughly `diff_blocks_per_section × blocksize`. |
 | `-a ALGO` / `--algorithm`    | `sha256` | Hash algorithm. Any algorithm supported by Python's `hashlib` is accepted (e.g. `sha512`, `sha3-256`).           |
 | `-r OFFSET` / `--resume-from`| `0`      | Skip ahead to this byte offset, or to `NN%` / `NN.N%` of the local file (rounded down to a section boundary).    |
-| `--retries N`                | `0`      | Automatically retry on connection failure, up to N times, with exponential back-off.                             |
+| `--retries N`                | `3`      | Automatically retry on connection failure, up to N times, with exponential back-off (`0` disables).              |
 | `-i FILE` / `--identity`     |          | SSH identity file (`-i FILE`).                                                                                   |
-| `-o OPT` / `--ssh-opt`       |          | Extra SSH option, repeatable (passed as `-o OPT`).                                                               |
+| `-o OPT` / `--ssh-opt`       |          | Extra SSH option, repeatable (passed as `-o OPT`). Takes precedence over the defaults below.                     |
 | `-C` / `--compress`          |          | Enable SSH compression.                                                                                          |
 | `-N` / `--dry-run`           |          | Count differing blocks only; do not update destination.                                                          |
 | `-B N` / `--block-count`     | `0`      | Limit sync to the first N blocks (0 = no limit). A `K`/`M`/`G`/`T` suffix interprets the value as bytes,         |
@@ -78,8 +85,8 @@ bscp --resume-from 42949672960 /dev/sda myhost:/dev/sda
 # Or, more conveniently, resume from a percentage of the local file
 bscp -r 50% /dev/sda myhost:/dev/sda
 
-# Auto-retry up to 3 times on transient connection failures
-bscp --retries 3 /dev/sda myhost:/dev/sda
+# Disable auto-retry on connection failures (default is --retries 3)
+bscp --retries 0 /dev/sda myhost:/dev/sda
 
 # Limit a long sync to just the first 1 GiB (suffix is bytes, rounded up to blocks)
 bscp -B 1G /dev/sda myhost:/dev/sda

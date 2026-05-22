@@ -84,6 +84,11 @@ bscp (single file)
 ├── build_resume_cmd() — assembles a copy-pasteable resume command line from
 │                        the current argv and the failed section offset.
 ├── build_ssh_cmd()    — assembles the ssh argv list from ssh_args dict.
+│                        Appends `-o ServerAliveInterval=15 -o ServerAliveCountMax=4`
+│                        after the user's `-o` options so a dropped TCP
+│                        connection surfaces as a BrokenPipeError within
+│                        ~60s instead of hanging.  User `-o` wins because
+│                        ssh applies the first matching `-o`.
 ├── do_sync()          — all transfer logic for both push and pull.  Hosts
 │                        a `show_copy_progress` closure that all three
 │                        phase-B branches (push, push --buffer, pull) share.
@@ -224,6 +229,15 @@ The maximum in-flight data is `PULL_WINDOW × blocksize` (default 128 × 64 KiB
 If you increase `blocksize` significantly (e.g. to 1 MiB), consider reducing
 `PULL_WINDOW` proportionally.  If you decrease `blocksize`, a larger
 `PULL_WINDOW` reduces round-trip overhead on high-latency links.
+
+The remote's pull-phase-B loop flushes stdout after **every** block write
+(both `remote_script` and `remote_perl`).  Per-block flush is a no-op when
+`blocksize` ≥ Python's 8 KiB BufferedWriter buffer (the write already
+bypasses the buffer), so default `64 KiB` blocks pay no measurable cost.
+The flush exists to eliminate a latency-hiccup class where, with small
+custom block sizes, blocks would otherwise sit in the remote's Python or
+Perl I/O buffer waiting for buffer-fill before reaching the wire — a
+read-side stall that looks identical to a deadlock under load.
 
 ## Memory model
 

@@ -49,6 +49,7 @@ PULL_WINDOW = 128
 
 DEFAULT_BLOCK   = 64 * 1024
 DEFAULT_SECTION = 10 * 1024**3
+DEFAULT_RETRIES = 3
 MIN_MEMORY_PUSH = 64 * DEFAULT_BLOCK
 
 REPORT_INTERVAL = 0.5 # status line should update after this many seconds have passed
@@ -143,7 +144,6 @@ def _remote():
                         bl = min(blocksize, sync_size - rpos)
                         f.seek(rpos)
                         stdout.write(f.read(bl))
-                    if count:
                         stdout.flush()
 
                 pos = sec_end
@@ -254,8 +254,8 @@ eval {
                 seek($fh, $rpos, 0);
                 my $buf; read($fh, $buf, $bl);
                 print STDOUT $buf;
+                STDOUT->flush;
             }
-            STDOUT->flush if $count;
         }
         $pos = $sec_end;
     }
@@ -403,7 +403,7 @@ def build_resume_cmd(argv0, args, src, dst, offset, block_count=None):
         parts += ['-s', format_size(args.section_size)]
     if args.algorithm != 'sha256':
         parts += ['-a', args.algorithm]
-    if args.retries:
+    if args.retries != DEFAULT_RETRIES:
         parts += ['--retries', str(args.retries)]
     if args.identity:
         parts += ['-i', args.identity]
@@ -441,6 +441,15 @@ def build_ssh_cmd(remote_host, args):
         cmd += ['-i', args['identity']]
     for opt in (args.get('ssh_opt') or []):
         cmd += ['-o', opt]
+    # Keepalive failsafe: a silently-dropped TCP connection (router NAT
+    # timeout, peer kernel stall, ISP blip) otherwise leaves both ends
+    # blocked on read/write forever.  With these settings ssh declares the
+    # connection dead after ~60s of unresponsiveness, which surfaces as a
+    # BrokenPipeError on the client and engages the ConnectionLost path
+    # (and --retries, if set).  Appended after the user's -o options
+    # because ssh applies the first matching -o, so a user-supplied
+    # override still wins.
+    cmd += ['-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4']
     script_py = remote_script + '\n_remote()'
     hex_pl    = remote_perl.encode('utf-8').hex()
     # BSCP_FORCE_PERL skips the Python branch — used by tests.sh to exercise
@@ -716,8 +725,8 @@ if __name__ == '__main__':
                         help='resume from byte offset (K/M/G/T suffix accepted), '
                              'or NN[.N]%% of the local file size; rounded down '
                              'to section boundary')
-    parser.add_argument('--retries',            default=0, type=int, metavar='N',
-                        help='auto-retry attempts on connection failure (default 0)')
+    parser.add_argument('--retries',            default=DEFAULT_RETRIES, type=int, metavar='N',
+                        help='auto-retry attempts on connection failure (default %d; 0 disables)' % DEFAULT_RETRIES)
     parser.add_argument('-i', '--identity',     metavar='FILE',
                         help='SSH identity file (-i FILE)')
     parser.add_argument('-o', '--ssh-opt',      action='append', metavar='OPT',
