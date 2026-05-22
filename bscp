@@ -648,11 +648,12 @@ def do_sync(local_file, remote_host, remote_file, mode,
         # expected diff volume in the unscanned tail (using the diff-density
         # observed so far) at the observed copy rate.  No regime flip at the
         # phase A → phase B boundary; ETA is stable across sections.
-        t_overall_start = time()
-        total_scan_time = 0.0
-        total_copy_time = 0.0
-        prev_eta        = None     # display-side downward-rate clamp
-        prev_eta_t      = 0.0
+        t_overall_start      = time()
+        total_scan_time      = 0.0
+        total_copy_time      = 0.0
+        prev_eta             = None     # display-side downward-rate clamp
+        prev_eta_t           = 0.0
+        eta_have_real_sample = False    # smoothing anchor — see smoothed_eta
 
         # Pre-copy bootstrap: copy throughput is typically 1–2 orders of
         # magnitude below scan throughput.  This factor is replaced by the
@@ -721,15 +722,22 @@ def do_sync(local_file, remote_host, remote_file, mode,
             return remaining_scan_time + remaining_copy_time
 
         def smoothed_eta(raw, now, confident):
-            # Until we have a real copy_rate sample, do not smooth — the
-            # bootstrap estimate can be wildly off and we want the display
-            # to converge fast.  Afterwards, clamp downward speed: ETA may
-            # never drop faster than wall clock, otherwise a fast section
-            # makes the next section's correction look like a jump up.
-            nonlocal prev_eta, prev_eta_t
-            if not confident or prev_eta is None:
+            # Bootstrap (no copy_rate sample yet) is a wild guess — never
+            # smooth against it; let raw show through so the display can
+            # converge fast as soon as real data arrives.  The first
+            # confident tick also re-anchors prev_eta, otherwise the
+            # bootstrap-inflated value would leak into the floor clamp and
+            # the display would crawl down at 1s per wall-clock second from
+            # the bogus initial estimate.  Subsequent confident ticks
+            # clamp downward speed: ETA may never drop faster than wall
+            # clock, so a fast section does not make the next section's
+            # correction look like a jump up.
+            nonlocal prev_eta, prev_eta_t, eta_have_real_sample
+            if not confident or prev_eta is None or not eta_have_real_sample:
                 prev_eta   = raw
                 prev_eta_t = now
+                if confident:
+                    eta_have_real_sample = True
                 return raw
             dt          = max(0.0, now - prev_eta_t)
             min_allowed = max(0.0, prev_eta - dt)

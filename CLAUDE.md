@@ -495,10 +495,13 @@ timer is folded in via the `scan_active_since` / `copy_active_since`
 arguments to `estimate_eta()`.
 
 The displayed value is passed through `smoothed_eta()`, which **clamps
-downward speed**: ETA may never drop faster than wall clock (`prev_eta - dt`).
-Going up is unconstrained (new information).  Smoothing is bypassed while
-the copy rate is still in bootstrap so the display can converge fast on
-the first real sample.
+downward speed**: once smoothing is engaged, ETA may never drop faster than
+wall clock (`prev_eta - dt`).  Going up is unconstrained (new information).
+Smoothing is bypassed while the copy rate is still in bootstrap, and the
+first confident tick (after the first phase B records bytes) re-anchors
+`prev_eta` to the real value — otherwise the bootstrap-inflated estimate
+would leak into the floor clamp and the display would crawl down at 1s
+per wall-clock second from a wildly inflated initial guess.
 
 Why this design: the old ETA was scan-only during phase A and
 section-only-plus-future-scan during phase B, which made it jump at every
