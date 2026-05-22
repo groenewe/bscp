@@ -438,9 +438,10 @@ scan SCANNED/TOTAL (PCT%) diff blocks=N (PCT%) (SPEED MiB/s) ELAPSED (ETA)
 - first `(PCT%)` — percentage of file scanned
 - `diff blocks=N` — cumulative diff count; second `(PCT%)` — diffs as fraction of
   blocks scanned
-- `ELAPSED` / `(ETA)` — wall-clock elapsed and estimated remaining in `m:ss` format;
-  ETA is linear extrapolation based on scan throughput only (does not account for
-  future copy phases, which is acceptable since scan dominates for typical workloads)
+- `ELAPSED` / `(ETA)` — wall-clock elapsed and estimated remaining in `m:ss` format.
+  ETA uses a unified time-budget model (see [ETA model](#eta-model)).  When no copy
+  rate has been measured yet (i.e. before the first phase B writes any bytes), ETA
+  is shown as `~m:ss` to signal that the estimate is a bootstrap guess.
 
 Progress format during copy (mirrors the scan layout — same column order so the
 display does not visually re-arrange between phases):
@@ -457,8 +458,42 @@ copy WPOS/TOTAL (PCT%) block C/N (SEC_PCT%) (SPEED KiB/s) ELAPSED (ETA)
   so far; it advances when the next section's scan completes.
 - `SEC_PCT%` — running fraction of this section's diff blocks copied
   (`blocks_done_this_section / section_diff_count`).
-- `ELAPSED` / `(ETA)` — same convention as scan; ETA = section remaining +
-  extrapolated future-section scan time.
+- `ELAPSED` / `(ETA)` — same convention as scan; same unified model
+  (see [ETA model](#eta-model)).
+
+## ETA model
+
+ETA = `remaining_scan_time + remaining_copy_time`, evaluated at every progress
+tick from cumulative counters that survive section boundaries:
+
+- `scan_rate = (total_scanned - skipped_blocks) / total_scan_time` (blocks/s)
+- `copy_rate = total_written / total_copy_time` (bytes/s); before the first
+  phase B records bytes the rate is bootstrapped as
+  `scan_rate * blocksize / BOOTSTRAP_COPY_RATIO` (default ratio 50:1 — copy is
+  typically 1–2 orders of magnitude slower than scan)
+- `diff_frac = total_diffs / scan_blocks_done`
+- `remaining_scan_time  = unscanned_blocks / scan_rate`
+- `est_future_diffs     = diff_frac * unscanned_blocks`
+- `remaining_copy_bytes = (total_diffs + est_future_diffs) * blocksize - total_written`
+- `remaining_copy_time  = remaining_copy_bytes / copy_rate`
+
+`total_scan_time` and `total_copy_time` accumulate strictly within their
+respective phases (`t_phase_a_start` / `t_phase_b_start` deltas), so the two
+rates do not contaminate each other.  During the live phase the active
+timer is folded in via the `scan_active_since` / `copy_active_since`
+arguments to `estimate_eta()`.
+
+The displayed value is passed through `smoothed_eta()`, which **clamps
+downward speed**: ETA may never drop faster than wall clock (`prev_eta - dt`).
+Going up is unconstrained (new information).  Smoothing is bypassed while
+the copy rate is still in bootstrap so the display can converge fast on
+the first real sample.
+
+Why this design: the old ETA was scan-only during phase A and
+section-only-plus-future-scan during phase B, which made it jump at every
+section boundary because future copy work was simply omitted from the
+phase-A estimate.  The unified formula folds both into a single budget;
+the downward clamp absorbs the per-section diff-density noise.
 
 ## Quiet and batch modes
 
