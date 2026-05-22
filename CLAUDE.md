@@ -59,7 +59,20 @@ bscp (single file)
 │                        little-endian Q< pack format.
 ├── IOCounter          — thin wrapper around subprocess stdin/stdout that
 │                        tracks total bytes sent/received.  Flushes after
-│                        every write to prevent buffering deadlocks.
+│                        every write to prevent buffering deadlocks.  When
+│                        --io-timeout > 0 the wrapper switches to a raw-fd
+│                        path (os.read / os.write inside select.select()
+│                        loops); if select returns no readiness within the
+│                        timeout it raises IOTimeout, which do_sync catches
+│                        and converts into a ConnectionLost so --retries
+│                        engages.  The raw path requires Popen(bufsize=0)
+│                        so select on the fd is authoritative — no hidden
+│                        Python BufferedReader read-ahead.  Default
+│                        (timeout = 0) keeps the buffered path for parity.
+├── IOTimeout          — OSError subclass raised by IOCounter when the
+│                        --io-timeout watchdog fires.  Listed alongside
+│                        BrokenPipeError / ConnectionResetError / EOFError
+│                        in do_sync's per-section except clause.
 ├── ConnectionLost     — RuntimeError subclass carrying the section start
 │                        offset and an `interrupted` flag (True on Ctrl+C,
 │                        False on pipe error).  Used for resume reporting.

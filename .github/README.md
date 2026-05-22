@@ -48,6 +48,8 @@ prefix that fits.
 | `-a ALGO` / `--algorithm`    | `sha256` | Hash algorithm. Any algorithm supported by Python's `hashlib` is accepted (e.g. `sha512`, `sha3-256`).           |
 | `-r OFFSET` / `--resume-from`| `0`      | Skip ahead to this byte offset, or to `NN%` / `NN.N%` of the local file (rounded down to a section boundary).    |
 | `--retries N`                | `3`      | Automatically retry on connection failure, up to N times, with exponential back-off (`0` disables).              |
+| `--io-timeout SECS`          | `0`      | Abort (engaging `--retries`) if no SSH-pipe I/O progress for SECS seconds. Catches stuck remote process or       |
+|                              |          | hung disk while TCP is still alive. `0` disables, falling back to the SSH keepalive (~60s).                      |
 | `-i FILE` / `--identity`     |          | SSH identity file (`-i FILE`).                                                                                   |
 | `-o OPT` / `--ssh-opt`       |          | Extra SSH option, repeatable (passed as `-o OPT`). Takes precedence over the defaults below.                     |
 | `-C` / `--compress`          |          | Enable SSH compression.                                                                                          |

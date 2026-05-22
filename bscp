@@ -29,6 +29,7 @@
 from argparse import ArgumentParser
 import hashlib
 import os
+import select
 import shlex
 import struct
 import subprocess
@@ -47,10 +48,11 @@ ALLOW_TRUNCATE = 2
 # OpenSSH's dynamic window.
 PULL_WINDOW = 128
 
-DEFAULT_BLOCK   = 64 * 1024
-DEFAULT_SECTION = 10 * 1024**3
-DEFAULT_RETRIES = 3
-MIN_MEMORY_PUSH = 64 * DEFAULT_BLOCK
+DEFAULT_BLOCK      = 64 * 1024
+DEFAULT_SECTION    = 10 * 1024**3
+DEFAULT_RETRIES    = 3
+DEFAULT_IO_TIMEOUT = 0    # 0 = disabled; --io-timeout SECS aborts if no I/O progress for SECS seconds
+MIN_MEMORY_PUSH    = 64 * DEFAULT_BLOCK
 
 REPORT_INTERVAL = 0.5 # status line should update after this many seconds have passed
 last_report_len = 0   # last progress or error length message on screen, if any; used by report()
@@ -265,22 +267,72 @@ exit 0;
 '''
 
 
+class IOTimeout(OSError):
+    """No-progress timeout from the --io-timeout watchdog.  Subclasses OSError
+    so the existing (BrokenPipeError, ConnectionResetError, EOFError) handler
+    in do_sync catches it (BrokenPipeError ⊂ OSError); kept distinct so the
+    handler can attribute the failure to a stall, not a peer reset."""
+
+
 class IOCounter:
-    def __init__(self, in_stream, out_stream):
+    """Bytes-counting wrapper around the SSH subprocess pipes.
+
+    With timeout == 0 (default) the existing fully-buffered Python I/O path
+    is used unchanged.  With timeout > 0 the wrapper bypasses Python's
+    BufferedReader / BufferedWriter and drives the raw file descriptors via
+    os.read / os.write inside select.select() loops.  If select returns with
+    no descriptor ready for the requested direction within `timeout`
+    seconds, IOTimeout is raised — caught by do_sync and turned into a
+    ConnectionLost so --retries engages.  The bufsize=0 contract on the
+    subprocess (set by the caller when timeout > 0) is what keeps raw fd
+    reads from racing with a stale Python read-ahead buffer."""
+
+    def __init__(self, in_stream, out_stream, timeout=0):
         self.in_stream  = in_stream
         self.out_stream = out_stream
         self.in_total   = 0
         self.out_total  = 0
+        self.timeout    = timeout
+        if timeout > 0:
+            self._in_fd  = in_stream.fileno()
+            self._out_fd = out_stream.fileno()
 
     def read(self, n):
-        data = self.in_stream.read(n)
+        if self.timeout > 0:
+            data = self._read_raw(n)
+        else:
+            data = self.in_stream.read(n)
         self.in_total += len(data)
         return data
 
+    def _read_raw(self, n):
+        buf = b''
+        while len(buf) < n:
+            ready, _, _ = select.select([self._in_fd], [], [], self.timeout)
+            if not ready:
+                raise IOTimeout('no read progress for %.1fs' % self.timeout)
+            chunk = os.read(self._in_fd, n - len(buf))
+            if not chunk:
+                break  # peer closed — return short read; caller surfaces it
+            buf += chunk
+        return buf
+
     def write(self, data):
-        self.out_stream.write(data)
+        if self.timeout > 0:
+            self._write_raw(data)
+        else:
+            self.out_stream.write(data)
+            self.out_stream.flush()
         self.out_total += len(data)
-        self.out_stream.flush()
+
+    def _write_raw(self, data):
+        mv = memoryview(data)
+        written = 0
+        while written < len(mv):
+            _, ready, _ = select.select([], [self._out_fd], [], self.timeout)
+            if not ready:
+                raise IOTimeout('no write progress for %.1fs' % self.timeout)
+            written += os.write(self._out_fd, mv[written:])
 
 
 class ConnectionLost(RuntimeError):
@@ -405,6 +457,8 @@ def build_resume_cmd(argv0, args, src, dst, offset, block_count=None):
         parts += ['-a', args.algorithm]
     if args.retries != DEFAULT_RETRIES:
         parts += ['--retries', str(args.retries)]
+    if args.io_timeout != DEFAULT_IO_TIMEOUT:
+        parts += ['--io-timeout', str(args.io_timeout)]
     if args.identity:
         parts += ['-i', args.identity]
     for opt in (args.ssh_opt or []):
@@ -470,7 +524,8 @@ def build_ssh_cmd(remote_host, args):
 
 def do_sync(local_file, remote_host, remote_file, mode,
             blocksize, section_size, hashname,
-            start_offset=0, dry_run=False, block_count=0, allow_truncate=False, buffer=False, ssh_args=None):
+            start_offset=0, dry_run=False, block_count=0, allow_truncate=False, buffer=False,
+            io_timeout=0, ssh_args=None):
 
     ssh_args = ssh_args or {}
     fn_bytes = remote_file.encode('utf-8')
@@ -496,8 +551,15 @@ def do_sync(local_file, remote_host, remote_file, mode,
             wire_size = min(wire_size, start_offset + block_count * blocksize)
 
         cmd  = build_ssh_cmd(remote_host, ssh_args)
-        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-        io   = IOCounter(proc.stdout, proc.stdin)
+        # bufsize=0 only when the watchdog is active: it bypasses Python's
+        # BufferedReader on proc.stdout so select() on the raw fd is
+        # authoritative (no hidden read-ahead buffer hiding bytes from
+        # select), and bypasses BufferedWriter on proc.stdin so os.write()
+        # short-write semantics work as expected.  Default path keeps the
+        # original buffered I/O for performance parity.
+        popen_bufsize = 0 if io_timeout > 0 else -1
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=popen_bufsize)
+        io   = IOCounter(proc.stdout, proc.stdin, timeout=io_timeout)
 
         # The remote runs its own size-mismatch check on the wire-side `size`,
         # which is wire_size (the -B-capped local size) — so when -B is in use
@@ -689,8 +751,13 @@ def do_sync(local_file, remote_host, remote_file, mode,
                 total_written += written
                 pos = sec_end
 
-        except (BrokenPipeError, ConnectionResetError, EOFError) as exc:
+        except (BrokenPipeError, ConnectionResetError, EOFError, IOTimeout) as exc:
+            # IOTimeout comes from the --io-timeout watchdog (no SSH-pipe
+            # progress within the configured interval).  Closing stdout in
+            # addition to stdin unblocks the remote if it was stuck mid-write
+            # — same rationale as fail() above.
             proc.stdin.close()
+            proc.stdout.close()
             proc.wait()
             raise ConnectionLost(last_sec_start) from exc
         except KeyboardInterrupt:
@@ -727,6 +794,11 @@ if __name__ == '__main__':
                              'to section boundary')
     parser.add_argument('--retries',            default=DEFAULT_RETRIES, type=int, metavar='N',
                         help='auto-retry attempts on connection failure (default %d; 0 disables)' % DEFAULT_RETRIES)
+    parser.add_argument('--io-timeout',         default=DEFAULT_IO_TIMEOUT, type=float, metavar='SECS',
+                        help='abort the transfer (engaging --retries) if no SSH-pipe I/O progress is observed '
+                             'for SECS seconds. Catches stuck remote processes or hung disks while TCP itself '
+                             'is still alive. Default %g = disabled, relying on the SSH ServerAliveInterval '
+                             'keepalive (~60s to detect a dropped connection).' % DEFAULT_IO_TIMEOUT)
     parser.add_argument('-i', '--identity',     metavar='FILE',
                         help='SSH identity file (-i FILE)')
     parser.add_argument('-o', '--ssh-opt',      action='append', metavar='OPT',
@@ -840,7 +912,7 @@ if __name__ == '__main__':
                     mode, blocksize, section_size, hashname,
                     start_offset=start_offset, dry_run=dry_run,
                     block_count=args.block_count, allow_truncate=args.allow_truncate,
-                    buffer=buffer, ssh_args=ssh_args)
+                    buffer=buffer, io_timeout=args.io_timeout, ssh_args=ssh_args)
                 break
             except ConnectionLost as exc:
                 if attempt < args.retries and not exc.interrupted:
