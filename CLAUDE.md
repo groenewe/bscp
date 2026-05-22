@@ -432,19 +432,33 @@ summary line with: `2>&1 | tr '\r' '\n' | grep '^in='`
 
 Progress format during scan:
 ```
-scan SCANNED/TOTAL (PCT%) diff=N (PCT%) (SPEED MiB/s) ELAPSED (ETA)
+scan SCANNED/TOTAL (PCT%) diff blocks=N (PCT%) (SPEED MiB/s) ELAPSED (ETA)
 ```
-- `SCANNED/TOTAL` — cumulative blocks across all sections, not per-section
+- `SCANNED/TOTAL` — cumulative bytes across all sections, not per-section
 - first `(PCT%)` — percentage of file scanned
-- `diff=N` — cumulative diff count; `(PCT%)` — diffs as fraction of blocks scanned
+- `diff blocks=N` — cumulative diff count; second `(PCT%)` — diffs as fraction of
+  blocks scanned
 - `ELAPSED` / `(ETA)` — wall-clock elapsed and estimated remaining in `m:ss` format;
   ETA is linear extrapolation based on scan throughput only (does not account for
   future copy phases, which is acceptable since scan dominates for typical workloads)
 
-Progress format during copy:
+Progress format during copy (mirrors the scan layout — same column order so the
+display does not visually re-arrange between phases):
 ```
-[CUR_SECTION/TOTAL_SECTIONS] copy WRITTEN/SECTION_COPY_BYTES (SPEED KiB/s) ELAPSED (ETA)
+copy WPOS/TOTAL (PCT%) block C/N (SEC_PCT%) (SPEED KiB/s) ELAPSED (ETA)
 ```
+- `WPOS/TOTAL` — current block write offset / total file size; first `(PCT%)` is
+  overall file position.  `WPOS` is the start offset of the block being written, so
+  it never reaches 100% — by design, to avoid misreading a section's last frame as
+  whole-file completion.
+- `block C/N` — cumulative blocks copied so far across all sections (`C`) over the
+  cumulative diff-block count discovered by scan so far (`N`).  During the copy of
+  any one section, `N` is frozen at the value scan ended on for sections processed
+  so far; it advances when the next section's scan completes.
+- `SEC_PCT%` — running fraction of this section's diff blocks copied
+  (`blocks_done_this_section / section_diff_count`).
+- `ELAPSED` / `(ETA)` — same convention as scan; ETA = section remaining +
+  extrapolated future-section scan time.
 
 ## Quiet and batch modes
 

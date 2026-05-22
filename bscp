@@ -633,23 +633,21 @@ def do_sync(local_file, remote_host, remote_file, mode,
             return io.in_total, io.out_total, 0, 0, 0
         eff_section    = section_size or sync_size
         total_blocks   = max(1, (sync_size + blocksize - 1) // blocksize)
-        total_sections = max(1, (sync_size + eff_section - 1) // eff_section)
         skipped_blocks = start_offset // blocksize
         total_scanned  = skipped_blocks
         t_start_scan   = time()
 
-        total_diffs    = 0
-        total_written  = 0
-        last_sec_start = start_offset
-        cur_section    = start_offset // eff_section
-        t_last_progress = 0.0
+        total_diffs         = 0
+        total_written       = 0
+        total_blocks_copied = 0
+        last_sec_start      = start_offset
+        t_last_progress     = 0.0
 
         try:
             pos = start_offset
             while pos < sync_size:
                 sec_end        = min(pos + eff_section, sync_size)
                 last_sec_start = pos
-                cur_section   += 1
 
                 # ── Phase A: hash exchange ────────────────────────────
                 diff_blocks    = []   # push: [(wpos, block)]
@@ -695,47 +693,53 @@ def do_sync(local_file, remote_host, remote_file, mode,
                 newly = total_scanned - skipped_blocks
                 scan_remaining_eta = (t_xfer - t_start_scan) * (total_blocks - total_scanned) / max(1, newly)
 
-                def show_copy_progress():
+                section_diff_count = len(diff_blocks) + len(diff_positions)
+
+                def show_copy_progress(wpos, blocks_done):
                     nonlocal t_last_progress
                     now = time()
                     if now - t_last_progress < REPORT_INTERVAL:
                         return
                     t_last_progress = now
-                    elapsed = now - t_xfer
-                    speed   = written / (elapsed * 1024 + 1)
-                    eta     = elapsed * (total_copy_bytes - written) / (written + 1) + scan_remaining_eta
-                    report('\r[%d/%d] copy %s/%s (%.0f KiB/s) %s (%s) ' % (
-                        cur_section, total_sections,
-                        format_size(written, floor=True),
-                        format_size(total_copy_bytes, floor=True),
+                    elapsed    = now - t_xfer
+                    speed      = written / (elapsed * 1024 + 1)
+                    eta        = elapsed * (total_copy_bytes - written) / (written + 1) + scan_remaining_eta
+                    pct_pos    = wpos * 100.0 / sync_size
+                    pct_sec    = blocks_done * 100.0 / max(1, section_diff_count)
+                    cum_blocks = total_blocks_copied + blocks_done
+                    report('\rcopy %s/%s (%.1f%%) block %d/%d (%.1f%%) (%.0f KiB/s) %s (%s) ' % (
+                        format_size(wpos, floor=True),
+                        format_size(sync_size, floor=True),
+                        pct_pos, cum_blocks, total_diffs, pct_sec,
                         speed, format_time(now - t_start_scan), format_time(eta)))
 
                 if mode == MODE_PUSH and not buffer:
                     total_copy_bytes = sum(min(blocksize, sync_size - rp) for rp in diff_positions)
                     io.write(struct.pack('<Q', 0 if dry_run else len(diff_positions)))
                     if not dry_run:
-                        for wpos in diff_positions:
+                        for i, wpos in enumerate(diff_positions):
                             bl = min(blocksize, sync_size - wpos)
                             f.seek(wpos)
                             io.write(struct.pack('<Q', wpos))
                             io.write(f.read(bl))
                             written += bl
-                            show_copy_progress()
+                            show_copy_progress(wpos, i + 1)
 
                 elif mode == MODE_PUSH:
                     total_copy_bytes = sum(len(b) for _, b in diff_blocks)
                     io.write(struct.pack('<Q', 0 if dry_run else len(diff_blocks)))
                     if not dry_run:
-                        for wpos, wblock in diff_blocks:
+                        for i, (wpos, wblock) in enumerate(diff_blocks):
                             io.write(struct.pack('<Q', wpos))
                             io.write(wblock)
                             written += len(wblock)
-                            show_copy_progress()
+                            show_copy_progress(wpos, i + 1)
 
                 else:  # pull — windowed to avoid two-pipe deadlock
                     total_copy_bytes = sum(min(blocksize, sync_size - rp) for rp in diff_positions)
                     io.write(struct.pack('<Q', 0 if dry_run else len(diff_positions)))
                     if not dry_run:
+                        blocks_done = 0
                         for batch_start in range(0, len(diff_positions), PULL_WINDOW):
                             window = diff_positions[batch_start:batch_start + PULL_WINDOW]
                             for rpos in window:
@@ -745,10 +749,12 @@ def do_sync(local_file, remote_host, remote_file, mode,
                                 block = io.read(bl)
                                 f.seek(rpos)
                                 f.write(block)
-                                written += bl
-                                show_copy_progress()
+                                written      += bl
+                                blocks_done  += 1
+                                show_copy_progress(rpos, blocks_done)
 
-                total_written += written
+                total_written       += written
+                total_blocks_copied += section_diff_count
                 pos = sec_end
 
         except (BrokenPipeError, ConnectionResetError, EOFError, IOTimeout) as exc:
