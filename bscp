@@ -945,7 +945,7 @@ if __name__ == '__main__':
             total_diffs, format_size(total_diffs * blocksize, floor=True),
             (100.0 * total_diffs * blocksize) / sync_size, format_time(elapsed)))
     else:
-        report('\rin=%s out=%s size=%s diffs=%d speedup=%.2f (%s)\n' % (
+        report('\rin=%s out=%s size=%s diff blocks=%d speedup=%.2f (%s)\n' % (
             format_size(in_total,  floor=True),
             format_size(out_total, floor=True),
             format_size(sync_size, floor=True),
