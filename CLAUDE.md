@@ -471,11 +471,22 @@ tick from cumulative counters that survive section boundaries:
   phase B records bytes the rate is bootstrapped as
   `scan_rate * blocksize / BOOTSTRAP_COPY_RATIO` (default ratio 50:1 — copy is
   typically 1–2 orders of magnitude slower than scan)
-- `diff_frac = total_diffs / scan_blocks_done`
+- `diff_frac` — per-section diff-density EMA, blended with the in-progress
+  section by its completion ratio.  Completed sections contribute their final
+  fraction via `ema = α·sec_frac + (1−α)·ema` (`DIFF_EMA_ALPHA = 0.4`); within
+  the current section the running fraction takes over linearly as the section
+  scan completes (`w_running = sec_blocks_scanned / sec_blocks_total`).  Lets
+  the projection follow varying diff rates across the file (e.g. only the
+  middle region changed) without becoming jumpy.
 - `remaining_scan_time  = unscanned_blocks / scan_rate`
 - `est_future_diffs     = diff_frac * unscanned_blocks`
 - `remaining_copy_bytes = (total_diffs + est_future_diffs) * blocksize - total_written`
 - `remaining_copy_time  = remaining_copy_bytes / copy_rate`
+
+When `--dry-run` is in effect, no blocks are transferred — `remaining_copy_time`
+is forced to zero and the ETA collapses to scan-only.  The `~` bootstrap marker
+is suppressed in dry-run since the scan-only estimate is authoritative on the
+first tick.
 
 `total_scan_time` and `total_copy_time` accumulate strictly within their
 respective phases (`t_phase_a_start` / `t_phase_b_start` deltas), so the two

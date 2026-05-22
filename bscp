@@ -660,17 +660,33 @@ def do_sync(local_file, remote_host, remote_file, mode,
         # so it only affects the first few ticks of the very first section.
         BOOTSTRAP_COPY_RATIO = 50.0
 
+        # Diff-density EMA: per-section fraction of differing blocks, smoothed
+        # across completed sections.  Lets ETA track varying diff rates
+        # (e.g. only one region of the file changed) without becoming jumpy.
+        # Higher α reacts faster but is noisier; 0.4 is a balanced default.
+        DIFF_EMA_ALPHA = 0.4
+        ema_diff_frac  = None
+
         def estimate_eta(now, live_diffs=0, live_written=0,
-                         scan_active_since=None, copy_active_since=None):
+                         scan_active_since=None, copy_active_since=None,
+                         sec_blocks_scanned=0, sec_blocks_total=0):
             scan_secs = total_scan_time
             if scan_active_since is not None:
                 scan_secs += now - scan_active_since
-            copy_secs = total_copy_time
-            if copy_active_since is not None:
-                copy_secs += now - copy_active_since
 
             scan_blocks_done = max(1, total_scanned - skipped_blocks)
             scan_rate = scan_blocks_done / scan_secs if scan_secs > 0 else 0.0
+            unscanned = max(0, total_blocks - total_scanned)
+            remaining_scan_time = unscanned / scan_rate if scan_rate > 0 else 0.0
+
+            # Dry-run does not transfer any blocks — the copy component is
+            # zero by definition, so the ETA collapses to scan-only.
+            if dry_run:
+                return remaining_scan_time
+
+            copy_secs = total_copy_time
+            if copy_active_since is not None:
+                copy_secs += now - copy_active_since
 
             written_cum = total_written + live_written
             if written_cum > 0 and copy_secs > 0:
@@ -678,14 +694,29 @@ def do_sync(local_file, remote_host, remote_file, mode,
             else:
                 copy_rate = max(1.0, scan_rate * blocksize / BOOTSTRAP_COPY_RATIO)
 
+            # Diff-density estimate.  When called from phase A, the caller
+            # passes section progress; the in-section running fraction is
+            # blended with the completed-section EMA, weighted by section
+            # completion.  When called from phase B (sec_blocks_total == 0)
+            # the section's scan is already folded into the EMA, so we use
+            # it directly.
+            if sec_blocks_scanned > 0:
+                sec_so_far = live_diffs / sec_blocks_scanned
+            else:
+                sec_so_far = 0.0
+            if ema_diff_frac is None:
+                diff_frac = sec_so_far
+            elif sec_blocks_total <= 0:
+                diff_frac = ema_diff_frac
+            else:
+                w_running = sec_blocks_scanned / sec_blocks_total
+                diff_frac = w_running * sec_so_far + (1.0 - w_running) * ema_diff_frac
+
             diffs_cum        = total_diffs + live_diffs
-            unscanned        = max(0, total_blocks - total_scanned)
-            diff_frac        = diffs_cum / scan_blocks_done
             est_future_diffs = diff_frac * unscanned
             est_copy_bytes   = (diffs_cum + est_future_diffs) * blocksize
             remaining_copy   = max(0.0, est_copy_bytes - written_cum)
 
-            remaining_scan_time = unscanned / scan_rate if scan_rate > 0 else 0.0
             remaining_copy_time = remaining_copy / copy_rate if copy_rate > 0 else 0.0
             return remaining_scan_time + remaining_copy_time
 
@@ -743,10 +774,16 @@ def do_sync(local_file, remote_host, remote_file, mode,
                         elapsed      = now - t_overall_start
                         scan_secs    = total_scan_time + (now - t_phase_a_start)
                         speed        = newly * blocksize / (scan_secs * 1024**2 + 1)
-                        confident    = total_written > 0
+                        # Dry-run has no copy phase, so the scan-only ETA is
+                        # immediately authoritative — no bootstrap to flag.
+                        confident    = dry_run or total_written > 0
+                        sec_blk_done = (p   - pos + blocksize - 1) // blocksize
+                        sec_blk_tot  = (sec_end - pos + blocksize - 1) // blocksize
                         raw_eta      = estimate_eta(now,
                                                     live_diffs=sec_diffs,
-                                                    scan_active_since=t_phase_a_start)
+                                                    scan_active_since=t_phase_a_start,
+                                                    sec_blocks_scanned=sec_blk_done,
+                                                    sec_blocks_total=sec_blk_tot)
                         eta          = smoothed_eta(raw_eta, now, confident)
                         eta_mark     = '' if confident else '~'
                         scanned_bytes = min(total_scanned * blocksize, sync_size)
@@ -757,7 +794,13 @@ def do_sync(local_file, remote_host, remote_file, mode,
                             format_time(elapsed), eta_mark, format_time(eta)))
 
                 total_scan_time += time() - t_phase_a_start
-                total_diffs     += len(diff_blocks) + len(diff_positions)
+                sec_blocks_total = (sec_end - pos + blocksize - 1) // blocksize
+                sec_diff_count   = len(diff_blocks) + len(diff_positions)
+                sec_frac         = sec_diff_count / max(1, sec_blocks_total)
+                ema_diff_frac    = (sec_frac if ema_diff_frac is None
+                                    else DIFF_EMA_ALPHA * sec_frac
+                                       + (1 - DIFF_EMA_ALPHA) * ema_diff_frac)
+                total_diffs     += sec_diff_count
 
                 # ── Phase B: transfer ─────────────────────────────────
                 t_phase_b_start    = time()
