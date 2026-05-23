@@ -1157,8 +1157,9 @@ if __name__ == '__main__':
     speedup  = sync_size / (xfer + 1)
 
     if dry_run:
-        report('\rdry-run: %d diff blocks (+/- %s) (%.1f%%) (%s)\n' % (
+        report('\rdry-run: %d diff blocks (+/- %s of %s) (%.1f%%) (%s)\n' % (
             total_diffs, format_size(total_diffs * blocksize, floor=True),
+            format_size(sync_size, floor=True),
             (100.0 * total_diffs * blocksize) / sync_size, format_time(elapsed)))
     else:
         report('\rin=%s out=%s size=%s diff blocks=%d speedup=%.2f (%s)\n' % (
