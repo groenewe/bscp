@@ -692,6 +692,29 @@ def do_sync(local_file, remote_host, remote_file, mode,
         rate_prev_copy_secs  = 0.0
         rate_prev_written    = 0
 
+        # ETA display damping: once the rate EMAs are seeded (`confident`),
+        # the underlying estimate is still recomputed every progress tick,
+        # but the *displayed* value is only re-snapped to it every
+        # ETA_REFRESH_INTERVAL seconds.  In between, it counts down 1s per
+        # wall-clock second — so the user sees a steady countdown rather
+        # than per-tick jitter from EMA wiggle.  Before confidence the
+        # display tracks every tick (no damping, since the early estimate
+        # genuinely needs to swing toward truth).
+        ETA_REFRESH_INTERVAL = 5.0
+        eta_displayed        = None
+        eta_displayed_at     = 0.0
+
+        def display_eta(fresh_eta, confident, now):
+            nonlocal eta_displayed, eta_displayed_at
+            if (not confident
+                    or eta_displayed is None
+                    or now - eta_displayed_at >= ETA_REFRESH_INTERVAL):
+                eta_displayed    = fresh_eta
+            else:
+                eta_displayed    = max(0.0, eta_displayed - (now - eta_displayed_at))
+            eta_displayed_at = now
+            return eta_displayed
+
         def update_scan_rate_ema(scan_secs_now):
             nonlocal ema_scan_rate, rate_prev_scan_secs, rate_prev_scanned
             if scan_secs_now < RATE_RELIABLE_SECS:
@@ -844,11 +867,12 @@ def do_sync(local_file, remote_host, remote_file, mode,
                                            dry_run or ema_copy_rate is not None)
                         sec_blk_done = (p   - pos + blocksize - 1) // blocksize
                         sec_blk_tot  = (sec_end - pos + blocksize - 1) // blocksize
-                        eta          = estimate_eta(now,
+                        eta          = display_eta(estimate_eta(now,
                                                     live_diffs=sec_diffs,
                                                     scan_active_since=t_phase_a_start,
                                                     sec_blocks_scanned=sec_blk_done,
-                                                    sec_blocks_total=sec_blk_tot)
+                                                    sec_blocks_total=sec_blk_tot),
+                                                    confident, now)
                         eta_mark     = '' if confident else '~'
                         scanned_bytes = min(total_scanned * blocksize, sync_size)
                         report('\rscan %s/%s (%.1f%%) diff blocks=%d (%.1f%%) (%.0f MiB/s) %s (%s%s) ' % (
@@ -881,10 +905,11 @@ def do_sync(local_file, remote_host, remote_file, mode,
                     speed       = written / (sec_elapsed * 1024 + 1)
                     copy_secs   = total_copy_time + (now - t_phase_b_start)
                     update_copy_rate_ema(copy_secs, total_written + written)
-                    eta         = estimate_eta(now,
-                                               live_written=written,
-                                               copy_active_since=t_phase_b_start)
                     confident   = ema_scan_rate is not None and ema_copy_rate is not None
+                    eta         = display_eta(estimate_eta(now,
+                                               live_written=written,
+                                               copy_active_since=t_phase_b_start),
+                                               confident, now)
                     eta_mark    = '' if confident else '~'
                     pct_pos     = wpos * 100.0 / sync_size
                     pct_sec     = blocks_done * 100.0 / max(1, section_diff_count)

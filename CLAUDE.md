@@ -508,16 +508,24 @@ rates do not contaminate each other.  During the live phase the active
 timer is folded in via the `scan_active_since` / `copy_active_since`
 arguments to `estimate_eta()`.
 
-There is no display-side smoothing of the ETA itself.  The three EMAs
-(`scan_rate`, `copy_rate`, `diff_frac`) damp their respective inputs; the
-ETA expression is then evaluated and shown as-is.  An earlier design had a
-"downward floor clamp" (ETA may never drop faster than 1s per wall-clock
-second), but this prevented bootstrap overestimates from ever being
-corrected — once the floor anchored to an inflated initial value, the
-display would crawl down at 1s/s for the entire run.  Trusting the input
-EMAs and showing the raw ETA gives faster correction at the cost of mild
-tick-to-tick wiggle (a few seconds), which is the right trade since an
-honest, self-correcting estimate beats a stuck-high one.
+Display-side damping is applied **only after the rate EMAs are seeded**
+(`confident == True`).  The underlying estimate is still recomputed every
+progress tick (~0.5s), but the displayed value is only re-snapped to the
+fresh estimate every `ETA_REFRESH_INTERVAL` seconds (default 5s).
+Between snaps the displayed value counts down 1s per wall-clock second,
+so the user sees a steady countdown instead of per-tick EMA wiggle (which
+under stable conditions still drifts by a few seconds between ticks).
+Before confidence — the bootstrap window — the display tracks every tick
+with no damping, so the early estimate is free to swing toward truth
+quickly.
+
+An earlier design had a "downward floor clamp" (ETA may never drop faster
+than 1s per wall-clock second) that applied unconditionally, even during
+bootstrap.  That prevented bootstrap overestimates from being corrected:
+once the floor anchored to an inflated initial value, the display crawled
+down at 1s/s for the entire run.  The current design — damp only after
+the rate EMAs are seeded — keeps fast correction during bootstrap and
+adds smoothing only once the estimate is reliable.
 
 Why this design: the old ETA was scan-only during phase A and
 section-only-plus-future-scan during phase B, which made it jump at every
