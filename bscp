@@ -692,28 +692,37 @@ def do_sync(local_file, remote_host, remote_file, mode,
         rate_prev_copy_secs  = 0.0
         rate_prev_written    = 0
 
-        # ETA display damping: once the rate EMAs are seeded (`confident`),
-        # the underlying estimate is still recomputed every progress tick,
-        # but the *displayed* value is only re-snapped to it every
-        # ETA_REFRESH_INTERVAL seconds.  In between, it counts down 1s per
-        # wall-clock second — so the user sees a steady countdown rather
-        # than per-tick jitter from EMA wiggle.  Before confidence the
-        # display tracks every tick (no damping, since the early estimate
-        # genuinely needs to swing toward truth).
+        # ETA display damping: the underlying estimate is recomputed every
+        # progress tick, but the *displayed* value is re-snapped only every
+        # ETA_REFRESH_INTERVAL seconds.  Between snaps, the value counts
+        # down 1s per wall-clock second so the user sees a steady countdown
+        # rather than per-tick jitter from EMA wiggle.  Damping is applied
+        # from the start (not gated on `confident`), so an unseeded early
+        # estimate never gets a chance to flicker — the first ETA_WARMUP_SECS
+        # of the run displays `--:--` instead, which gives the rate EMAs
+        # time to seed from real data before any number is shown.
         ETA_REFRESH_INTERVAL = 5.0
+        ETA_WARMUP_SECS      = 30.0
+        # Confidence shortcut: once at least CONFIDENT_SCAN_FRAC of the
+        # blocks-still-to-scan have been scanned, treat the scan-rate EMA
+        # as authoritative even if the copy-rate EMA never seeds (e.g.
+        # zero diffs found, so no copy happens).  Without this gate, a
+        # clean run with no differing blocks would keep the `~` bootstrap
+        # marker for its entire duration.
+        CONFIDENT_SCAN_FRAC  = 0.01
         eta_displayed        = None
         eta_displayed_at     = 0.0
 
-        def display_eta(fresh_eta, confident, now):
+        def display_eta(fresh_eta, now):
             nonlocal eta_displayed, eta_displayed_at
-            if (not confident
-                    or eta_displayed is None
+            if now - t_overall_start < ETA_WARMUP_SECS:
+                return None
+            if (eta_displayed is None
                     or now - eta_displayed_at >= ETA_REFRESH_INTERVAL):
                 eta_displayed    = fresh_eta
-            else:
-                eta_displayed    = max(0.0, eta_displayed - (now - eta_displayed_at))
-            eta_displayed_at = now
-            return eta_displayed
+                eta_displayed_at = now
+                return eta_displayed
+            return max(0.0, eta_displayed - (now - eta_displayed_at))
 
         def update_scan_rate_ema(scan_secs_now):
             nonlocal ema_scan_rate, rate_prev_scan_secs, rate_prev_scanned
@@ -860,11 +869,16 @@ def do_sync(local_file, remote_host, remote_file, mode,
                         # without waiting for the next copy tick.
                         update_copy_rate_ema(total_copy_time, total_written)
                         # `~` marker means "low confidence" — rate samples
-                        # are still bootstrap-quality.  Drops once both
-                        # rate EMAs are seeded (or scan-only is seeded
-                        # under --dry-run).
+                        # are still bootstrap-quality.  Drops once the rate
+                        # EMAs are seeded (or scan-only is seeded under
+                        # --dry-run), or — for runs with zero diffs found —
+                        # once CONFIDENT_SCAN_FRAC of the file has been
+                        # scanned and the absence of diffs can be trusted.
+                        scan_frac    = (total_scanned - skipped_blocks) / max(
+                                           1, total_blocks - skipped_blocks)
                         confident    = ema_scan_rate is not None and (
-                                           dry_run or ema_copy_rate is not None)
+                                           dry_run or ema_copy_rate is not None
+                                           or scan_frac >= CONFIDENT_SCAN_FRAC)
                         sec_blk_done = (p   - pos + blocksize - 1) // blocksize
                         sec_blk_tot  = (sec_end - pos + blocksize - 1) // blocksize
                         eta          = display_eta(estimate_eta(now,
@@ -872,14 +886,16 @@ def do_sync(local_file, remote_host, remote_file, mode,
                                                     scan_active_since=t_phase_a_start,
                                                     sec_blocks_scanned=sec_blk_done,
                                                     sec_blocks_total=sec_blk_tot),
-                                                    confident, now)
-                        eta_mark     = '' if confident else '~'
+                                                    now)
+                        eta_str      = ('--:--' if eta is None
+                                        else ('' if confident else '~')
+                                             + format_time(eta))
                         scanned_bytes = min(total_scanned * blocksize, sync_size)
-                        report('\rscan %s/%s (%.1f%%) diff blocks=%d (%.1f%%) (%.0f MiB/s) %s (%s%s) ' % (
+                        report('\rscan %s/%s (%.1f%%) diff blocks=%d (%.1f%%) (%.0f MiB/s) %s (%s) ' % (
                             format_size(scanned_bytes, floor=True),
                             format_size(sync_size, floor=True),
                             pct_done, ndiff, pct_diff, speed,
-                            format_time(elapsed), eta_mark, format_time(eta)))
+                            format_time(elapsed), eta_str))
 
                 total_scan_time += time() - t_phase_a_start
                 sec_blocks_total = (sec_end - pos + blocksize - 1) // blocksize
@@ -905,21 +921,27 @@ def do_sync(local_file, remote_host, remote_file, mode,
                     speed       = written / (sec_elapsed * 1024 + 1)
                     copy_secs   = total_copy_time + (now - t_phase_b_start)
                     update_copy_rate_ema(copy_secs, total_written + written)
-                    confident   = ema_scan_rate is not None and ema_copy_rate is not None
+                    scan_frac   = (total_scanned - skipped_blocks) / max(
+                                      1, total_blocks - skipped_blocks)
+                    confident   = ema_scan_rate is not None and (
+                                      ema_copy_rate is not None
+                                      or scan_frac >= CONFIDENT_SCAN_FRAC)
                     eta         = display_eta(estimate_eta(now,
                                                live_written=written,
                                                copy_active_since=t_phase_b_start),
-                                               confident, now)
-                    eta_mark    = '' if confident else '~'
+                                               now)
+                    eta_str     = ('--:--' if eta is None
+                                   else ('' if confident else '~')
+                                        + format_time(eta))
                     pct_pos     = wpos * 100.0 / sync_size
                     pct_sec     = blocks_done * 100.0 / max(1, section_diff_count)
                     cum_blocks  = total_blocks_copied + blocks_done
-                    report('\rcopy %s/%s (%.1f%%) block %d/%d (%.1f%%) (%.0f KiB/s) %s (%s%s) ' % (
+                    report('\rcopy %s/%s (%.1f%%) block %d/%d (%.1f%%) (%.0f KiB/s) %s (%s) ' % (
                         format_size(wpos, floor=True),
                         format_size(sync_size, floor=True),
                         pct_pos, cum_blocks, total_diffs, pct_sec,
                         speed, format_time(now - t_overall_start),
-                        eta_mark, format_time(eta)))
+                        eta_str))
 
                 if mode == MODE_PUSH and not buffer:
                     io.write(struct.pack('<Q', 0 if dry_run else len(diff_positions)))

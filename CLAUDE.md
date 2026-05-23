@@ -519,9 +519,11 @@ scan SCANNED/TOTAL (PCT%) diff blocks=N (PCT%) (SPEED MiB/s) ELAPSED (ETA)
 - `diff blocks=N` — cumulative diff count; second `(PCT%)` — diffs as fraction of
   blocks scanned
 - `ELAPSED` / `(ETA)` — wall-clock elapsed and estimated remaining in `m:ss` format.
-  ETA uses a unified time-budget model (see [ETA model](#eta-model)).  When no copy
-  rate has been measured yet (i.e. before the first phase B writes any bytes), ETA
-  is shown as `~m:ss` to signal that the estimate is a bootstrap guess.
+  ETA uses a unified time-budget model (see [ETA model](#eta-model)).  During the
+  first 30s of the run the ETA reads `--:--` (warmup; rate EMAs still seeding).
+  After warmup, if the rates are still bootstrap-quality (no copy data yet on a
+  run that does have diffs to copy, and < 1% scanned), ETA is shown as `~m:ss`
+  to signal that the estimate is a bootstrap guess.
 
 Progress format during copy (mirrors the scan layout — same column order so the
 display does not visually re-arrange between phases):
@@ -579,8 +581,13 @@ is forced to zero and the ETA collapses to scan-only.
 
 The `~m:ss` bootstrap marker is displayed until the rate EMAs have been
 seeded from real data (both `scan_rate` and `copy_rate`, or just `scan_rate`
-under `--dry-run`).  Once seeded, the marker drops and the displayed ETA
-reflects measured rates.
+under `--dry-run`).  As a fallback for runs that find zero differing blocks
+— where `copy_rate` can never seed because no copy ever happens — the
+marker also drops once `CONFIDENT_SCAN_FRAC` (default 1%) of the blocks
+still to scan have been scanned: at that point the absence of diffs is
+taken as authoritative, and the scan-rate EMA alone is enough to project
+the remaining time.  Without this gate, a clean transfer of an unchanged
+file would carry the `~` marker for its entire duration.
 
 `total_scan_time` and `total_copy_time` accumulate strictly within their
 respective phases (`t_phase_a_start` / `t_phase_b_start` deltas), so the two
@@ -588,24 +595,28 @@ rates do not contaminate each other.  During the live phase the active
 timer is folded in via the `scan_active_since` / `copy_active_since`
 arguments to `estimate_eta()`.
 
-Display-side damping is applied **only after the rate EMAs are seeded**
-(`confident == True`).  The underlying estimate is still recomputed every
-progress tick (~0.5s), but the displayed value is only re-snapped to the
-fresh estimate every `ETA_REFRESH_INTERVAL` seconds (default 5s).
-Between snaps the displayed value counts down 1s per wall-clock second,
-so the user sees a steady countdown instead of per-tick EMA wiggle (which
-under stable conditions still drifts by a few seconds between ticks).
-Before confidence — the bootstrap window — the display tracks every tick
-with no damping, so the early estimate is free to swing toward truth
-quickly.
+Display-side damping is applied unconditionally from the start: the
+underlying estimate is still recomputed every progress tick (~0.5s), but
+the displayed value is only re-snapped to the fresh estimate every
+`ETA_REFRESH_INTERVAL` seconds (default 5s).  Between snaps the displayed
+value counts down 1s per wall-clock second so the user sees a steady
+countdown instead of per-tick EMA wiggle.  To avoid the early bootstrap
+estimate ever reaching the screen at all, the first `ETA_WARMUP_SECS`
+(default 30s) of the run displays `--:--` in the ETA slot — long enough
+for the rate EMAs to seed from real data before any number appears.
 
 An earlier design had a "downward floor clamp" (ETA may never drop faster
 than 1s per wall-clock second) that applied unconditionally, even during
 bootstrap.  That prevented bootstrap overestimates from being corrected:
 once the floor anchored to an inflated initial value, the display crawled
-down at 1s/s for the entire run.  The current design — damp only after
-the rate EMAs are seeded — keeps fast correction during bootstrap and
-adds smoothing only once the estimate is reliable.
+down at 1s/s for the entire run.  A subsequent revision damped only after
+the rate EMAs were seeded, but that left a per-tick-anchor bug — the
+displayed value snapped to `fresh_eta` only on the first call, after
+which `eta_displayed_at` was updated on every tick and the 5s threshold
+never re-fired — and never became "confident" at all on zero-diff runs.
+The current design — always damp, always snap on the 5s schedule, show
+`--:--` until warmup ends, and grant scan-only confidence at 1%
+scanned — addresses both.
 
 Why this design: the old ETA was scan-only during phase A and
 section-only-plus-future-scan during phase B, which made it jump at every
