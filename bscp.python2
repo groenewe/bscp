@@ -1,0 +1,1129 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+# Copyright (C) 2012-2024  The Bscp Authors <https://github.com/bscp-tool/bscp/graphs/contributors>
+#
+# Permission to use, copy, modify, and/or distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+# Bscp copies a file or block device over SSH, transferring only changed
+# blocks.  Both push (local → remote) and pull (remote → local) are
+# supported.  The remote-side script is embedded and executed via
+# "python(/2/3) -c", with a Perl fallback for hosts without Python, so
+# no installation on the remote host is required.
+# Features: section-based processing to bound memory use, single-pass
+# scan+copy, windowed pull to avoid SSH pipe deadlock, resume on failure
+# (byte offset or percentage of source), automatic retry with exponential
+# back-off, and dry-run mode.
+#
+# Changes from branch main-HG onward were made mostly by Claude (Anthropic).
+
+from __future__ import division
+
+from argparse import ArgumentParser
+import binascii
+import hashlib
+import math
+import os
+import struct
+import subprocess
+import sys
+from time import sleep, time
+
+# Python 2.7 has shlex but no shlex.quote; the pipes module provides the same
+# function under the same name.  Python 3.3+ has shlex.quote in stdlib.
+try:
+    from shlex import quote as _shquote
+except ImportError:
+    from pipes import quote as _shquote
+
+# BrokenPipeError / ConnectionResetError are Python 3.3+; on Python 2 a broken
+# pipe surfaces as IOError(EPIPE) and a reset connection as a generic
+# IOError/OSError.  Catching IOError + OSError + EOFError covers both.
+try:
+    _PIPE_ERRORS = (BrokenPipeError, ConnectionResetError, EOFError)
+except NameError:
+    _PIPE_ERRORS = (IOError, OSError, EOFError)
+
+# Header: size(8), blocksize(8), section_size(8), start_offset(8), filename_len(8), hashname_len(8), mode(1) - 49 bytes total
+HEADER_FMT  = '<QQQQQQB'
+HEADER_SIZE = struct.calcsize(HEADER_FMT)
+MODE_PUSH, MODE_PULL = 0, 1
+ALLOW_TRUNCATE = 2
+
+# Number of diff-block requests sent per round-trip in pull phase B.
+# Larger = fewer round-trips; too large risks filling SSH stdout window before
+# the client drains it.  128 × 64 KiB = 8 MiB max in-flight, well within
+# OpenSSH's dynamic window.
+PULL_WINDOW = 128
+
+DEFAULT_BLOCK   = 64 * 1024
+DEFAULT_SECTION = 10 * 1024**3
+DEFAULT_RETRIES = 3
+MIN_MEMORY_PUSH = 64 * DEFAULT_BLOCK
+
+REPORT_INTERVAL = 0.5 # status line should update after this many seconds have passed
+last_report_len = 0   # last progress or error length message on screen, if any; used by report()
+quiet = False         # option -q or --quiet: suppress '\r' progress report line normally updated via stderr
+batch = False         # option --batch: suppress all stderr output, return only a suitable exit code (see help)
+
+remote_script = '''
+def _remote():
+    import hashlib, os, struct, sys  # noqa: F401 (standalone on remote host)
+
+    stdin  = getattr(sys.stdin,  'buffer', sys.stdin)
+    stdout = getattr(sys.stdout, 'buffer', sys.stdout)
+
+    HEADER_FMT     = '<QQQQQQB'
+    HEADER_SIZE    = struct.calcsize(HEADER_FMT)
+    MODE_PUSH, MODE_PULL = 0, 1
+    PUSH_PULL_MASK = 1
+    ALLOW_TRUNCATE = 2
+
+    data = stdin.read(HEADER_SIZE)
+    if len(data) < HEADER_SIZE:
+        sys.exit(1)
+    (size, blocksize, section_size, start_offset,
+     filename_len, hashname_len, mode) = struct.unpack(HEADER_FMT, data)
+    allow_truncate = mode & ALLOW_TRUNCATE
+    mode = mode & PUSH_PULL_MASK
+
+    fn_bytes = stdin.read(filename_len)
+    hashname = stdin.read(hashname_len).decode('ascii')
+    filename = fn_bytes.decode('utf-8')
+
+    stdout.write(hashlib.new(hashname, fn_bytes).digest())
+    stdout.flush()
+    if stdin.read(2) != b'go':
+        sys.exit(1)
+
+    try:
+        fobj = open(filename, 'rb+' if mode == MODE_PUSH else 'rb')
+    except OSError:
+        stdout.write(struct.pack('<Q', 0))
+        stdout.flush()
+        sys.exit(1)
+
+    with fobj as f:
+        f.seek(0, 2)
+        remote_size = f.tell()
+        stdout.write(struct.pack('<Q', remote_size))
+        stdout.flush()
+
+        # In push, remote is destination; in pull, remote is source.
+        # Refuse to proceed if destination is smaller, unless --allow-truncate.
+        dst_size = remote_size if mode == MODE_PUSH else size
+        src_size = size        if mode == MODE_PUSH else remote_size
+        if dst_size < src_size and not allow_truncate:
+            sys.exit(1)
+
+        sync_size = min(size, remote_size)
+        eff_section = section_size or sync_size
+        if sync_size == 0:
+            sys.exit(0)
+
+        # If the client decides to abort after the handshake (e.g. its
+        # post-handshake truncate check fires) it closes its end of the
+        # pipe, which surfaces here as a short stdin read or a broken stdout
+        # write.  Treat both as a clean shutdown rather than letting Python
+        # spew a traceback over the user's stderr.
+        try:
+            pos = start_offset
+            while pos < sync_size:
+                sec_end = min(pos + eff_section, sync_size)
+
+                p = pos
+                while p < sec_end:
+                    bl = min(blocksize, sec_end - p)
+                    f.seek(p)
+                    stdout.write(hashlib.new(hashname, f.read(bl)).digest())
+                    p += bl
+                stdout.flush()
+
+                (count,) = struct.unpack('<Q', stdin.read(8))
+
+                if mode == MODE_PUSH:
+                    for _ in range(count):
+                        (wpos,) = struct.unpack('<Q', stdin.read(8))
+                        bl = min(blocksize, sync_size - wpos)
+                        f.seek(wpos)
+                        f.write(stdin.read(bl))
+                else:
+                    for _ in range(count):
+                        (rpos,) = struct.unpack('<Q', stdin.read(8))
+                        bl = min(blocksize, sync_size - rpos)
+                        f.seek(rpos)
+                        stdout.write(f.read(bl))
+                        stdout.flush()
+
+                pos = sec_end
+        except (struct.error, IOError, OSError):
+            sys.exit(1)
+'''
+
+# Perl fallback for hosts that have no Python.  Functionally identical to
+# remote_script above; see CLAUDE.md ("Remote script constraints") for why
+# this exists as a hex-pack-eval payload rather than an inline -c argument.
+remote_perl = '''
+use strict; use warnings;
+binmode STDIN; binmode STDOUT;
+
+my $HEADER_FMT     = 'Q< Q< Q< Q< Q< Q< C';
+my $HEADER_SIZE    = 49;
+my ($MODE_PUSH, $MODE_PULL) = (0, 1);
+my $PUSH_PULL_MASK = 1;
+my $ALLOW_TRUNCATE = 2;
+
+sub r {
+    my $n = shift;
+    my $buf = '';
+    while (length($buf) < $n) {
+        my $chunk;
+        my $got = read(STDIN, $chunk, $n - length($buf));
+        die "short read\\n" unless defined($got) && $got > 0;
+        $buf .= $chunk;
+    }
+    return $buf;
+}
+
+sub make_hash {
+    my $name = lc(shift);
+    if ($name eq 'md5') {
+        require Digest::MD5;
+        return \\&Digest::MD5::md5;
+    }
+    if ($name =~ /^sha(1|224|256|384|512)\\z/) {
+        require Digest::SHA;
+        my $bits = $1;
+        return sub { Digest::SHA->new($bits)->add($_[0])->digest };
+    }
+    die "unsupported hash algorithm: $name\\n";
+}
+
+eval {
+    my $data = r($HEADER_SIZE);
+    my ($size, $blocksize, $section_size, $start_offset,
+        $filename_len, $hashname_len, $mode_byte) = unpack($HEADER_FMT, $data);
+    my $allow_truncate = $mode_byte & $ALLOW_TRUNCATE;
+    my $mode           = $mode_byte & $PUSH_PULL_MASK;
+
+    my $fn_bytes = r($filename_len);
+    my $hashname = r($hashname_len);
+
+    my $hashfn = make_hash($hashname);
+    print STDOUT $hashfn->($fn_bytes);
+    STDOUT->flush;
+
+    exit 1 unless r(2) eq 'go';
+
+    my $fh;
+    unless (open($fh, $mode == $MODE_PUSH ? '+<:raw' : '<:raw', $fn_bytes)) {
+        print STDOUT pack('Q<', 0); STDOUT->flush; exit 1;
+    }
+    seek($fh, 0, 2);
+    my $remote_size = tell($fh);
+    print STDOUT pack('Q<', $remote_size); STDOUT->flush;
+
+    my $dst_size = $mode == $MODE_PUSH ? $remote_size : $size;
+    my $src_size = $mode == $MODE_PUSH ? $size        : $remote_size;
+    exit 1 if $dst_size < $src_size && !$allow_truncate;
+
+    my $sync_size   = $size < $remote_size ? $size : $remote_size;
+    my $eff_section = $section_size || $sync_size;
+    exit 0 if $sync_size == 0;
+
+    my $pos = $start_offset;
+    while ($pos < $sync_size) {
+        my $sec_end = $pos + $eff_section;
+        $sec_end = $sync_size if $sec_end > $sync_size;
+
+        my $p = $pos;
+        while ($p < $sec_end) {
+            my $bl = $blocksize < $sec_end - $p ? $blocksize : $sec_end - $p;
+            seek($fh, $p, 0);
+            my $buf; read($fh, $buf, $bl);
+            print STDOUT $hashfn->($buf);
+            $p += $bl;
+        }
+        STDOUT->flush;
+
+        my ($count) = unpack('Q<', r(8));
+
+        if ($mode == $MODE_PUSH) {
+            for (1..$count) {
+                my ($wpos) = unpack('Q<', r(8));
+                my $bl = $blocksize < $sync_size - $wpos ? $blocksize : $sync_size - $wpos;
+                my $blk = r($bl);
+                seek($fh, $wpos, 0);
+                print $fh $blk;
+            }
+        } else {
+            for (1..$count) {
+                my ($rpos) = unpack('Q<', r(8));
+                my $bl = $blocksize < $sync_size - $rpos ? $blocksize : $sync_size - $rpos;
+                seek($fh, $rpos, 0);
+                my $buf; read($fh, $buf, $bl);
+                print STDOUT $buf;
+                STDOUT->flush;
+            }
+        }
+        $pos = $sec_end;
+    }
+};
+exit 1 if $@;
+exit 0;
+'''
+
+
+class IOCounter:
+    def __init__(self, in_stream, out_stream):
+        self.in_stream  = in_stream
+        self.out_stream = out_stream
+        self.in_total   = 0
+        self.out_total  = 0
+
+    def read(self, n):
+        data = self.in_stream.read(n)
+        self.in_total += len(data)
+        return data
+
+    def write(self, data):
+        self.out_stream.write(data)
+        self.out_total += len(data)
+        self.out_stream.flush()
+
+
+class ConnectionLost(RuntimeError):
+    def __init__(self, offset, interrupted=False):
+        verb = 'Interrupted' if interrupted else 'Connection lost'
+        # super(Cls, self) form for Python 2 compatibility.
+        super(ConnectionLost, self).__init__(
+            '%s - resume with: --resume-from %d' % (verb, offset))
+        self.offset      = offset
+        self.interrupted = interrupted
+
+
+def report(msg):
+    global last_report_len
+
+    if batch:
+        return
+    if quiet and msg[:1] == '\r':
+        return
+    stt = 1 if (last_report_len == 0 and msg[:1] in ('\r', '\n')) else 0
+    lines = msg[stt:].split('\n')
+    first = lines[0]
+    if last_report_len > len(lines[0]):
+        lines[0] = first + ' ' * (last_report_len - len(first))
+    sys.stderr.write('\n'.join(lines))
+    sys.stderr.flush()
+    last_report_len = len(first)
+
+
+def parse_size(s):
+    s = s.strip()
+    if not s:
+        raise ValueError('empty size string')
+    suffixes = {'k': 1024, 'm': 1024**2, 'g': 1024**3, 't': 1024**4}
+    if s[-1].lower() in suffixes:
+        return int(float(s[:-1]) * suffixes[s[-1].lower()])
+    return int(s)
+
+
+def parse_block_count(s):
+    """Parse -B value. Bare integer N -> N blocks. With K/M/G/T suffix -> byte
+    size, returned as a negative sentinel that main() resolves to a block
+    count once the (possibly user-overridden) block size is known."""
+    s = s.strip()
+    if not s:
+        raise ValueError('empty block-count value')
+    if s[-1].lower() in ('k', 'm', 'g', 't'):
+        v = parse_size(s)
+        if v < 0:
+            raise ValueError('block-count value must be non-negative')
+        return -v if v else 0
+    n = int(s)
+    if n < 0:
+        raise ValueError('block-count value must be non-negative')
+    return n
+
+
+def parse_resume_from(s):
+    """Parse -r value. Bare integer or K/M/G/T size string -> bytes (positive).
+    NN% or NN.N% (0..100 inclusive) -> negative permille sentinel that
+    main() resolves to a byte offset against the local file size."""
+    s = s.strip()
+    if not s:
+        raise ValueError('empty resume-from value')
+    if s.endswith('%'):
+        v = float(s[:-1])
+        if not (0 <= v <= 100):
+            raise ValueError('resume-from percentage must be between 0 and 100')
+        return -int(round(v * 10))
+    return parse_size(s)
+
+
+def available_memory():
+    try:
+        pages = os.sysconf('SC_AVPHYS_PAGES')
+        size  = os.sysconf('SC_PAGE_SIZE')
+        if pages > 0 and size > 0:
+            return pages * size
+    except (AttributeError, ValueError, OSError):
+        pass
+    return 0
+
+
+def format_time(seconds):
+    s = int(seconds)
+    h, s = divmod(s, 3600)
+    m, s = divmod(s, 60)
+    return '%d:%02d:%02d' % (h, m, s) if h else '%d:%02d' % (m, s)
+
+
+def format_size(n, floor=False):
+    """Return n as a human-readable size string.
+    floor=False (default): only emit a unit when n is an exact multiple of
+        it.  Round-trips losslessly through parse_size(); use for CLI args.
+    floor=True: truncate to the largest unit that keeps the count to four
+        digits or fewer; use for display values.  When the next unit up
+        would otherwise force a count of five or more digits, the count is
+        allowed to drop below ten — e.g. 9999M displays as "9999M" but
+        10000M (= 9.77G) becomes "9G", and 10240M (= 10G) becomes "10G"."""
+    if floor:
+        for suffix, div in (('',  1),
+                            ('K', 1 << 10),
+                            ('M', 1 << 20),
+                            ('G', 1 << 30),
+                            ('T', 1 << 40)):
+            count = n // div
+            if count <= 9999:
+                return '%d%s' % (count, suffix)
+        # n >= 10000 T (≈ 10 PiB) — fall back to T regardless of width.
+        return '%dT' % (n >> 40)
+    for suffix, div in (('T', 1 << 40), ('G', 1 << 30), ('M', 1 << 20), ('K', 1 << 10)):
+        if n % div == 0 and n // div > 0:
+            return '%d%s' % (n // div, suffix)
+    return str(n)
+
+
+def build_resume_cmd(argv0, args, src, dst, offset, block_count=None):
+    parts = [argv0]
+    if args.block_size != DEFAULT_BLOCK:
+        parts += ['-b', format_size(args.block_size)]
+    if args.section_size != DEFAULT_SECTION:
+        parts += ['-s', format_size(args.section_size)]
+    if args.algorithm != 'sha256':
+        parts += ['-a', args.algorithm]
+    if args.retries != DEFAULT_RETRIES:
+        parts += ['--retries', str(args.retries)]
+    if args.identity:
+        parts += ['-i', args.identity]
+    for opt in (args.ssh_opt or []):
+        parts += ['-o', opt]
+    if args.compress:
+        parts.append('-C')
+    if args.dry_run:
+        parts.append('-N')
+    if args.allow_truncate:
+        parts.append('--allow-truncate')
+    if args.buffer:
+        parts.append('--buffer')
+    bc = args.block_count if block_count is None else block_count
+    if bc:
+        parts += ['-B', str(bc)]
+    if args.port != 22:
+        parts += ['-p', str(args.port)]
+    if args.quiet:
+        parts.append('-q')
+    if args.batch:
+        parts.append('--batch')
+    parts += ['-r', format_size(offset)]
+    parts += [src, dst]
+    return ' '.join(_shquote(p) for p in parts)
+
+
+def build_ssh_cmd(remote_host, args):
+    cmd = ['ssh']
+    if args.get('compress'):
+        cmd.append('-C')
+    if args.get('port', 22) != 22:
+        cmd += ['-p', str(args['port'])]
+    if args.get('identity'):
+        cmd += ['-i', args['identity']]
+    for opt in (args.get('ssh_opt') or []):
+        cmd += ['-o', opt]
+    # Keepalive failsafe: a silently-dropped TCP connection (router NAT
+    # timeout, peer kernel stall, ISP blip) otherwise leaves both ends
+    # blocked on read/write forever.  With these settings ssh declares the
+    # connection dead after ~60s of unresponsiveness, which surfaces as a
+    # BrokenPipeError on the client and engages the ConnectionLost path
+    # (and --retries, if set).  Appended after the user's -o options
+    # because ssh applies the first matching -o, so a user-supplied
+    # override still wins.
+    cmd += ['-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4']
+    script_py = remote_script + '\n_remote()'
+    # bytes.hex() is Py3.5+; binascii.hexlify works on both.  decode('ascii')
+    # gives a native str on Py3 and unicode on Py2 — both interpolate fine
+    # into the wrapper shell string below.
+    hex_pl    = binascii.hexlify(remote_perl.encode('utf-8')).decode('ascii')
+    # BSCP_FORCE_PERL skips the Python branch — used by tests.sh to exercise
+    # the Perl fallback on a host that has both interpreters.
+    py_branch = '' if os.environ.get('BSCP_FORCE_PERL') else (
+        'for py in python3 python2 python; do '
+        'command -v "$py" >/dev/null 2>&1 && exec "$py" -O -B -c "%s"; '
+        'done; ' % script_py)
+    wrapper = (
+        py_branch +
+        "command -v perl >/dev/null 2>&1 && "
+        "exec perl -e 'eval pack(qq{H*}, q{%s})'; "
+        'echo "bscp: no python or perl found on remote" >&2; exit 127'
+    ) % hex_pl
+    cmd += ['--', remote_host, wrapper]
+    return cmd
+
+
+def do_sync(local_file, remote_host, remote_file, mode,
+            blocksize, section_size, hashname,
+            start_offset=0, dry_run=False, block_count=0, allow_truncate=False, buffer=False, ssh_args=None):
+
+    ssh_args = ssh_args or {}
+    fn_bytes = remote_file.encode('utf-8')
+    hn_bytes = hashname.encode('ascii')
+    dig_size = hashlib.new(hashname).digest_size
+
+    # Local is the destination on pull (we write blocks back into it) and the
+    # source on push (read-only).  The remote uses the symmetric inverse —
+    # see the open() in remote_script / remote_perl.
+    open_mode = 'rb+' if mode == MODE_PULL else 'rb'
+    try:
+        f = open(local_file, open_mode)
+    except (IOError, OSError) as e:
+        # Py2 raises IOError, Py3 raises OSError (IOError is an alias).
+        raise RuntimeError('Cannot open local file %s: %s' % (local_file, e))
+    with f:
+        f.seek(0, 2)
+        local_size = f.tell()
+        # wire_size is what we ship in the header — the source size as seen
+        # by the protocol, after -B capping.  The unmodified local_size is
+        # still used below for the authoritative truncate check.
+        wire_size = local_size
+        if block_count > 0:
+            wire_size = min(wire_size, start_offset + block_count * blocksize)
+
+        cmd  = build_ssh_cmd(remote_host, ssh_args)
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        io   = IOCounter(proc.stdout, proc.stdin)
+
+        # The remote runs its own size-mismatch check on the wire-side `size`,
+        # which is wire_size (the -B-capped local size) — so when -B is in use
+        # the remote would falsely refuse.  The client's check below is
+        # authoritative (it sees the real local_size and the requested limit),
+        # so set the wire-side ALLOW_TRUNCATE bit whenever -B caps wire_size.
+        wire_truncate = allow_truncate or block_count > 0
+        mode_byte = mode | (ALLOW_TRUNCATE if wire_truncate else 0)
+        io.write(struct.pack(HEADER_FMT,
+                             wire_size, blocksize, section_size, start_offset,
+                             len(fn_bytes), len(hn_bytes), mode_byte))
+        io.write(fn_bytes)
+        io.write(hn_bytes)
+
+        def fail(msg):
+            # Closing stdout too unblocks the remote if it is mid-stream on
+            # stdout.write() (e.g. streaming hashes after we told it
+            # ALLOW_TRUNCATE on the wire but then refuse on our side); without
+            # it proc.wait() would deadlock against the remote's blocked write.
+            proc.stdin.close()
+            proc.stdout.close()
+            proc.wait()
+            raise RuntimeError(msg)
+
+        if io.read(dig_size) != hashlib.new(hashname, fn_bytes).digest():
+            fail('Remote script failed to execute')
+        io.write(b'go')
+
+        (remote_size,) = struct.unpack('<Q', io.read(8))
+        if remote_size == 0:
+            fail('Remote file not found or inaccessible')
+
+        # In push, remote is destination; in pull, remote is source.
+        if mode == MODE_PUSH:
+            src_label, src_size, dst_label, dst_size = 'local',  local_size,  'remote', remote_size
+        else:
+            src_label, src_size, dst_label, dst_size = 'remote', remote_size, 'local',  local_size
+
+        # -B caps the source for the truncate check too: the user only wants
+        # to sync up to that much, so a smaller destination is only "truncating"
+        # if it can't fit even the requested amount.  An overshoot (-B asks for
+        # more than the source has) is just a warning.
+        eff_src = src_size
+        if block_count > 0:
+            requested = start_offset + block_count * blocksize
+            if requested > src_size:
+                report('\nWarning: -B requests up to %s but %s source has only %s; '
+                       'syncing only what is available\n' % (
+                       format_size(requested, floor=True),
+                       src_label, format_size(src_size, floor=True)))
+            else:
+                eff_src = requested
+
+        if dst_size < eff_src:
+            if not allow_truncate:
+                fail('%s destination size %d (%d blocks) < %s source size %d (%d blocks); '
+                     'override with --allow-truncate' % (
+                     dst_label, dst_size, dst_size // blocksize,
+                     src_label, eff_src,  eff_src // blocksize))
+            dst_h = format_size(dst_size, floor=True)
+            report('\nWarning: %s destination (%s) smaller than %s source (%s); '
+                   'syncing only first %s\n' % (
+                   dst_label, dst_h, src_label,
+                   format_size(eff_src, floor=True), dst_h))
+
+        sync_size = min(wire_size, remote_size)
+        if sync_size == 0:
+            # Server has already exited (matching `if sync_size == 0: sys.exit(0)`).
+            proc.stdin.close()
+            proc.wait()
+            return io.in_total, io.out_total, 0, 0, 0
+        eff_section    = section_size or sync_size
+        total_blocks   = max(1, (sync_size + blocksize - 1) // blocksize)
+        skipped_blocks = start_offset // blocksize
+        total_scanned  = skipped_blocks
+
+        total_diffs         = 0
+        total_written       = 0
+        total_blocks_copied = 0
+        last_sec_start      = start_offset
+        # One-element list cells so closures can mutate without `nonlocal`
+        # (Python 2 has no nonlocal keyword).  Each cell holds one value
+        # accessed as `var[0]`.
+        t_last_progress     = [0.0]
+
+        # Unified ETA state — tracked across sections so the estimate folds
+        # both scan and copy work into one time budget.  Scan extrapolates
+        # remaining blocks at the observed scan rate; copy extrapolates the
+        # expected diff volume in the unscanned tail (using the diff-density
+        # observed so far) at the observed copy rate.  No regime flip at the
+        # phase A → phase B boundary; ETA is stable across sections.
+        t_overall_start = time()
+        total_scan_time = 0.0
+        total_copy_time = 0.0
+
+        # Pre-copy bootstrap: copy throughput is typically 1–2 orders of
+        # magnitude below scan throughput.  Used until the first phase B
+        # produces a real copy-rate measurement.
+        BOOTSTRAP_COPY_RATIO = 50.0
+
+        # Minimum cumulative scan/copy time before the rate is considered
+        # reliable enough to drop the `~` bootstrap marker.  The very first
+        # tick fires after a single block in microseconds, so the rate is
+        # noise-dominated; before this threshold we display `~m:ss` to
+        # signal low confidence.  Copy also has a byte-volume gate so fast
+        # transfers (localhost, 10 GbE) — where the whole copy can finish
+        # in under a second — still seed the EMA from real data instead of
+        # being marked bootstrap-quality forever.
+        RATE_RELIABLE_SECS  = 1.0
+        RATE_RELIABLE_BYTES = 4 * 1024 * 1024
+
+        # Diff-density EMA: per-section fraction of differing blocks,
+        # smoothed across completed sections.  α=0.4 balanced.
+        DIFF_EMA_ALPHA = 0.4
+        ema_diff_frac  = None
+
+        # Scan/copy rate EMAs — time-weighted to track real throughput
+        # changes mid-run (HDD outer↔inner geometry, varying compressibility
+        # under -C, network jitter).  RATE_EMA_TAU is the exponential decay
+        # constant in seconds-of-phase-time; with REPORT_INTERVAL=0.5s, τ=5s
+        # gives an effective ~10-sample window — long enough to ignore
+        # per-tick noise, short enough to react to genuine rate changes
+        # within a few seconds.  Rates are bootstrapped from the cumulative
+        # average at the first sample where the phase has accumulated at
+        # least RATE_RELIABLE_SECS of time, which sidesteps the bogus
+        # first-block measurement entirely.
+        RATE_EMA_TAU         = 5.0
+        # See t_last_progress above for the list-cell pattern.
+        ema_scan_rate        = [None]              # blocks/sec
+        ema_copy_rate        = [None]              # bytes/sec
+        rate_prev_scan_secs  = [0.0]
+        rate_prev_scanned    = [skipped_blocks]
+        rate_prev_copy_secs  = [0.0]
+        rate_prev_written    = [0]
+
+        # ETA display damping: once the rate EMAs are seeded (`confident`),
+        # the underlying estimate is still recomputed every progress tick,
+        # but the *displayed* value is only re-snapped to it every
+        # ETA_REFRESH_INTERVAL seconds.  In between, it counts down 1s per
+        # wall-clock second — so the user sees a steady countdown rather
+        # than per-tick jitter from EMA wiggle.  Before confidence the
+        # display tracks every tick (no damping, since the early estimate
+        # genuinely needs to swing toward truth).
+        ETA_REFRESH_INTERVAL = 5.0
+        # See t_last_progress above for the list-cell pattern.
+        eta_displayed        = [None]
+        eta_displayed_at     = [0.0]
+
+        def display_eta(fresh_eta, confident, now):
+            if (not confident
+                    or eta_displayed[0] is None
+                    or now - eta_displayed_at[0] >= ETA_REFRESH_INTERVAL):
+                eta_displayed[0]    = fresh_eta
+            else:
+                eta_displayed[0]    = max(0.0, eta_displayed[0] - (now - eta_displayed_at[0]))
+            eta_displayed_at[0] = now
+            return eta_displayed[0]
+
+        def update_scan_rate_ema(scan_secs_now):
+            if scan_secs_now < RATE_RELIABLE_SECS:
+                return
+            if ema_scan_rate[0] is None:
+                # Seed from cumulative — bypasses first-tick noise entirely.
+                ema_scan_rate[0]       = (total_scanned - skipped_blocks) / scan_secs_now
+                rate_prev_scan_secs[0] = scan_secs_now
+                rate_prev_scanned[0]   = total_scanned
+                return
+            dt    = scan_secs_now - rate_prev_scan_secs[0]
+            delta = total_scanned - rate_prev_scanned[0]
+            if dt <= 0 or delta <= 0:
+                return
+            inst             = delta / dt
+            w                = 1.0 - math.exp(-dt / RATE_EMA_TAU)
+            ema_scan_rate[0] = (1 - w) * ema_scan_rate[0] + w * inst
+            rate_prev_scan_secs[0] = scan_secs_now
+            rate_prev_scanned[0]   = total_scanned
+
+        def update_copy_rate_ema(copy_secs_now, written_now):
+            if written_now <= 0:
+                return
+            if (copy_secs_now < RATE_RELIABLE_SECS
+                    and written_now < RATE_RELIABLE_BYTES):
+                return
+            if ema_copy_rate[0] is None:
+                ema_copy_rate[0]       = written_now / copy_secs_now
+                rate_prev_copy_secs[0] = copy_secs_now
+                rate_prev_written[0]   = written_now
+                return
+            dt    = copy_secs_now - rate_prev_copy_secs[0]
+            delta = written_now - rate_prev_written[0]
+            if dt <= 0 or delta <= 0:
+                return
+            inst             = delta / dt
+            w                = 1.0 - math.exp(-dt / RATE_EMA_TAU)
+            ema_copy_rate[0] = (1 - w) * ema_copy_rate[0] + w * inst
+            rate_prev_copy_secs[0] = copy_secs_now
+            rate_prev_written[0]   = written_now
+
+        def estimate_eta(now, live_diffs=0, live_written=0,
+                         scan_active_since=None, copy_active_since=None,
+                         sec_blocks_scanned=0, sec_blocks_total=0):
+            scan_secs = total_scan_time
+            if scan_active_since is not None:
+                scan_secs += now - scan_active_since
+
+            scan_blocks_done = max(1, total_scanned - skipped_blocks)
+            if ema_scan_rate[0] is not None:
+                scan_rate = ema_scan_rate[0]
+            elif scan_secs > 0:
+                scan_rate = scan_blocks_done / scan_secs
+            else:
+                scan_rate = 0.0
+            unscanned = max(0, total_blocks - total_scanned)
+            remaining_scan_time = unscanned / scan_rate if scan_rate > 0 else 0.0
+
+            # Dry-run does not transfer any blocks — the copy component is
+            # zero by definition, so the ETA collapses to scan-only.
+            if dry_run:
+                return remaining_scan_time
+
+            copy_secs = total_copy_time
+            if copy_active_since is not None:
+                copy_secs += now - copy_active_since
+
+            written_cum = total_written + live_written
+            if ema_copy_rate[0] is not None:
+                copy_rate = ema_copy_rate[0]
+            elif written_cum > 0 and copy_secs > 0:
+                copy_rate = written_cum / copy_secs
+            else:
+                copy_rate = max(1.0, scan_rate * blocksize / BOOTSTRAP_COPY_RATIO)
+
+            # Diff-density estimate.  When called from phase A, the caller
+            # passes section progress; the in-section running fraction is
+            # blended with the completed-section EMA, weighted by section
+            # completion.  When called from phase B (sec_blocks_total == 0)
+            # the section's scan is already folded into the EMA, so we use
+            # it directly.
+            if sec_blocks_scanned > 0:
+                sec_so_far = live_diffs / sec_blocks_scanned
+            else:
+                sec_so_far = 0.0
+            if ema_diff_frac is None:
+                diff_frac = sec_so_far
+            elif sec_blocks_total <= 0:
+                diff_frac = ema_diff_frac
+            else:
+                w_running = sec_blocks_scanned / sec_blocks_total
+                diff_frac = w_running * sec_so_far + (1.0 - w_running) * ema_diff_frac
+
+            diffs_cum        = total_diffs + live_diffs
+            est_future_diffs = diff_frac * unscanned
+            est_copy_bytes   = (diffs_cum + est_future_diffs) * blocksize
+            remaining_copy   = max(0.0, est_copy_bytes - written_cum)
+
+            remaining_copy_time = remaining_copy / copy_rate if copy_rate > 0 else 0.0
+            return remaining_scan_time + remaining_copy_time
+
+        try:
+            pos = start_offset
+            while pos < sync_size:
+                sec_end        = min(pos + eff_section, sync_size)
+                last_sec_start = pos
+
+                # ── Phase A: hash exchange ────────────────────────────
+                diff_blocks    = []   # push: [(wpos, block)]
+                diff_positions = []   # pull: [rpos]
+
+                t_phase_a_start = time()
+                f.seek(pos)
+                p = pos
+                while p < sec_end:
+                    bl         = min(blocksize, sec_end - p)
+                    block      = f.read(bl)
+                    local_dig  = hashlib.new(hashname, block).digest()
+                    remote_dig = io.read(dig_size)
+                    if local_dig != remote_dig:
+                        if mode == MODE_PUSH and buffer:
+                            diff_blocks.append((p, block))
+                        else:
+                            diff_positions.append(p)
+                    p             += bl
+                    total_scanned += 1
+                    now = time()
+                    if now - t_last_progress[0] >= REPORT_INTERVAL:
+                        t_last_progress[0] = now
+                        sec_diffs    = len(diff_blocks) + len(diff_positions)
+                        ndiff        = total_diffs + sec_diffs
+                        pct_done     = total_scanned * 100.0 / total_blocks
+                        newly        = total_scanned - skipped_blocks
+                        pct_diff     = ndiff * 100.0 / max(1, newly)
+                        elapsed      = now - t_overall_start
+                        scan_secs    = total_scan_time + (now - t_phase_a_start)
+                        speed        = newly * blocksize / (scan_secs * 1024**2 + 1)
+                        update_scan_rate_ema(scan_secs)
+                        # Copy phase is not currently running, but earlier
+                        # sections' phase B may have written bytes — sample
+                        # the EMA from the cumulative totals so it can seed
+                        # without waiting for the next copy tick.
+                        update_copy_rate_ema(total_copy_time, total_written)
+                        # `~` marker means "low confidence" — rate samples
+                        # are still bootstrap-quality.  Drops once both
+                        # rate EMAs are seeded (or scan-only is seeded
+                        # under --dry-run).
+                        confident    = ema_scan_rate[0] is not None and (
+                                           dry_run or ema_copy_rate[0] is not None)
+                        sec_blk_done = (p   - pos + blocksize - 1) // blocksize
+                        sec_blk_tot  = (sec_end - pos + blocksize - 1) // blocksize
+                        eta          = display_eta(estimate_eta(now,
+                                                    live_diffs=sec_diffs,
+                                                    scan_active_since=t_phase_a_start,
+                                                    sec_blocks_scanned=sec_blk_done,
+                                                    sec_blocks_total=sec_blk_tot),
+                                                    confident, now)
+                        eta_mark     = '' if confident else '~'
+                        scanned_bytes = min(total_scanned * blocksize, sync_size)
+                        report('\rscan %s/%s (%.1f%%) diff blocks=%d (%.1f%%) (%.0f MiB/s) %s (%s%s) ' % (
+                            format_size(scanned_bytes, floor=True),
+                            format_size(sync_size, floor=True),
+                            pct_done, ndiff, pct_diff, speed,
+                            format_time(elapsed), eta_mark, format_time(eta)))
+
+                total_scan_time += time() - t_phase_a_start
+                sec_blocks_total = (sec_end - pos + blocksize - 1) // blocksize
+                sec_diff_count   = len(diff_blocks) + len(diff_positions)
+                sec_frac         = sec_diff_count / max(1, sec_blocks_total)
+                ema_diff_frac    = (sec_frac if ema_diff_frac is None
+                                    else DIFF_EMA_ALPHA * sec_frac
+                                       + (1 - DIFF_EMA_ALPHA) * ema_diff_frac)
+                total_diffs     += sec_diff_count
+
+                # ── Phase B: transfer ─────────────────────────────────
+                t_phase_b_start    = time()
+                written            = 0
+                section_diff_count = len(diff_blocks) + len(diff_positions)
+
+                def show_copy_progress(wpos, blocks_done):
+                    now = time()
+                    if now - t_last_progress[0] < REPORT_INTERVAL:
+                        return
+                    t_last_progress[0] = now
+                    sec_elapsed = max(1e-6, now - t_phase_b_start)
+                    speed       = written / (sec_elapsed * 1024 + 1)
+                    copy_secs   = total_copy_time + (now - t_phase_b_start)
+                    update_copy_rate_ema(copy_secs, total_written + written)
+                    confident   = ema_scan_rate[0] is not None and ema_copy_rate[0] is not None
+                    eta         = display_eta(estimate_eta(now,
+                                               live_written=written,
+                                               copy_active_since=t_phase_b_start),
+                                               confident, now)
+                    eta_mark    = '' if confident else '~'
+                    pct_pos     = wpos * 100.0 / sync_size
+                    pct_sec     = blocks_done * 100.0 / max(1, section_diff_count)
+                    cum_blocks  = total_blocks_copied + blocks_done
+                    report('\rcopy %s/%s (%.1f%%) block %d/%d (%.1f%%) (%.0f KiB/s) %s (%s%s) ' % (
+                        format_size(wpos, floor=True),
+                        format_size(sync_size, floor=True),
+                        pct_pos, cum_blocks, total_diffs, pct_sec,
+                        speed, format_time(now - t_overall_start),
+                        eta_mark, format_time(eta)))
+
+                if mode == MODE_PUSH and not buffer:
+                    io.write(struct.pack('<Q', 0 if dry_run else len(diff_positions)))
+                    if not dry_run:
+                        for i, wpos in enumerate(diff_positions):
+                            bl = min(blocksize, sync_size - wpos)
+                            f.seek(wpos)
+                            io.write(struct.pack('<Q', wpos))
+                            io.write(f.read(bl))
+                            written += bl
+                            show_copy_progress(wpos, i + 1)
+
+                elif mode == MODE_PUSH:
+                    io.write(struct.pack('<Q', 0 if dry_run else len(diff_blocks)))
+                    if not dry_run:
+                        for i, (wpos, wblock) in enumerate(diff_blocks):
+                            io.write(struct.pack('<Q', wpos))
+                            io.write(wblock)
+                            written += len(wblock)
+                            show_copy_progress(wpos, i + 1)
+
+                else:  # pull — windowed to avoid two-pipe deadlock
+                    io.write(struct.pack('<Q', 0 if dry_run else len(diff_positions)))
+                    if not dry_run:
+                        blocks_done = 0
+                        for batch_start in range(0, len(diff_positions), PULL_WINDOW):
+                            window = diff_positions[batch_start:batch_start + PULL_WINDOW]
+                            for rpos in window:
+                                io.write(struct.pack('<Q', rpos))
+                            for rpos in window:
+                                bl    = min(blocksize, sync_size - rpos)
+                                block = io.read(bl)
+                                f.seek(rpos)
+                                f.write(block)
+                                written      += bl
+                                blocks_done  += 1
+                                show_copy_progress(rpos, blocks_done)
+
+                total_copy_time     += time() - t_phase_b_start
+                total_written       += written
+                total_blocks_copied += section_diff_count
+                pos = sec_end
+
+        except _PIPE_ERRORS:
+            # `raise X from Y` is Py3-only; on Py2 the cause chain is dropped.
+            # Closing stdout in addition to stdin unblocks the remote if it
+            # was stuck mid-write — same rationale as fail() above.
+            proc.stdin.close()
+            proc.stdout.close()
+            proc.wait()
+            raise ConnectionLost(last_sec_start)
+        except KeyboardInterrupt:
+            # Mirror the _PIPE_ERRORS path: close stdout too, otherwise a
+            # remote blocked mid-write (pull phase B, or any phase A) keeps
+            # proc.wait() hanging forever and the user sees no resume hint.
+            proc.stdin.close()
+            proc.stdout.close()
+            proc.wait()
+            raise ConnectionLost(last_sec_start, interrupted=True)
+
+        proc.stdin.close()
+        proc.wait()
+
+    return io.in_total, io.out_total, sync_size, total_diffs, total_written
+
+
+if __name__ == '__main__':
+    parser = ArgumentParser(
+        description='Binary Secure Copy — push or pull a local/remote file or block device, '
+                    'transferring only changed blocks over SSH.',
+        usage='%(prog)s [options] SRC DST\n'
+              '  push:  bscp [options] local_file   HOST:remote_file\n'
+              '  pull:  bscp [options] HOST:remote_file   local_file')
+    parser.add_argument('-b', '--block-size',   default=DEFAULT_BLOCK,
+                        type=parse_size, metavar='SIZE',
+                        help='block size (default 64K; supports K/M/G/T suffix)')
+    parser.add_argument('-s', '--section-size', default=DEFAULT_SECTION,
+                        type=parse_size, metavar='SIZE',
+                        help='section size (default 10G; bounds memory use per pass)')
+    parser.add_argument('-a', '--algorithm',    default='sha256',
+                        metavar='ALGO',
+                        help='hash algorithm (default sha256)')
+    parser.add_argument('-r', '--resume-from',  default=0,
+                        type=parse_resume_from, metavar='OFFSET',
+                        help='resume from byte offset (K/M/G/T suffix accepted), '
+                             'or NN[.N]%% of the local file size; rounded down '
+                             'to section boundary')
+    parser.add_argument('--retries',            default=DEFAULT_RETRIES, type=int, metavar='N',
+                        help='auto-retry attempts on connection failure (default %d; 0 disables)' % DEFAULT_RETRIES)
+    parser.add_argument('-i', '--identity',     metavar='FILE',
+                        help='SSH identity file (-i FILE)')
+    parser.add_argument('-o', '--ssh-opt',      action='append', metavar='OPT',
+                        help='extra SSH option, repeatable (passed as -o OPT)')
+    parser.add_argument('-C', '--compress',     action='store_true',
+                        help='enable SSH compression')
+    parser.add_argument('-N', '--dry-run',      action='store_true',
+                        help='count differences only; do not update destination')
+    parser.add_argument('-B', '--block-count',        default=0, type=parse_block_count, metavar='N',
+                        help='limit sync to first N blocks (default 0 = no limit). '
+                             'A K/M/G/T suffix interprets the value as bytes, '
+                             'rounded up to a whole number of blocks.')
+    parser.add_argument('--allow-truncate',           action='store_true',
+                        help='allow destination to be smaller than source; '
+                             'syncs only the bytes that fit. '
+                             'WARNING: data beyond destination size is not copied.')
+    parser.add_argument('--buffer',                   action='store_true',
+                        help='push: buffer differing blocks in memory during '
+                             'transfer instead of re-reading them from disk. '
+                             'Higher memory use, but only one disk read pass needed. Experimental.')
+    parser.add_argument('-q', '--quiet',              action='store_true',
+                        help='suppress scan/copy progress lines; errors and warnings are still shown')
+    parser.add_argument('--batch',                    action='store_true',
+                        help='suppress all stderr output; use exit status to detect errors (implies -q). '
+                             'Exit 0=success, 1=fatal error, 2=bad arguments, '
+                             '3=connection lost (resume with --resume-from), 130=interrupted. '
+                             'Note: the exit code cannot convey the resume offset; '
+                             'callers that need to resume should use -q instead and '
+                             'parse the "Resume with:" line from stderr.')
+    parser.add_argument('-p', '--port',         default=22, type=int, metavar='PORT',
+                        help='SSH port (default 22)')
+    parser.add_argument('src', help='source — local path or HOST:path')
+    parser.add_argument('dst', help='destination — HOST:path or local path')
+
+    if len(sys.argv) == 1:
+        parser.print_usage(sys.stderr)
+        sys.stderr.write('Use -h or --help for full option list.\n')
+        sys.exit(2)
+
+    args = parser.parse_args()
+    quiet = args.quiet or args.batch
+    batch = args.batch
+
+    src, dst = args.src, args.dst
+    if ':' in src and ':' not in dst:
+        mode = MODE_PULL
+        remote_host, remote_file = src.split(':', 1)
+        local_file = dst
+    elif ':' in dst and ':' not in src:
+        mode = MODE_PUSH
+        local_file = src
+        remote_host, remote_file = dst.split(':', 1)
+    else:
+        parser.error('exactly one of SRC or DST must be HOST:path')
+
+    blocksize    = args.block_size
+    section_size = args.section_size
+    hashname     = args.algorithm
+    dry_run      = args.dry_run
+    # parse_resume_from() returns a negative permille sentinel for the NN%
+    # form; resolve against the local file size before section-boundary
+    # rounding.  If the file is missing, fall through with offset 0 — the
+    # friendlier 'Cannot open local file ...' error fires inside do_sync.
+    if args.resume_from < 0:
+        try:
+            local_size_for_pct = os.path.getsize(local_file)
+        except OSError:
+            local_size_for_pct = 0
+        resume_offset = (-args.resume_from) * local_size_for_pct // 1000
+    else:
+        resume_offset = args.resume_from
+    # section_size == 0 means whole-file-in-one-section, in which case the
+    # only valid resume boundary is start_offset itself.
+    start_offset = (resume_offset // section_size) * section_size if section_size else resume_offset
+    ssh_args     = vars(args)
+
+    # parse_block_count() returns a negative sentinel for byte-suffixed -B
+    # values; resolve to a block count now that blocksize is known.
+    if args.block_count < 0:
+        args.block_count = (-args.block_count + blocksize - 1) // blocksize
+
+    # For push with --buffer, cap section size at half of available memory
+    # so that the diff_blocks list (one full block per diff) cannot exhaust RAM.
+    # Without --buffer (or while pulling), only 8-byte positions are stored, so no cap needed.
+    buffer = args.buffer
+    if mode == MODE_PUSH and buffer:
+        avail = available_memory()
+        if avail < MIN_MEMORY_PUSH:
+            buffer = False
+            report('\nNote: dropping --buffer mode due to low available memory\n')
+        else:
+            mem_limit = max(avail // 2, blocksize)
+            # section_size == 0 means "whole file as one section" — also clamp.
+            if section_size == 0 or section_size > mem_limit:
+                section_size = mem_limit
+                report('\nNote: section size reduced to %s (half of available memory)\n'
+                        % format_size(section_size, floor=True))
+
+    resume_cmd = lambda offset: build_resume_cmd(
+        sys.argv[0], args, src, dst, offset)
+
+    t_start  = time()
+    attempt  = 0
+
+    try:
+        while True:
+            try:
+                (in_total, out_total, sync_size,
+                 total_diffs, total_written) = do_sync(
+                    local_file, remote_host, remote_file,
+                    mode, blocksize, section_size, hashname,
+                    start_offset=start_offset, dry_run=dry_run,
+                    block_count=args.block_count, allow_truncate=args.allow_truncate,
+                    buffer=buffer, ssh_args=ssh_args)
+                break
+            except ConnectionLost as exc:
+                if attempt < args.retries and not exc.interrupted:
+                    delay = min(2 ** attempt, 60)
+                    report('\nConnection lost — retrying (%d/%d) in %ds...\n'
+                            'Resume manually with:\n  %s\n' % (
+                            attempt + 1, args.retries, delay,
+                            resume_cmd(exc.offset)))
+                    start_offset = exc.offset
+                    attempt += 1
+                    sleep(delay)
+                else:
+                    label = 'Interrupted' if exc.interrupted else 'Connection lost'
+                    report('\n%s - Resume with:\n  %s\n' % (
+                        label, resume_cmd(exc.offset)))
+                    sys.exit(130 if exc.interrupted else 3)
+            except RuntimeError as exc:
+                report('\nError: %s\n' % exc)
+                sys.exit(1)
+    except KeyboardInterrupt:
+        report('\nInterrupted - Resume with:\n  %s\n' % resume_cmd(start_offset))
+        sys.exit(130)
+
+    elapsed  = time() - t_start
+    xfer     = in_total + out_total
+    speedup  = sync_size / (xfer + 1)
+
+    if dry_run:
+        report('\rdry-run: %d diff blocks (+/- %s) (%.1f%%) (%s)\n' % (
+            total_diffs, format_size(total_diffs * blocksize, floor=True),
+            (100.0 * total_diffs * blocksize) / sync_size, format_time(elapsed)))
+    else:
+        report('\rin=%s out=%s size=%s diff blocks=%d speedup=%.2f (%s)\n' % (
+            format_size(in_total,  floor=True),
+            format_size(out_total, floor=True),
+            format_size(sync_size, floor=True),
+            total_diffs, speedup, format_time(elapsed)))
+
+    if args.block_count:
+        report('Continue with:\n  %s\n' % build_resume_cmd(
+            sys.argv[0], args, src, dst, sync_size, block_count=0))
