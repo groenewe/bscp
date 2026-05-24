@@ -662,12 +662,13 @@ def do_sync(local_file, remote_host, remote_file, mode,
         # reliable enough to drop the `~` bootstrap marker.  The very first
         # tick fires after a single block in microseconds, so the rate is
         # noise-dominated; before this threshold we display `~m:ss` to
-        # signal low confidence.  Copy also has a byte-volume gate so fast
-        # transfers (localhost, 10 GbE) — where the whole copy can finish
-        # in under a second — still seed the EMA from real data instead of
-        # being marked bootstrap-quality forever.
-        RATE_RELIABLE_SECS  = 5.0
-        RATE_RELIABLE_BYTES = 512 * 1024 * 1024
+        # signal low confidence.  Copy also has a byte-volume gate
+        # (RATE_RELIABLE_COPY_BYTES) so fast transfers (localhost, 10 GbE)
+        # — where the whole copy can finish in under a second — still seed
+        # the EMA from real data instead of being marked bootstrap-quality
+        # forever.
+        RATE_RELIABLE_SECS       = 5.0
+        RATE_RELIABLE_COPY_BYTES = 8 * 1024 * 1024
 
         # Diff-density EMA: per-section fraction of differing blocks,
         # smoothed across completed sections.  α=0.4 balanced.
@@ -693,14 +694,19 @@ def do_sync(local_file, remote_host, remote_file, mode,
         rate_prev_written    = 0
 
         # ETA display damping: the underlying estimate is recomputed every
-        # progress tick, but the *displayed* value is re-snapped only every
-        # ETA_REFRESH_INTERVAL seconds.  Between snaps, the value counts
-        # down 1s per wall-clock second so the user sees a steady countdown
-        # rather than per-tick jitter from EMA wiggle.  Damping is applied
+        # progress tick into a heavily-weighted EMA (`eta_smoothed`), but
+        # the *displayed* value is only re-snapped from `eta_smoothed` every
+        # ETA_REFRESH_INTERVAL seconds and held constant between snaps.
+        # The user sees the ETA stay still for a full refresh window and
+        # then update in one step — explicitly chosen over per-tick (or
+        # per-second) countdown so the number on screen does not appear to
+        # drift independently of measured progress.  Damping is applied
         # from the start (not gated on `confident`), so an unseeded early
-        # estimate never gets a chance to flicker — the first ETA_WARMUP_SECS
-        # of the run displays `~-:--` instead, which gives the rate EMAs
-        # time to seed from real data before any number is shown.
+        # estimate never gets a chance to flicker — for the first
+        # ETA_WARMUP_SECS of the run, display_eta() returns None and the
+        # caller omits the `(ETA)` field from the progress line entirely,
+        # which gives the rate EMAs time to seed from real data before any
+        # number is shown.
         ETA_REFRESH_INTERVAL = 10.0
         ETA_WARMUP_SECS      = 20.0
         # Confidence shortcut: once at least CONFIDENT_SCAN_FRAC of the
@@ -719,7 +725,7 @@ def do_sync(local_file, remote_host, remote_file, mode,
             if now - t_overall_start < ETA_WARMUP_SECS:
                 return None
             if eta_smoothed is None:
-               eta_smoothed = fresh_eta
+                eta_smoothed = fresh_eta
             eta_smoothed = (99.0 * (eta_smoothed - REPORT_INTERVAL) + fresh_eta) / 100.0
             if now - eta_displayed_at >= ETA_REFRESH_INTERVAL:
                 eta_displayed = eta_smoothed
@@ -751,7 +757,7 @@ def do_sync(local_file, remote_host, remote_file, mode,
             if written_now <= 0:
                 return
             if (copy_secs_now < RATE_RELIABLE_SECS
-                    and written_now < RATE_RELIABLE_BYTES / BOOTSTRAP_COPY_RATIO):
+                    and written_now < RATE_RELIABLE_COPY_BYTES):
                 return
             if ema_copy_rate is None:
                 ema_copy_rate       = written_now / copy_secs_now
