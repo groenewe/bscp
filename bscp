@@ -415,11 +415,16 @@ def available_memory():
     return 0
 
 
-def format_time(seconds):
+def format_time(seconds, round_minutes=False):
     s = int(seconds)
     h, s = divmod(s, 3600)
     m, s = divmod(s, 60)
-    return '%d:%02d:%02d' % (h, m, s) if h else '%d:%02d' % (m, s)
+    if round_minutes and int(seconds) >= 30:
+        if s >= 30:
+            m += 1
+        return '%d:%02d:00' % (h, m) if h else '%d:00' %m
+    else:
+        return '%d:%02d:%02d' % (h, m, s) if h else '%d:%02d' % (m, s)
 
 
 def format_size(n, floor=False):
@@ -897,7 +902,7 @@ def do_sync(local_file, remote_host, remote_file, mode,
                                                     now)
                         eta_str  = '' if confident or eta is None else '~'
                         if eta is not None:
-                            eta_str = " (%s%s)" %(eta_str, format_time(eta))
+                            eta_str = " (%s%s)" %(eta_str, format_time(eta, round_minutes=True))
                         scanned_bytes = min(total_scanned * blocksize, sync_size)
                         report('\rscan %s/%s (%.1f%%) diff blocks=%d (%.1f%%) (%.0f MiB/s) %s%s ' % (
                             format_size(scanned_bytes, floor=True),
@@ -940,7 +945,7 @@ def do_sync(local_file, remote_host, remote_file, mode,
                                                now)
                     eta_str  = '' if confident or eta is None else '~'
                     if eta is not None:
-                        eta_str = " (%s%s)" %(eta_str, format_time(eta))
+                        eta_str = " (%s%s)" %(eta_str, format_time(eta, round_minutes=True))
                     pct_pos     = wpos * 100.0 / sync_size
                     pct_sec     = blocks_done * 100.0 / max(1, section_diff_count)
                     cum_blocks  = total_blocks_copied + blocks_done
