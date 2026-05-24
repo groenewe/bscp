@@ -656,7 +656,7 @@ def do_sync(local_file, remote_host, remote_file, mode,
         # Pre-copy bootstrap: copy throughput is typically 1–2 orders of
         # magnitude below scan throughput.  Used until the first phase B
         # produces a real copy-rate measurement.
-        BOOTSTRAP_COPY_RATIO = 50.0
+        BOOTSTRAP_COPY_RATIO = 64.0
 
         # Minimum cumulative scan/copy time before the rate is considered
         # reliable enough to drop the `~` bootstrap marker.  The very first
@@ -666,8 +666,8 @@ def do_sync(local_file, remote_host, remote_file, mode,
         # transfers (localhost, 10 GbE) — where the whole copy can finish
         # in under a second — still seed the EMA from real data instead of
         # being marked bootstrap-quality forever.
-        RATE_RELIABLE_SECS  = 1.0
-        RATE_RELIABLE_BYTES = 4 * 1024 * 1024
+        RATE_RELIABLE_SECS  = 5.0
+        RATE_RELIABLE_BYTES = 512 * 1024 * 1024
 
         # Diff-density EMA: per-section fraction of differing blocks,
         # smoothed across completed sections.  α=0.4 balanced.
@@ -699,30 +699,32 @@ def do_sync(local_file, remote_host, remote_file, mode,
         # rather than per-tick jitter from EMA wiggle.  Damping is applied
         # from the start (not gated on `confident`), so an unseeded early
         # estimate never gets a chance to flicker — the first ETA_WARMUP_SECS
-        # of the run displays `--:--` instead, which gives the rate EMAs
+        # of the run displays `~-:--` instead, which gives the rate EMAs
         # time to seed from real data before any number is shown.
-        ETA_REFRESH_INTERVAL = 5.0
-        ETA_WARMUP_SECS      = 30.0
+        ETA_REFRESH_INTERVAL = 10.0
+        ETA_WARMUP_SECS      = 20.0
         # Confidence shortcut: once at least CONFIDENT_SCAN_FRAC of the
         # blocks-still-to-scan have been scanned, treat the scan-rate EMA
         # as authoritative even if the copy-rate EMA never seeds (e.g.
         # zero diffs found, so no copy happens).  Without this gate, a
         # clean run with no differing blocks would keep the `~` bootstrap
         # marker for its entire duration.
-        CONFIDENT_SCAN_FRAC  = 0.01
+        CONFIDENT_SCAN_FRAC  = 0.05
+        eta_smoothed         = None
         eta_displayed        = None
         eta_displayed_at     = 0.0
 
         def display_eta(fresh_eta, now):
-            nonlocal eta_displayed, eta_displayed_at
+            nonlocal eta_smoothed, eta_displayed, eta_displayed_at
             if now - t_overall_start < ETA_WARMUP_SECS:
                 return None
-            if (eta_displayed is None
-                    or now - eta_displayed_at >= ETA_REFRESH_INTERVAL):
-                eta_displayed    = fresh_eta
+            if eta_smoothed is None:
+               eta_smoothed = fresh_eta
+            eta_smoothed = (99.0 * (eta_smoothed - REPORT_INTERVAL) + fresh_eta) / 100.0
+            if now - eta_displayed_at >= ETA_REFRESH_INTERVAL:
+                eta_displayed = eta_smoothed
                 eta_displayed_at = now
-                return eta_displayed
-            return max(0.0, eta_displayed - (now - eta_displayed_at))
+            return eta_displayed
 
         def update_scan_rate_ema(scan_secs_now):
             nonlocal ema_scan_rate, rate_prev_scan_secs, rate_prev_scanned
@@ -749,7 +751,7 @@ def do_sync(local_file, remote_host, remote_file, mode,
             if written_now <= 0:
                 return
             if (copy_secs_now < RATE_RELIABLE_SECS
-                    and written_now < RATE_RELIABLE_BYTES):
+                    and written_now < RATE_RELIABLE_BYTES / BOOTSTRAP_COPY_RATIO):
                 return
             if ema_copy_rate is None:
                 ema_copy_rate       = written_now / copy_secs_now
@@ -887,11 +889,11 @@ def do_sync(local_file, remote_host, remote_file, mode,
                                                     sec_blocks_scanned=sec_blk_done,
                                                     sec_blocks_total=sec_blk_tot),
                                                     now)
-                        eta_str      = ('--:--' if eta is None
-                                        else ('' if confident else '~')
-                                             + format_time(eta))
+                        eta_str  = '' if confident or eta is None else '~'
+                        if eta is not None:
+                            eta_str = " (%s%s)" %(eta_str, format_time(eta))
                         scanned_bytes = min(total_scanned * blocksize, sync_size)
-                        report('\rscan %s/%s (%.1f%%) diff blocks=%d (%.1f%%) (%.0f MiB/s) %s (%s) ' % (
+                        report('\rscan %s/%s (%.1f%%) diff blocks=%d (%.1f%%) (%.0f MiB/s) %s%s ' % (
                             format_size(scanned_bytes, floor=True),
                             format_size(sync_size, floor=True),
                             pct_done, ndiff, pct_diff, speed,
@@ -930,13 +932,13 @@ def do_sync(local_file, remote_host, remote_file, mode,
                                                live_written=written,
                                                copy_active_since=t_phase_b_start),
                                                now)
-                    eta_str     = ('--:--' if eta is None
-                                   else ('' if confident else '~')
-                                        + format_time(eta))
+                    eta_str  = '' if confident or eta is None else '~'
+                    if eta is not None:
+                        eta_str = " (%s%s)" %(eta_str, format_time(eta))
                     pct_pos     = wpos * 100.0 / sync_size
                     pct_sec     = blocks_done * 100.0 / max(1, section_diff_count)
                     cum_blocks  = total_blocks_copied + blocks_done
-                    report('\rcopy %s/%s (%.1f%%) block %d/%d (%.1f%%) (%.0f KiB/s) %s (%s) ' % (
+                    report('\rcopy %s/%s (%.1f%%) block %d/%d (%.1f%%) (%.0f KiB/s) %s%s ' % (
                         format_size(wpos, floor=True),
                         format_size(sync_size, floor=True),
                         pct_pos, cum_blocks, total_diffs, pct_sec,
