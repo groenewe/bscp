@@ -312,6 +312,23 @@ class ConnectionLost(RuntimeError):
         self.interrupted = interrupted
 
 
+def _shutdown_proc(proc):
+    # close() flushes the BufferedWriter; against a dead pipe that flush
+    # itself raises BrokenPipeError, which would chain on top of whatever
+    # we were already handling and escape do_sync.  Same for stdout if
+    # the peer reset between writes.  Swallow pipe errors here — by the
+    # time we are tearing down, the wire is already gone.
+    for stream in (proc.stdin, proc.stdout):
+        try:
+            stream.close()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+    try:
+        proc.wait()
+    except OSError:
+        pass
+
+
 def report(msg):
     global last_report_len
 
@@ -547,9 +564,7 @@ def do_sync(local_file, remote_host, remote_file, mode,
             # stdout.write() (e.g. streaming hashes after we told it
             # ALLOW_TRUNCATE on the wire but then refuse on our side); without
             # it proc.wait() would deadlock against the remote's blocked write.
-            proc.stdin.close()
-            proc.stdout.close()
-            proc.wait()
+            _shutdown_proc(proc)
             raise RuntimeError(msg)
 
         if io.read(dig_size) != hashlib.new(hashname, fn_bytes).digest():
@@ -596,8 +611,7 @@ def do_sync(local_file, remote_host, remote_file, mode,
         sync_size = min(wire_size, remote_size)
         if sync_size == 0:
             # Server has already exited (matching `if sync_size == 0: sys.exit(0)`).
-            proc.stdin.close()
-            proc.wait()
+            _shutdown_proc(proc)
             return io.in_total, io.out_total, 0, 0, 0
         eff_section    = section_size or sync_size
         total_blocks   = max(1, (sync_size + blocksize - 1) // blocksize)
@@ -964,22 +978,17 @@ def do_sync(local_file, remote_host, remote_file, mode,
         except _PIPE_ERRORS:
             # Closing stdout in addition to stdin unblocks the remote if it
             # was stuck mid-write — same rationale as fail() above.
-            proc.stdin.close()
-            proc.stdout.close()
-            proc.wait()
+            _shutdown_proc(proc)
             # `raise X from Y` is Py3-only; cause chain is dropped on Py2.
             raise ConnectionLost(last_sec_start)
         except KeyboardInterrupt:
             # Mirror the BrokenPipeError path: close stdout too, otherwise a
             # remote blocked mid-write (pull phase B, or any phase A) keeps
             # proc.wait() hanging forever and the user sees no resume hint.
-            proc.stdin.close()
-            proc.stdout.close()
-            proc.wait()
+            _shutdown_proc(proc)
             raise ConnectionLost(last_sec_start, interrupted=True)
 
-        proc.stdin.close()
-        proc.wait()
+        _shutdown_proc(proc)
 
     return io.in_total, io.out_total, sync_size, total_diffs, total_written
 
