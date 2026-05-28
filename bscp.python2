@@ -83,27 +83,44 @@ def _remote():
     stdin  = getattr(sys.stdin,  'buffer', sys.stdin)
     stdout = getattr(sys.stdout, 'buffer', sys.stdout)
 
+    # Read exactly n bytes or raise EOFError.  On a blocking pipe a short
+    # read means EOF, i.e. the client's SSH connection is gone; signal it
+    # rather than acting on a truncated read (a partial block write would
+    # otherwise corrupt the destination silently).
+    def rd(n):
+        buf = b''
+        while len(buf) < n:
+            chunk = stdin.read(n - len(buf))
+            if not chunk:
+                raise EOFError
+            buf += chunk
+        return buf
+
     HEADER_FMT     = '<QQQQQQB'
     HEADER_SIZE    = struct.calcsize(HEADER_FMT)
     MODE_PUSH, MODE_PULL = 0, 1
     PUSH_PULL_MASK = 1
     ALLOW_TRUNCATE = 2
 
-    data = stdin.read(HEADER_SIZE)
-    if len(data) < HEADER_SIZE:
+    try:
+        data = rd(HEADER_SIZE)
+    except EOFError:
         sys.exit(1)
     (size, blocksize, section_size, start_offset,
      filename_len, hashname_len, mode) = struct.unpack(HEADER_FMT, data)
     allow_truncate = mode & ALLOW_TRUNCATE
     mode = mode & PUSH_PULL_MASK
 
-    fn_bytes = stdin.read(filename_len)
-    hashname = stdin.read(hashname_len).decode('ascii')
-    filename = fn_bytes.decode('utf-8')
+    try:
+        fn_bytes = rd(filename_len)
+        hashname = rd(hashname_len).decode('ascii')
+        filename = fn_bytes.decode('utf-8')
 
-    stdout.write(hashlib.new(hashname, fn_bytes).digest())
-    stdout.flush()
-    if stdin.read(2) != b'go':
+        stdout.write(hashlib.new(hashname, fn_bytes).digest())
+        stdout.flush()
+        if rd(2) != b'go':
+            sys.exit(1)
+    except EOFError:
         sys.exit(1)
 
     try:
@@ -149,24 +166,24 @@ def _remote():
                     p += bl
                 stdout.flush()
 
-                (count,) = struct.unpack('<Q', stdin.read(8))
+                (count,) = struct.unpack('<Q', rd(8))
 
                 if mode == MODE_PUSH:
                     for _ in range(count):
-                        (wpos,) = struct.unpack('<Q', stdin.read(8))
+                        (wpos,) = struct.unpack('<Q', rd(8))
                         bl = min(blocksize, sync_size - wpos)
                         f.seek(wpos)
-                        f.write(stdin.read(bl))
+                        f.write(rd(bl))
                 else:
                     for _ in range(count):
-                        (rpos,) = struct.unpack('<Q', stdin.read(8))
+                        (rpos,) = struct.unpack('<Q', rd(8))
                         bl = min(blocksize, sync_size - rpos)
                         f.seek(rpos)
                         stdout.write(f.read(bl))
                         stdout.flush()
 
                 pos = sec_end
-        except (struct.error, IOError, OSError):
+        except (struct.error, IOError, OSError, EOFError):
             sys.exit(1)
 '''
 

@@ -308,6 +308,15 @@ This means:
 - **Python 2/3 binary I/O**: use `getattr(sys.stdin, 'buffer', sys.stdin)`;
   Python 3 wraps stdin in a text layer (`.buffer` gives raw bytes), Python 2
   does not.  All other constructs in the body are compatible with both.
+- **All stdin reads go through `rd(n)`**, a read-exactly helper that loops
+  until `n` bytes arrive or raises `EOFError` on a short read.  On a blocking
+  pipe a short read means EOF (lost SSH connection); acting on it directly
+  would silently write a truncated block to the destination in push phase B.
+  This mirrors the Perl remote's `r()` helper and the client's own
+  short-read guards.  `EOFError` is **not** an `OSError` subclass on
+  Python 2, so it is named explicitly in the section-loop `except`
+  clause and in the handshake-phase `try/except`.  Never call
+  `stdin.read()` directly in the remote body — use `rd()`.
 
 ## Perl fallback (`remote_perl`)
 
