@@ -571,7 +571,11 @@ def do_sync(local_file, remote_host, remote_file, mode,
             fail('Remote script failed to execute')
         io.write(b'go')
 
-        (remote_size,) = struct.unpack('<Q', io.read(8))
+        size_bytes = io.read(8)
+        if len(size_bytes) < 8:
+            fail('Remote closed connection during handshake (got %d of 8 size bytes)'
+                 % len(size_bytes))
+        (remote_size,) = struct.unpack('<Q', size_bytes)
         if remote_size == 0:
             fail('Remote file not found or inaccessible')
 
@@ -835,6 +839,9 @@ def do_sync(local_file, remote_host, remote_file, mode,
                     block      = f.read(bl)
                     local_dig  = hashlib.new(hashname, block).digest()
                     remote_dig = io.read(dig_size)
+                    if len(remote_dig) < dig_size:
+                        raise EOFError('SSH pipe closed during phase-A hash read '
+                                       '(got %d of %d bytes)' % (len(remote_dig), dig_size))
                     if local_dig != remote_dig:
                         if mode == MODE_PUSH and buffer:
                             diff_blocks.append((p, block))
@@ -964,6 +971,10 @@ def do_sync(local_file, remote_host, remote_file, mode,
                             for rpos in window:
                                 bl    = min(blocksize, sync_size - rpos)
                                 block = io.read(bl)
+                                if len(block) < bl:
+                                    raise EOFError('SSH pipe closed during pull phase-B block read '
+                                                   '(got %d of %d bytes at offset %d)'
+                                                   % (len(block), bl, rpos))
                                 f.seek(rpos)
                                 f.write(block)
                                 written      += bl
