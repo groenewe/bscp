@@ -627,6 +627,9 @@ def format_time(seconds, round_minutes=False):
     if round_minutes and int(seconds) >= 30:
         if s >= 30:
             m += 1
+            if m >= 60:
+               m -= 60
+               h += 1
         return '%d:%02d:00' % (h, m) if h else '%d:00' %m
     else:
         return '%d:%02d:%02d' % (h, m, s) if h else '%d:%02d' % (m, s)
