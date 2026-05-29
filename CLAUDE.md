@@ -398,6 +398,27 @@ This means:
   Python 2, so it is named explicitly in the section-loop `except`
   clause and in the handshake-phase `try/except`.  Never call
   `stdin.read()` directly in the remote body — use `rd()`.
+- **Indent with TABS, not spaces** (applies to all three remote literals —
+  `remote_script`, `remote_script_mt`, `remote_perl`).  Two of them are
+  hex-encoded onto the ssh command line; one tab replaces a 4-space indent
+  unit, roughly halving the leading-whitespace bytes on the wire (deepest
+  nesting saves most).  Python accepts pure-tab indentation; Perl ignores
+  indentation entirely.  The surrounding `bscp` client code stays 4-space
+  indented — the tabs are *inside string literals*, so they do not affect
+  this file's own indentation and raise no `TabError`.  A `# vim: set ts=4:`
+  modeline at the end of `bscp` renders the embedded tabs at width 4; a note
+  above `remote_script` records the convention.  When editing a remote
+  literal, keep tabs (don't let an editor expand them to spaces).
+
+## Remote process marker
+
+Each `exec`'d remote command in `build_ssh_cmd()` ends with a literal
+`bscp-remote` argument (`... -c "<script>" bscp-remote`, `perl -e '...'
+bscp-remote`).  The remote bodies never read `argv`, so it is inert, but it
+lands in the remote process command line — `ps aux | grep bscp-remote` or an
+htop search locates the remote process on the destination host.  It applies
+to all three variants (python3/MT, python2/legacy, perl).  Keep it the last
+token of each branch; a protocol/dispatch change must preserve it.
 
 ## Perl fallback (`remote_perl`)
 
@@ -418,8 +439,8 @@ perl -e 'eval pack(qq{H*}, q{<hex>})'
 The bash single-quotes protect against bash; the hex alphabet is inert in
 any quoting context; Perl's `q{...}` accepts the hex string with no
 escaping; `pack 'H*', ...` decodes; `eval` runs.  Cost: the encoded form
-is 2× the source size, currently ~6.5 KB on the SSH command line — well
-within `ARG_MAX`.
+is 2× the source size, currently ~5.5 KB (`remote_perl`) / ~6.2 KB
+(`remote_script_mt`) on the SSH command line — well within `ARG_MAX`.
 
 Perl version requirements: 5.10+ (2007) for the `Q<` little-endian pack
 format and the `\z` regex anchor.  The body uses `Digest::SHA` (core since

@@ -130,6 +130,13 @@ Only differing blocks are transferred.  The section loop keeps peak memory
 proportional to the number of differing blocks in one section rather than
 the entire file.
 
+Block hashing — the CPU-bound part of the scan on fast storage — is
+multi-threaded on both ends when the remote runs Python 3 (see
+`--hash-threads`).
+
+The remote helper process is tagged `bscp-remote` on its command line, so
+`ps aux | grep bscp-remote` (or an htop search) finds it on the remote host.
+
 See [PROTOCOL.md](../PROTOCOL.md) for the full wire-format specification.
 
 ## Comparison with similar tools
