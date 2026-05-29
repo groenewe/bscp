@@ -62,7 +62,6 @@ prefix that fits.
 
 ### Options
 
-| ----------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------- |
 | Flag                          | Default  | Description                                                                                                      |
 | ----------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------- |
 | `-b SIZE` / `--block-size`    | `64K`    | Comparison/transfer granularity. Supports `K`/`M`/`G` suffixes.                                                  |
@@ -91,7 +90,6 @@ prefix that fits.
 | `--batch`                     |          | Suppress all stderr output; use the exit status to detect errors (implies `-q`).                                 |
 |                               |          | Cannot convey a resume offset — use `-q` instead if a caller needs to parse the "Resume with:" stderr line.      |
 | `-p PORT` / `--port`          | `22`     | SSH port.                                                                                                        |
-| ----------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------- |
 
 ### Examples
 
@@ -126,7 +124,6 @@ bscp --allow-truncate /var/backups/disk.img myhost:/data/disk-half.img
 
 ### Exit status
 
-| ----- | -------------------------------------------------------------------------|
 | Code  | Meaning                                                                  |
 | ----- | -------------------------------------------------------------------------|
 | `0`   | Transfer completed successfully (or dry-run finished).                   |
@@ -134,7 +131,6 @@ bscp --allow-truncate /var/backups/disk.img myhost:/data/disk-half.img
 | `2`   | Bad arguments or usage error.                                            |
 | `3`   | Connection lost — transfer incomplete; re-run with `--resume-from`.      |
 | `130` | Interrupted by user (Ctrl+C).                                            |
-| ----- | -------------------------------------------------------------------------|
 
 ## How it works
 
@@ -248,7 +244,6 @@ mount -o ro /dev/loopNp2 /mnt/restore
 
 ## Comparison with similar tools
 
-| ---------------------- | ---------------- | ------------ | ------- |
 | Feature                | bscp             | blocksync.py | rsync   |
 | ---------------------- | ---------------- | ------------ | ------- |
 | Block device support   | ✓                | ✓            | Limited |
@@ -257,7 +252,6 @@ mount -o ro /dev/loopNp2 /mnt/restore
 | Default hash           | SHA-256          | MD5          | MD4/MD5 |
 | Resume support         | ✓                | —            | Partial |
 | Memory bounded         | ✓ (section size) | —            | —       |
-| ---------------------- | ---------------- | ------------ | ------- |
 
 ## Credits
 

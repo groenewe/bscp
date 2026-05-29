@@ -186,7 +186,6 @@ reverses this with `mode & PUSH_PULL_MASK` and `mode & ALLOW_TRUNCATE`.
 
 ## Key protocol constants
 
-| ---------------- | ------------ | -------------------------------------------------------------------- |
 | Name             | Value        | Notes                                                                |
 | ---------------- | ------------ | -------------------------------------------------------------------- |
 | `HEADER_FMT`     | `'<QQQQQQB'` | 49-byte protocol header struct                                       |
@@ -195,7 +194,6 @@ reverses this with `mode & PUSH_PULL_MASK` and `mode & ALLOW_TRUNCATE`.
 | `PUSH_PULL_MASK` | `1`          | Mask to extract push/pull bit from mode byte                         |
 | `ALLOW_TRUNCATE` | `2`          | Flag bit in mode byte (bit 1): allow destination smaller than source |
 | `PULL_WINDOW`    | `128`        | Batch size for pull phase B (see docs/protocol-internals.md)         |
-| ---------------- | ------------ | -------------------------------------------------------------------- |
 
 ## Protocol summary
 
@@ -257,13 +255,11 @@ stateless with respect to window size.
 
 ## Memory model
 
-| --------------------- | ------------------------------------ | ---------------------------------------------- | ------------------------------------ |
 | Phase                 | Push (default)                       | Push (`--buffer`)                              | Pull                                 |
 | --------------------- | ------------------------------------ | ---------------------------------------------- | ------------------------------------ |
 | Phase A (per section) | O(diff\_blocks × 8) — positions only | O(diff\_blocks × blocksize) — positions+blocks | O(diff\_blocks × 8) — positions only |
 | Phase B               | re-reads each block; O(1)            | consumed as sent                               | consumed as received                 |
 | Peak                  | negligible                           | ≤ section\_size (all blocks differ)            | negligible                           |
-| --------------------- | ------------------------------------ | ---------------------------------------------- | ------------------------------------ |
 
 Section size (`-s`) is only a real memory knob when `--buffer` is in use.
 By default the client only retains 8-byte offsets, so a single section can
@@ -286,7 +282,6 @@ A bash regression harness lives at `tests.sh` in the repo root.  It runs
 against `localhost:` and exercises every code path the manual tests used
 to cover, plus a few that were easy to forget:
 
-| ------------------------------------------------ | ------------------------------------------------- |
 | Test                                             | What it catches                                   |
 | ------------------------------------------------ | ------------------------------------------------- |
 | push: random 4K diffs in mid-file                | basic push round-trip, hash-exchange correctness  |
@@ -313,7 +308,6 @@ to cover, plus a few that were easy to forget:
 | friendly error when local file is missing        | OSError → `Error: Cannot open local file ...`     |
 | reject unknown / zero-digest `-a` algorithm      | `parse_algorithm` guard: exit 2, names the algo   |
 | `format_size` + `parse_size` unit tests          | display 4-digit cap rule + lossless round-trip    |
-| ------------------------------------------------ | ------------------------------------------------- |
 
 Prerequisites: `python3` on PATH, and passwordless `ssh localhost`.  Run:
 
@@ -392,7 +386,6 @@ Errors, warnings, and the final summary line are still printed to stderr.
 `--batch` suppresses **all** stderr output (implies `-q`).  The caller must
 rely solely on the exit status:
 
-| --------- | ---------------------------------------------- |
 | Exit code | Meaning                                        |
 | --------- | ---------------------------------------------- |
 | `0`       | Success                                        |
@@ -400,7 +393,6 @@ rely solely on the exit status:
 | `2`       | Bad arguments                                  |
 | `3`       | Connection lost — resume with `--resume-from`  |
 | `130`     | Interrupted (Ctrl+C)                           |
-| --------- | ---------------------------------------------- |
 
 Both flags are forwarded into the resume command printed by
 `build_resume_cmd()`, so a resumed invocation keeps the same verbosity level.

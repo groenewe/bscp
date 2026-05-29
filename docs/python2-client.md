@@ -61,7 +61,6 @@ and the Perl remote fallback — is identical to `bscp`.
 
 **Py2/3 compatibility shims** (all confined to `bscp.python2`):
 
-| --------------------------------------------------------- | ---------------------------------------------------------------------- |
 | Shim                                                      | Why                                                                    |
 | --------------------------------------------------------- | ---------------------------------------------------------------------- |
 | `#!/usr/bin/env python`                                   | Resolves to whichever `python` is on `PATH` (2 or 3).                  |
@@ -79,7 +78,6 @@ and the Perl remote fallback — is identical to `bscp`.
 |                                                           | `rate_prev_scan_secs`, `rate_prev_scanned`, `rate_prev_copy_secs`,     |
 |                                                           | `rate_prev_written` — every variable mutated by a closure.             |
 | `raise ConnectionLost(...)` without `from exc`            | `raise X from Y` is Py3-only; cause chain is dropped on Py2.           |
-| --------------------------------------------------------- | ---------------------------------------------------------------------- |
 
 When updating `bscp.python2`, the procedure is `cp bscp bscp.python2`
 followed by re-applying the shims above (the diff is mechanical and the
