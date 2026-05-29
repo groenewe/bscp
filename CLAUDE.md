@@ -321,11 +321,20 @@ Prerequisites: `python3` on PATH, and passwordless `ssh localhost`.  Run:
 ./tests.sh
 # or, when testing a different binary (e.g. a Nuitka build):
 BSCP=./bscp.nuitka ./tests.sh
+# or the Py2 client (skips 3 py3-only tests when `python` is Python 2):
+BSCP=./bscp.python2 ./tests.sh
 ```
 
 The script writes its fixtures into a `mktemp -d` directory and removes
 them on exit.  Exit status is `0` on success, `1` if any test failed (with
 the failing names listed at the end), or `2` on missing prerequisites.
+
+When `$BSCP` runs under a Python 2 interpreter (detected from its shebang
+plus `python -V`), three tests are skipped by default and reported as
+`skip`: the two `--hash-threads` tests (the option is python3-only) and
+the `-a` algorithm-rejection test (Py2's `hashlib` lacks the `shake_*` XOF
+functions it probes).  Pass `--force-all` to run every test regardless of
+interpreter.
 
 When investigating a single failure interactively, the manual idiom is
 still useful:

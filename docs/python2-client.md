@@ -31,22 +31,33 @@ set with two deliberate exceptions:
   TCP connection within ~60 s, which is good enough for the rare hosts
   that need the Py2 client.
 
-- `--hash-threads` is dropped.  Multi-threaded hashing is a python3-only
-  efficiency feature (see [remote-execution.md](remote-execution.md)); the Py2 client is a
+- `--hash-threads` is dropped — but only the **client-side** option and
+  thread pool.  Multi-threaded hashing is a python3-only efficiency
+  feature (see [remote-execution.md](remote-execution.md)); the Py2 client is a
   last-resort path for ancient hosts where the marginal throughput gain
   does not justify the threading complexity.  When refreshing
   `bscp.python2`, omit the `--hash-threads` argparse entry, the
   `ThreadPoolExecutor`/`deque` imports, the `DEFAULT_HASH_THREADS` /
   `HASH_THREADS_CAP` / `resolve_hash_threads` definitions, the `ex_hash`
   pool and `finally` shutdown, and keep the original serial phase-A loop
-  (read → hash → compare).  Note that the *remote* it talks to is
-  unaffected: a python3 remote still runs the threaded `remote_script_mt`
-  regardless of which client drives it.
+  (read → hash → compare).
+
+  The *remote* side, however, is **not** dropped: `bscp.python2` still
+  carries the `remote_script_mt` string verbatim, and its `build_ssh_cmd`
+  still dispatches a python3 remote to that threaded variant (hex-encoded,
+  via `binascii.hexlify`).  Because the Py2 client has no `--hash-threads`
+  value to pass, the thread count baked into the remote's `_remote(N)`
+  call is fixed at `0`, so the python3 remote auto-detects its own cores.
+  Net effect: driving a modern python3 host *from* the Py2 client still
+  gets multi-threaded remote hashing; only the local client's own hashing
+  is single-threaded.
 
 Everything else — section-based scan/copy, `--buffer`,
 `--allow-truncate`, `-B`, resume, retries, the unified ETA model with
-EMA-smoothed scan/copy rates and display damping, the Perl remote
-fallback — is identical to `bscp`.
+EMA-smoothed scan/copy rates and display damping, the grouped `--help`
+layout, the hash-algorithm advertise/validate (`PORTABLE_ALGOS`,
+`algorithm_help`, `parse_algorithm`), the `bscp-remote` process marker,
+and the Perl remote fallback — is identical to `bscp`.
 
 **Py2/3 compatibility shims** (all confined to `bscp.python2`):
 
@@ -56,7 +67,7 @@ fallback — is identical to `bscp`.
 | `#!/usr/bin/env python`                                     | Resolves to whichever `python` is on `PATH` (2 or 3).                  |
 | `# -*- coding: utf-8 -*-`                                   | Source contains em-dashes / box-drawing chars in strings and comments. |
 | `from __future__ import division`                           | `/` returns float on Py2 (matches Py3 semantics throughout the file).  |
-| `import binascii` + `hexlify(...).decode('ascii')`          | `bytes.hex()` is Py3.5+.                                               |
+| `import binascii` + `hexlify(...).decode('ascii')`          | `bytes.hex()` is Py3.5+; used for both the Perl and `remote_script_mt` hex payloads. |
 | `try: from shlex import quote ...                           | `shlex.quote` is Py3.3+; Py2's `pipes.quote` is the same function.     |
 |  except ImportError: from pipes import quote as _shquote`   |                                                                        |
 | `_PIPE_ERRORS` tuple defined via try/except `NameError`     | `BrokenPipeError` / `ConnectionResetError` are Py3.3+.                 |
@@ -72,13 +83,26 @@ fallback — is identical to `bscp`.
 When updating `bscp.python2`, the procedure is `cp bscp bscp.python2`
 followed by re-applying the shims above (the diff is mechanical and the
 shim sites are easy to locate by grepping for `nonlocal`, `bytes.hex()`,
-`shlex.quote`, `OSError as`, `BrokenPipeError`, and `from exc`).  After
-the shims, re-run `python2 -m py_compile bscp.python2 && python3 -m
-py_compile bscp.python2`, then `BSCP=./bscp.python2 ./tests.sh` under
-both interpreters.  The `--io-timeout` removal also requires deleting
-the `IOTimeout` class, the `IOCounter` raw-fd paths (`_read_raw`,
-`_write_raw`), the `popen_bufsize` branch, the `DEFAULT_IO_TIMEOUT`
-constant, and the argparse entry.
+`shlex.quote`, `OSError as`, `BrokenPipeError`, and `from exc`).  The
+three remote source literals (`remote_script`, `remote_script_mt`,
+`remote_perl`) and the tab-indentation note above them are copied
+verbatim from `bscp` — they are interpreter-agnostic string data executed
+on the remote, so no shim applies inside them.  `build_ssh_cmd` is the one
+place the kept-but-rewired MT path lives: rewrite its `.hex()` calls as
+`binascii.hexlify(...).decode('ascii')` and bake `_remote(0)` into the
+`remote_script_mt` payload (the Py2 client has no `--hash-threads` value
+to pass).  After the shims, re-run `python2 -m py_compile bscp.python2 &&
+python3 -m py_compile bscp.python2`, then `BSCP=./bscp.python2 ./tests.sh`
+under both interpreters.  When the client runs under Python 2, `tests.sh`
+auto-skips three tests (the two `--hash-threads` tests, since the option
+is absent, and the `-a` rejection test, since Py2's `hashlib` lacks the
+`shake_*` XOF functions it probes); pass `--force-all` to run them anyway
+and watch them fail in the documented ways.  Under python3 the same file
+passes all 25 tests with nothing skipped.  The `--io-timeout` removal also
+requires deleting the
+`IOTimeout` class, the `IOCounter` raw-fd paths (`_read_raw`,
+`_write_raw`), the `popen_bufsize` branch, the `import select`, the
+`DEFAULT_IO_TIMEOUT` constant, and the argparse entry.
 
 `bscp.python2` is **not** built with Nuitka — a Nuitka binary (see
 [nuitka.md](nuitka.md)) already covers the no-Python-on-the-client case and

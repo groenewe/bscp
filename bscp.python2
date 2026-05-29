@@ -3,6 +3,11 @@
 
 # Copyright (C) 2012-2024  The Bscp Authors <https://github.com/bscp-tool/bscp/graphs/contributors>
 #
+# This is a fork.  It builds on, and is inspired by, the original bscp:
+#   https://github.com/bscp-tool/bscp   (canonical project, latest master)
+#   https://github.com/vog/bscp         (original author, Volker Diels-Grabsch)
+# Fork: https://github.com/groenewe/bscp
+#
 # Permission to use, copy, modify, and/or distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
 # copyright notice and this permission notice appear in all copies.
@@ -29,7 +34,7 @@
 
 from __future__ import division
 
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
 import binascii
 import hashlib
 import math
@@ -71,125 +76,314 @@ DEFAULT_SECTION = 10 * 1024**3
 DEFAULT_RETRIES = 3
 MIN_MEMORY_PUSH = 64 * DEFAULT_BLOCK
 
+# Hash algorithms guaranteed on every remote variant: python3, python2, and
+# the Perl fallback (Digest::MD5 + Digest::SHA).  hashlib offers more
+# locally, but only these are portable to all three remotes.
+PORTABLE_ALGOS = ('md5', 'sha1', 'sha224', 'sha256', 'sha384', 'sha512')
+
+
+def algorithm_help():
+    # Local-only extras: anything hashlib can do here that is not in the
+    # portable set.  Drop uppercase aliases (e.g. 'SHA256') for a clean list,
+    # and skip XOF/variable-length functions (shake_*, digest_size 0) — they
+    # have no fixed digest and would break the wire protocol.
+    portable = set(PORTABLE_ALGOS)
+    extra = sorted(a for a in hashlib.algorithms_available
+                   if a.lower() not in portable and a == a.lower()
+                   and hashlib.new(a).digest_size > 0)
+    h = ('hash algorithm (default sha256). Portable to all remotes: %s.'
+         % ', '.join(PORTABLE_ALGOS))
+    if extra:
+        h += (' Also usable locally: %s — these need the remote to be '
+              'python3/python2 with the same algorithm; the Perl remote '
+              'supports only the portable set.' % ', '.join(extra))
+    return h
+
+
+def parse_algorithm(name):
+    # Reject anything the local hashlib cannot build, and XOF/variable-length
+    # functions (shake_*, digest_size 0) — the wire protocol assumes a fixed
+    # digest size per block.  Remote availability still varies (Perl supports
+    # only PORTABLE_ALGOS); that surfaces as a remote handshake error.
+    try:
+        if hashlib.new(name).digest_size <= 0:
+            raise ArgumentTypeError(
+                "hash algorithm %r has no fixed digest size and cannot be "
+                "used (variable-length/XOF functions are unsupported)" % name)
+    except ArgumentTypeError:
+        raise
+    except (ValueError, TypeError):
+        raise ArgumentTypeError("unknown hash algorithm %r" % name)
+    return name
+
 REPORT_INTERVAL = 0.5 # status line should update after this many seconds have passed
 last_report_len = 0   # last progress or error length message on screen, if any; used by report()
 quiet = False         # option -q or --quiet: suppress '\r' progress report line normally updated via stderr
 batch = False         # option --batch: suppress all stderr output, return only a suitable exit code (see help)
 
+# NOTE: the three remote source literals below (remote_script,
+# remote_script_mt, remote_perl) are indented with TABS, not spaces.  Two of
+# them are hex-encoded onto the ssh command line; a tab is one character
+# where the equivalent 4-space indent is four, so tabs roughly halve the
+# leading-whitespace bytes on the wire (deep nesting shrinks the most).  Keep
+# them tab-indented when editing.  The surrounding bscp client code stays
+# 4-space indented as usual — the tabs live only inside these string
+# literals, so they do not affect this file's own indentation.  A `ts=4`
+# vim modeline at the end of the file renders the embedded tabs at width 4.
 remote_script = '''
 def _remote():
-    import hashlib, os, struct, sys  # noqa: F401 (standalone on remote host)
+	import hashlib, os, struct, sys  # noqa: F401 (standalone on remote host)
 
-    stdin  = getattr(sys.stdin,  'buffer', sys.stdin)
-    stdout = getattr(sys.stdout, 'buffer', sys.stdout)
+	stdin  = getattr(sys.stdin,  'buffer', sys.stdin)
+	stdout = getattr(sys.stdout, 'buffer', sys.stdout)
 
-    # Read exactly n bytes or raise EOFError.  On a blocking pipe a short
-    # read means EOF, i.e. the client's SSH connection is gone; signal it
-    # rather than acting on a truncated read (a partial block write would
-    # otherwise corrupt the destination silently).
-    def rd(n):
-        buf = b''
-        while len(buf) < n:
-            chunk = stdin.read(n - len(buf))
-            if not chunk:
-                raise EOFError
-            buf += chunk
-        return buf
+	# Read exactly n bytes or raise EOFError.  On a blocking pipe a short
+	# read means EOF, i.e. the client's SSH connection is gone; signal it
+	# rather than acting on a truncated read (a partial block write would
+	# otherwise corrupt the destination silently).
+	def rd(n):
+		buf = b''
+		while len(buf) < n:
+			chunk = stdin.read(n - len(buf))
+			if not chunk:
+				raise EOFError
+			buf += chunk
+		return buf
 
-    HEADER_FMT     = '<QQQQQQB'
-    HEADER_SIZE    = struct.calcsize(HEADER_FMT)
-    MODE_PUSH, MODE_PULL = 0, 1
-    PUSH_PULL_MASK = 1
-    ALLOW_TRUNCATE = 2
+	HEADER_FMT     = '<QQQQQQB'
+	HEADER_SIZE    = struct.calcsize(HEADER_FMT)
+	MODE_PUSH, MODE_PULL = 0, 1
+	PUSH_PULL_MASK = 1
+	ALLOW_TRUNCATE = 2
 
-    try:
-        data = rd(HEADER_SIZE)
-    except EOFError:
-        sys.exit(1)
-    (size, blocksize, section_size, start_offset,
-     filename_len, hashname_len, mode) = struct.unpack(HEADER_FMT, data)
-    allow_truncate = mode & ALLOW_TRUNCATE
-    mode = mode & PUSH_PULL_MASK
+	try:
+		data = rd(HEADER_SIZE)
+	except EOFError:
+		sys.exit(1)
+	(size, blocksize, section_size, start_offset,
+	 filename_len, hashname_len, mode) = struct.unpack(HEADER_FMT, data)
+	allow_truncate = mode & ALLOW_TRUNCATE
+	mode = mode & PUSH_PULL_MASK
 
-    try:
-        fn_bytes = rd(filename_len)
-        hashname = rd(hashname_len).decode('ascii')
-        filename = fn_bytes.decode('utf-8')
+	try:
+		fn_bytes = rd(filename_len)
+		hashname = rd(hashname_len).decode('ascii')
+		filename = fn_bytes.decode('utf-8')
 
-        stdout.write(hashlib.new(hashname, fn_bytes).digest())
-        stdout.flush()
-        if rd(2) != b'go':
-            sys.exit(1)
-    except EOFError:
-        sys.exit(1)
+		stdout.write(hashlib.new(hashname, fn_bytes).digest())
+		stdout.flush()
+		if rd(2) != b'go':
+			sys.exit(1)
+	except EOFError:
+		sys.exit(1)
 
-    try:
-        fobj = open(filename, 'rb+' if mode == MODE_PUSH else 'rb')
-    except OSError:
-        stdout.write(struct.pack('<Q', 0))
-        stdout.flush()
-        sys.exit(1)
+	try:
+		fobj = open(filename, 'rb+' if mode == MODE_PUSH else 'rb')
+	except OSError:
+		stdout.write(struct.pack('<Q', 0))
+		stdout.flush()
+		sys.exit(1)
 
-    with fobj as f:
-        f.seek(0, 2)
-        remote_size = f.tell()
-        stdout.write(struct.pack('<Q', remote_size))
-        stdout.flush()
+	with fobj as f:
+		f.seek(0, 2)
+		remote_size = f.tell()
+		stdout.write(struct.pack('<Q', remote_size))
+		stdout.flush()
 
-        # In push, remote is destination; in pull, remote is source.
-        # Refuse to proceed if destination is smaller, unless --allow-truncate.
-        dst_size = remote_size if mode == MODE_PUSH else size
-        src_size = size        if mode == MODE_PUSH else remote_size
-        if dst_size < src_size and not allow_truncate:
-            sys.exit(1)
+		# In push, remote is destination; in pull, remote is source.
+		# Refuse to proceed if destination is smaller, unless --allow-truncate.
+		dst_size = remote_size if mode == MODE_PUSH else size
+		src_size = size        if mode == MODE_PUSH else remote_size
+		if dst_size < src_size and not allow_truncate:
+			sys.exit(1)
 
-        sync_size = min(size, remote_size)
-        eff_section = section_size or sync_size
-        if sync_size == 0:
-            sys.exit(0)
+		sync_size = min(size, remote_size)
+		eff_section = section_size or sync_size
+		if sync_size == 0:
+			sys.exit(0)
 
-        # If the client decides to abort after the handshake (e.g. its
-        # post-handshake truncate check fires) it closes its end of the
-        # pipe, which surfaces here as a short stdin read or a broken stdout
-        # write.  Treat both as a clean shutdown rather than letting Python
-        # spew a traceback over the user's stderr.
-        try:
-            pos = start_offset
-            while pos < sync_size:
-                sec_end = min(pos + eff_section, sync_size)
+		# If the client decides to abort after the handshake (e.g. its
+		# post-handshake truncate check fires) it closes its end of the
+		# pipe, which surfaces here as a short stdin read or a broken stdout
+		# write.  Treat both as a clean shutdown rather than letting Python
+		# spew a traceback over the user's stderr.
+		try:
+			pos = start_offset
+			while pos < sync_size:
+				sec_end = min(pos + eff_section, sync_size)
 
-                p = pos
-                while p < sec_end:
-                    bl = min(blocksize, sec_end - p)
-                    f.seek(p)
-                    stdout.write(hashlib.new(hashname, f.read(bl)).digest())
-                    p += bl
-                stdout.flush()
+				p = pos
+				while p < sec_end:
+					bl = min(blocksize, sec_end - p)
+					f.seek(p)
+					stdout.write(hashlib.new(hashname, f.read(bl)).digest())
+					p += bl
+				stdout.flush()
 
-                (count,) = struct.unpack('<Q', rd(8))
+				(count,) = struct.unpack('<Q', rd(8))
 
-                if mode == MODE_PUSH:
-                    for _ in range(count):
-                        (wpos,) = struct.unpack('<Q', rd(8))
-                        bl = min(blocksize, sync_size - wpos)
-                        f.seek(wpos)
-                        f.write(rd(bl))
-                else:
-                    for _ in range(count):
-                        (rpos,) = struct.unpack('<Q', rd(8))
-                        bl = min(blocksize, sync_size - rpos)
-                        f.seek(rpos)
-                        stdout.write(f.read(bl))
-                        stdout.flush()
+				if mode == MODE_PUSH:
+					for _ in range(count):
+						(wpos,) = struct.unpack('<Q', rd(8))
+						bl = min(blocksize, sync_size - wpos)
+						f.seek(wpos)
+						f.write(rd(bl))
+				else:
+					for _ in range(count):
+						(rpos,) = struct.unpack('<Q', rd(8))
+						bl = min(blocksize, sync_size - rpos)
+						f.seek(rpos)
+						stdout.write(f.read(bl))
+						stdout.flush()
 
-                pos = sec_end
-        except (struct.error, IOError, OSError, EOFError):
-            sys.exit(1)
+				pos = sec_end
+		except (struct.error, IOError, OSError, EOFError):
+			sys.exit(1)
+'''
+
+# Multi-threaded python3 remote.  Functionally identical to remote_script
+# on the wire — same handshake, same phase A/B contract — but phase-A
+# hashing fans out across a ThreadPoolExecutor.  python3-only (uses
+# concurrent.futures, sys.stdin.buffer unconditionally), so build_ssh_cmd()
+# dispatches it ONLY to python3 and falls back to the single-threaded
+# remote_script for python2/python and to remote_perl for Perl-only hosts.
+#
+# Because build_ssh_cmd() hex-encodes this and runs it via
+#   python3 -O -B -c "exec(bytes.fromhex('...').decode())"
+# the no-"/no-$/no-% constraints that apply to remote_script do NOT apply
+# here — the hex alphabet is inert in every shell quoting context.  The
+# thread count is baked into the trailing _remote(N) call by build_ssh_cmd
+# (N = client --hash-threads; 0 = let the remote auto-detect its own cores).
+#
+# Protocol constants are duplicated here too (see CLAUDE.md): any change to
+# HEADER_FMT / the mode bits / the phase contract must be made in FOUR
+# places now — client, remote_script, remote_script_mt, and remote_perl.
+remote_script_mt = '''
+def _remote(nthreads):
+	import hashlib, os, struct, sys
+	from collections import deque
+	from concurrent.futures import ThreadPoolExecutor
+
+	stdin  = sys.stdin.buffer
+	stdout = sys.stdout.buffer
+
+	def rd(n):
+		buf = b""
+		while len(buf) < n:
+			chunk = stdin.read(n - len(buf))
+			if not chunk:
+				raise EOFError
+			buf += chunk
+		return buf
+
+	HEADER_FMT     = "<QQQQQQB"
+	HEADER_SIZE    = struct.calcsize(HEADER_FMT)
+	MODE_PUSH, MODE_PULL = 0, 1
+	PUSH_PULL_MASK = 1
+	ALLOW_TRUNCATE = 2
+	HASH_THREADS_CAP = 4
+
+	if nthreads <= 0:
+		nthreads = min(os.cpu_count() or 1, HASH_THREADS_CAP)
+	window = max(2, nthreads * 2)
+
+	try:
+		data = rd(HEADER_SIZE)
+	except EOFError:
+		sys.exit(1)
+	(size, blocksize, section_size, start_offset,
+	 filename_len, hashname_len, mode) = struct.unpack(HEADER_FMT, data)
+	allow_truncate = mode & ALLOW_TRUNCATE
+	mode = mode & PUSH_PULL_MASK
+
+	try:
+		fn_bytes = rd(filename_len)
+		hashname = rd(hashname_len).decode("ascii")
+		filename = fn_bytes.decode("utf-8")
+		stdout.write(hashlib.new(hashname, fn_bytes).digest())
+		stdout.flush()
+		if rd(2) != b"go":
+			sys.exit(1)
+	except EOFError:
+		sys.exit(1)
+
+	try:
+		fobj = open(filename, "rb+" if mode == MODE_PUSH else "rb")
+	except OSError:
+		stdout.write(struct.pack("<Q", 0))
+		stdout.flush()
+		sys.exit(1)
+
+	def hashfn(block):
+		return hashlib.new(hashname, block).digest()
+
+	with fobj as f:
+		f.seek(0, 2)
+		remote_size = f.tell()
+		stdout.write(struct.pack("<Q", remote_size))
+		stdout.flush()
+
+		dst_size = remote_size if mode == MODE_PUSH else size
+		src_size = size        if mode == MODE_PUSH else remote_size
+		if dst_size < src_size and not allow_truncate:
+			sys.exit(1)
+
+		sync_size = min(size, remote_size)
+		eff_section = section_size or sync_size
+		if sync_size == 0:
+			sys.exit(0)
+
+		ex = ThreadPoolExecutor(max_workers=nthreads)
+		try:
+			pos = start_offset
+			while pos < sync_size:
+				sec_end = min(pos + eff_section, sync_size)
+
+				# Phase A: reads stay single-threaded and sequential (fast on
+				# NVMe); only hashing fans out.  Digests are written in block
+				# order, so the wire stream is identical to remote_script.
+				f.seek(pos)
+				p = pos
+				inflight = deque()
+				while p < sec_end and len(inflight) < window:
+					bl = min(blocksize, sec_end - p)
+					inflight.append(ex.submit(hashfn, f.read(bl)))
+					p += bl
+				while inflight:
+					stdout.write(inflight.popleft().result())
+					if p < sec_end:
+						bl = min(blocksize, sec_end - p)
+						inflight.append(ex.submit(hashfn, f.read(bl)))
+						p += bl
+				stdout.flush()
+
+				(count,) = struct.unpack("<Q", rd(8))
+
+				if mode == MODE_PUSH:
+					for _ in range(count):
+						(wpos,) = struct.unpack("<Q", rd(8))
+						bl = min(blocksize, sync_size - wpos)
+						f.seek(wpos)
+						f.write(rd(bl))
+				else:
+					for _ in range(count):
+						(rpos,) = struct.unpack("<Q", rd(8))
+						bl = min(blocksize, sync_size - rpos)
+						f.seek(rpos)
+						stdout.write(f.read(bl))
+						stdout.flush()
+
+				pos = sec_end
+		except (struct.error, IOError, OSError, EOFError):
+			sys.exit(1)
+		finally:
+			ex.shutdown(wait=False)
 '''
 
 # Perl fallback for hosts that have no Python.  Functionally identical to
-# remote_script above; see CLAUDE.md ("Remote script constraints") for why
-# this exists as a hex-pack-eval payload rather than an inline -c argument.
+# remote_script above; see docs/remote-execution.md ("Remote script
+# constraints") for why this exists as a hex-pack-eval payload rather than
+# an inline -c argument.
 remote_perl = '''
 use strict; use warnings;
 binmode STDIN; binmode STDOUT;
@@ -201,100 +395,100 @@ my $PUSH_PULL_MASK = 1;
 my $ALLOW_TRUNCATE = 2;
 
 sub r {
-    my $n = shift;
-    my $buf = '';
-    while (length($buf) < $n) {
-        my $chunk;
-        my $got = read(STDIN, $chunk, $n - length($buf));
-        die "short read\\n" unless defined($got) && $got > 0;
-        $buf .= $chunk;
-    }
-    return $buf;
+	my $n = shift;
+	my $buf = '';
+	while (length($buf) < $n) {
+		my $chunk;
+		my $got = read(STDIN, $chunk, $n - length($buf));
+		die "short read\\n" unless defined($got) && $got > 0;
+		$buf .= $chunk;
+	}
+	return $buf;
 }
 
 sub make_hash {
-    my $name = lc(shift);
-    if ($name eq 'md5') {
-        require Digest::MD5;
-        return \\&Digest::MD5::md5;
-    }
-    if ($name =~ /^sha(1|224|256|384|512)\\z/) {
-        require Digest::SHA;
-        my $bits = $1;
-        return sub { Digest::SHA->new($bits)->add($_[0])->digest };
-    }
-    die "unsupported hash algorithm: $name\\n";
+	my $name = lc(shift);
+	if ($name eq 'md5') {
+		require Digest::MD5;
+		return \\&Digest::MD5::md5;
+	}
+	if ($name =~ /^sha(1|224|256|384|512)\\z/) {
+		require Digest::SHA;
+		my $bits = $1;
+		return sub { Digest::SHA->new($bits)->add($_[0])->digest };
+	}
+	die "unsupported hash algorithm: $name\\n";
 }
 
 eval {
-    my $data = r($HEADER_SIZE);
-    my ($size, $blocksize, $section_size, $start_offset,
-        $filename_len, $hashname_len, $mode_byte) = unpack($HEADER_FMT, $data);
-    my $allow_truncate = $mode_byte & $ALLOW_TRUNCATE;
-    my $mode           = $mode_byte & $PUSH_PULL_MASK;
+	my $data = r($HEADER_SIZE);
+	my ($size, $blocksize, $section_size, $start_offset,
+		$filename_len, $hashname_len, $mode_byte) = unpack($HEADER_FMT, $data);
+	my $allow_truncate = $mode_byte & $ALLOW_TRUNCATE;
+	my $mode           = $mode_byte & $PUSH_PULL_MASK;
 
-    my $fn_bytes = r($filename_len);
-    my $hashname = r($hashname_len);
+	my $fn_bytes = r($filename_len);
+	my $hashname = r($hashname_len);
 
-    my $hashfn = make_hash($hashname);
-    print STDOUT $hashfn->($fn_bytes);
-    STDOUT->flush;
+	my $hashfn = make_hash($hashname);
+	print STDOUT $hashfn->($fn_bytes);
+	STDOUT->flush;
 
-    exit 1 unless r(2) eq 'go';
+	exit 1 unless r(2) eq 'go';
 
-    my $fh;
-    unless (open($fh, $mode == $MODE_PUSH ? '+<:raw' : '<:raw', $fn_bytes)) {
-        print STDOUT pack('Q<', 0); STDOUT->flush; exit 1;
-    }
-    seek($fh, 0, 2);
-    my $remote_size = tell($fh);
-    print STDOUT pack('Q<', $remote_size); STDOUT->flush;
+	my $fh;
+	unless (open($fh, $mode == $MODE_PUSH ? '+<:raw' : '<:raw', $fn_bytes)) {
+		print STDOUT pack('Q<', 0); STDOUT->flush; exit 1;
+	}
+	seek($fh, 0, 2);
+	my $remote_size = tell($fh);
+	print STDOUT pack('Q<', $remote_size); STDOUT->flush;
 
-    my $dst_size = $mode == $MODE_PUSH ? $remote_size : $size;
-    my $src_size = $mode == $MODE_PUSH ? $size        : $remote_size;
-    exit 1 if $dst_size < $src_size && !$allow_truncate;
+	my $dst_size = $mode == $MODE_PUSH ? $remote_size : $size;
+	my $src_size = $mode == $MODE_PUSH ? $size        : $remote_size;
+	exit 1 if $dst_size < $src_size && !$allow_truncate;
 
-    my $sync_size   = $size < $remote_size ? $size : $remote_size;
-    my $eff_section = $section_size || $sync_size;
-    exit 0 if $sync_size == 0;
+	my $sync_size   = $size < $remote_size ? $size : $remote_size;
+	my $eff_section = $section_size || $sync_size;
+	exit 0 if $sync_size == 0;
 
-    my $pos = $start_offset;
-    while ($pos < $sync_size) {
-        my $sec_end = $pos + $eff_section;
-        $sec_end = $sync_size if $sec_end > $sync_size;
+	my $pos = $start_offset;
+	while ($pos < $sync_size) {
+		my $sec_end = $pos + $eff_section;
+		$sec_end = $sync_size if $sec_end > $sync_size;
 
-        my $p = $pos;
-        while ($p < $sec_end) {
-            my $bl = $blocksize < $sec_end - $p ? $blocksize : $sec_end - $p;
-            seek($fh, $p, 0);
-            my $buf; read($fh, $buf, $bl);
-            print STDOUT $hashfn->($buf);
-            $p += $bl;
-        }
-        STDOUT->flush;
+		my $p = $pos;
+		while ($p < $sec_end) {
+			my $bl = $blocksize < $sec_end - $p ? $blocksize : $sec_end - $p;
+			seek($fh, $p, 0);
+			my $buf; read($fh, $buf, $bl);
+			print STDOUT $hashfn->($buf);
+			$p += $bl;
+		}
+		STDOUT->flush;
 
-        my ($count) = unpack('Q<', r(8));
+		my ($count) = unpack('Q<', r(8));
 
-        if ($mode == $MODE_PUSH) {
-            for (1..$count) {
-                my ($wpos) = unpack('Q<', r(8));
-                my $bl = $blocksize < $sync_size - $wpos ? $blocksize : $sync_size - $wpos;
-                my $blk = r($bl);
-                seek($fh, $wpos, 0);
-                print $fh $blk;
-            }
-        } else {
-            for (1..$count) {
-                my ($rpos) = unpack('Q<', r(8));
-                my $bl = $blocksize < $sync_size - $rpos ? $blocksize : $sync_size - $rpos;
-                seek($fh, $rpos, 0);
-                my $buf; read($fh, $buf, $bl);
-                print STDOUT $buf;
-                STDOUT->flush;
-            }
-        }
-        $pos = $sec_end;
-    }
+		if ($mode == $MODE_PUSH) {
+			for (1..$count) {
+				my ($wpos) = unpack('Q<', r(8));
+				my $bl = $blocksize < $sync_size - $wpos ? $blocksize : $sync_size - $wpos;
+				my $blk = r($bl);
+				seek($fh, $wpos, 0);
+				print $fh $blk;
+			}
+		} else {
+			for (1..$count) {
+				my ($rpos) = unpack('Q<', r(8));
+				my $bl = $blocksize < $sync_size - $rpos ? $blocksize : $sync_size - $rpos;
+				seek($fh, $rpos, 0);
+				my $buf; read($fh, $buf, $bl);
+				print STDOUT $buf;
+				STDOUT->flush;
+			}
+		}
+		$pos = $sec_end;
+	}
 };
 exit 1 if $@;
 exit 0;
@@ -513,21 +707,46 @@ def build_ssh_cmd(remote_host, args):
     # because ssh applies the first matching -o, so a user-supplied
     # override still wins.
     cmd += ['-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4']
+    # Each exec'd remote ends with a literal `bscp-remote` argument.  The
+    # remote bodies never read argv, so it is inert — but it lands in the
+    # process command line, so `ps aux | grep bscp-remote` (or htop search)
+    # locates the remote process on the destination host.
     script_py = remote_script + '\n_remote()'
     # bytes.hex() is Py3.5+; binascii.hexlify works on both.  decode('ascii')
     # gives a native str on Py3 and unicode on Py2 — both interpolate fine
     # into the wrapper shell string below.
     hex_pl    = binascii.hexlify(remote_perl.encode('utf-8')).decode('ascii')
-    # BSCP_FORCE_PERL skips the Python branch — used by tests.sh to exercise
-    # the Perl fallback on a host that has both interpreters.
-    py_branch = '' if os.environ.get('BSCP_FORCE_PERL') else (
-        'for py in python3 python2 python; do '
-        'command -v "$py" >/dev/null 2>&1 && exec "$py" -O -B -c "%s"; '
-        'done; ' % script_py)
+    # A python3 remote runs the multi-threaded remote_script_mt regardless of
+    # which client drives it.  This py2 client has no --hash-threads option,
+    # so the baked thread count is 0 (the remote auto-detects its own cores).
+    # python2/python fall back to the single-threaded remote_script.  The
+    # source is hex-encoded so the shell sees only inert hex inside the -c
+    # arg, sidestepping the no-"/no-$/no-% rules.
+    script_mt = remote_script_mt + '\n_remote(0)\n'
+    hex_mt    = binascii.hexlify(script_mt.encode('utf-8')).decode('ascii')
+    # BSCP_FORCE_PERL skips both Python branches; BSCP_FORCE_PYTHON2 skips the
+    # python3/remote_script_mt branch so the single-threaded legacy
+    # remote_script is exercised even where python3 is present.  Both are
+    # test hooks (tests.sh) for paths that a fully-equipped host would
+    # otherwise never reach.
+    if os.environ.get('BSCP_FORCE_PERL'):
+        py_branch = ''
+    elif os.environ.get('BSCP_FORCE_PYTHON2'):
+        py_branch = (
+            'for py in python3 python2 python; do '
+            'command -v "$py" >/dev/null 2>&1 && exec "$py" -O -B -c "%s" bscp-remote; '
+            'done; ' % script_py)
+    else:
+        py_branch = (
+            'command -v python3 >/dev/null 2>&1 && '
+            'exec python3 -O -B -c "exec(bytes.fromhex(\'%s\').decode())" bscp-remote; '
+            'for py in python2 python; do '
+            'command -v "$py" >/dev/null 2>&1 && exec "$py" -O -B -c "%s" bscp-remote; '
+            'done; ' % (hex_mt, script_py))
     wrapper = (
         py_branch +
         "command -v perl >/dev/null 2>&1 && "
-        "exec perl -e 'eval pack(qq{H*}, q{%s})'; "
+        "exec perl -e 'eval pack(qq{H*}, q{%s})' bscp-remote; "
         'echo "bscp: no python or perl found on remote" >&2; exit 127'
     ) % hex_pl
     cmd += ['--', remote_host, wrapper]
@@ -1031,53 +1250,65 @@ if __name__ == '__main__':
         usage='%(prog)s [options] SRC DST\n'
               '  push:  bscp [options] local_file   HOST:remote_file\n'
               '  pull:  bscp [options] HOST:remote_file   local_file')
-    parser.add_argument('-b', '--block-size',   default=DEFAULT_BLOCK,
+    transfer = parser.add_argument_group('transfer tuning')
+    transfer.add_argument('-b', '--block-size',   default=DEFAULT_BLOCK,
                         type=parse_size, metavar='SIZE',
                         help='block size (default 64K; supports K/M/G/T suffix)')
-    parser.add_argument('-s', '--section-size', default=DEFAULT_SECTION,
+    transfer.add_argument('-s', '--section-size', default=DEFAULT_SECTION,
                         type=parse_size, metavar='SIZE',
                         help='section size (default 10G; bounds memory use per pass)')
-    parser.add_argument('-a', '--algorithm',    default='sha256',
-                        metavar='ALGO',
-                        help='hash algorithm (default sha256)')
-    parser.add_argument('-r', '--resume-from',  default=0,
+    transfer.add_argument('-a', '--algorithm',    default='sha256',
+                        type=parse_algorithm, metavar='ALGO',
+                        help=algorithm_help())
+    transfer.add_argument('-B', '--block-count',      default=0, type=parse_block_count, metavar='N',
+                        help='limit sync to first N blocks (default 0 = no limit). '
+                             'A K/M/G/T suffix interprets the value as bytes, '
+                             'rounded up to a whole number of blocks.')
+
+    perf = parser.add_argument_group('performance')
+    perf.add_argument('--buffer',                     action='store_true',
+                        help='push: buffer differing blocks in memory during '
+                             'transfer instead of re-reading them from disk. '
+                             'Higher memory use, but only one disk read pass needed. Experimental.')
+
+    ssh = parser.add_argument_group('SSH connection')
+    ssh.add_argument('-p', '--port',            default=22, type=int, metavar='PORT',
+                        help='SSH port (default 22)')
+    ssh.add_argument('-i', '--identity',        metavar='FILE',
+                        help='SSH identity file (-i FILE)')
+    ssh.add_argument('-o', '--ssh-opt',         action='append', metavar='OPT',
+                        help='extra SSH option, repeatable (passed as -o OPT)')
+    ssh.add_argument('-C', '--compress',        action='store_true',
+                        help='enable SSH compression')
+
+    resilience = parser.add_argument_group('resilience and resume')
+    resilience.add_argument('-r', '--resume-from',  default=0,
                         type=parse_resume_from, metavar='OFFSET',
                         help='resume from byte offset (K/M/G/T suffix accepted), '
                              'or NN[.N]%% of the local file size; rounded down '
                              'to section boundary')
-    parser.add_argument('--retries',            default=DEFAULT_RETRIES, type=int, metavar='N',
+    resilience.add_argument('--retries',        default=DEFAULT_RETRIES, type=int, metavar='N',
                         help='auto-retry attempts on connection failure (default %d; 0 disables)' % DEFAULT_RETRIES)
-    parser.add_argument('-i', '--identity',     metavar='FILE',
-                        help='SSH identity file (-i FILE)')
-    parser.add_argument('-o', '--ssh-opt',      action='append', metavar='OPT',
-                        help='extra SSH option, repeatable (passed as -o OPT)')
-    parser.add_argument('-C', '--compress',     action='store_true',
-                        help='enable SSH compression')
-    parser.add_argument('-N', '--dry-run',      action='store_true',
+
+    safety = parser.add_argument_group('safety')
+    safety.add_argument('-N', '--dry-run',      action='store_true',
                         help='count differences only; do not update destination')
-    parser.add_argument('-B', '--block-count',        default=0, type=parse_block_count, metavar='N',
-                        help='limit sync to first N blocks (default 0 = no limit). '
-                             'A K/M/G/T suffix interprets the value as bytes, '
-                             'rounded up to a whole number of blocks.')
-    parser.add_argument('--allow-truncate',           action='store_true',
+    safety.add_argument('--allow-truncate',           action='store_true',
                         help='allow destination to be smaller than source; '
                              'syncs only the bytes that fit. '
                              'WARNING: data beyond destination size is not copied.')
-    parser.add_argument('--buffer',                   action='store_true',
-                        help='push: buffer differing blocks in memory during '
-                             'transfer instead of re-reading them from disk. '
-                             'Higher memory use, but only one disk read pass needed. Experimental.')
-    parser.add_argument('-q', '--quiet',              action='store_true',
+
+    output = parser.add_argument_group('output')
+    output.add_argument('-q', '--quiet',              action='store_true',
                         help='suppress scan/copy progress lines; errors and warnings are still shown')
-    parser.add_argument('--batch',                    action='store_true',
+    output.add_argument('--batch',                    action='store_true',
                         help='suppress all stderr output; use exit status to detect errors (implies -q). '
                              'Exit 0=success, 1=fatal error, 2=bad arguments, '
                              '3=connection lost (resume with --resume-from), 130=interrupted. '
                              'Note: the exit code cannot convey the resume offset; '
                              'callers that need to resume should use -q instead and '
                              'parse the "Resume with:" line from stderr.')
-    parser.add_argument('-p', '--port',         default=22, type=int, metavar='PORT',
-                        help='SSH port (default 22)')
+
     parser.add_argument('src', help='source — local path or HOST:path')
     parser.add_argument('dst', help='destination — HOST:path or local path')
 
@@ -1203,3 +1434,8 @@ if __name__ == '__main__':
     if args.block_count:
         report('Continue with:\n  %s\n' % build_resume_cmd(
             sys.argv[0], args, src, dst, sync_size, block_count=0))
+
+# The remote source literals (remote_script, remote_script_mt, remote_perl)
+# are tab-indented; ts=4 renders those embedded tabs at the same visual width
+# as the surrounding 4-space client code.  See the note above remote_script.
+# vim: set ts=4:

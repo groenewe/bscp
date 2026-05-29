@@ -12,11 +12,38 @@
 # Usage:
 #   ./tests.sh
 #   BSCP=/usr/local/bin/bscp ./tests.sh
+#   ./tests.sh --force-all          # run every test even under a python2 client
+#
+# When $BSCP runs under a Python 2 interpreter (e.g. bscp.python2 where
+# `python` resolves to Python 2.x), three tests are skipped by default:
+# the two --hash-threads tests (the option is python3-only by design) and
+# the -a algorithm-rejection test (Py2's hashlib lacks the shake_* XOF
+# functions the test probes).  Pass --force-all to run them anyway.
 #
 # Exit status: 0 if all tests pass, non-zero otherwise.
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 BSCP="${BSCP:-$SCRIPT_DIR/bscp}"
+
+FORCE_ALL=0
+for arg in "$@"; do
+    case $arg in
+        --force-all) FORCE_ALL=1 ;;
+        *) echo "unknown argument: $arg" >&2; exit 2 ;;
+    esac
+done
+
+# A python2 client is one whose shebang invokes plain `python` (not python3)
+# where that `python` is a Python 2.x interpreter.  A python3 shebang or a
+# compiled Nuitka binary is never treated as python2.
+PY2_CLIENT=0
+case $(head -1 "$BSCP" 2>/dev/null) in
+    *python3*) ;;
+    *python*)  python -V 2>&1 | grep -q '^Python 2\.' && PY2_CLIENT=1 ;;
+esac
+
+# Tests skipped under a python2 client unless --force-all is given.
+PY2_SKIP="test_hash_threads_push test_hash_threads_single_pull test_reject_bad_algorithm"
 
 WORK=$(mktemp -d)
 SRC="$WORK/src.img"
@@ -26,10 +53,19 @@ trap 'rm -rf "$WORK"' EXIT
 
 PASSED=0
 FAILED=0
+SKIPPED=0
 FAILED_NAMES=()
+SKIPPED_NAMES=()
 
 run() {
     local name=$1; shift
+    local func=$1
+    if (( ! FORCE_ALL )) && (( PY2_CLIENT )) && [[ " $PY2_SKIP " == *" $func "* ]]; then
+        printf '  skip  %s\n' "$name"
+        SKIPPED=$((SKIPPED + 1))
+        SKIPPED_NAMES+=("$name")
+        return
+    fi
     local out
     out=$("$@" 2>&1)
     local rc=$?
@@ -385,7 +421,10 @@ run "reject unknown / zero-digest -a algorithm"      test_reject_bad_algorithm
 run "format_size + parse_size unit tests"            test_format_size_unit_tests
 
 echo
-echo "$PASSED passed, $FAILED failed"
+echo "$PASSED passed, $FAILED failed, $SKIPPED skipped"
+if (( SKIPPED > 0 )); then
+    printf 'Skipped (python2 client; use --force-all to run): %s\n' "${SKIPPED_NAMES[@]}"
+fi
 if (( FAILED > 0 )); then
     printf 'Failed: %s\n' "${FAILED_NAMES[@]}"
     exit 1
