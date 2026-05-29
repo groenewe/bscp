@@ -18,6 +18,9 @@
       h2 {
         font-size: 16pt;
       }
+      h3 {
+        font-size: 13pt;
+      }
       a {
         text-decoration: none;
       }
@@ -35,12 +38,30 @@
     <p>
       In other words, it handles the edge case where <a href="https://rsync.samba.org/">rsync</a> fails.
     </p>
+    <p>
+      This is a fork. It builds on, and is inspired by, the original
+      <a href="https://github.com/bscp-tool/bscp">bscp</a> by Volker
+      Diels-Grabsch (<a href="https://github.com/vog/bscp">vog/bscp</a>).
+      See <a href="#credits">Credits</a> below.
+    </p>
     <h2>Download</h2>
-    <pre>git clone https://github.com/bscp-tool/bscp</pre>
+    <pre>git clone https://github.com/&lt;your-account&gt;/bscp</pre>
     <h2>Usage</h2>
-    <pre>bscp SRC HOST:DEST [BLOCKSIZE] [HASH]</pre>
-    <p>The default <code>BLOCKSIZE</code> is <code>65536</code> (64 KiB).</p>
-    <p>The default <code>HASH</code> algorithm is <code>sha256</code> (SHA-256).</p>
+    <pre>bscp [options] SRC DST</pre>
+    <p>
+      Exactly one of SRC and DST is a remote <code>HOST:path</code>;
+      which side carries the <code>HOST:</code> prefix decides the direction:
+    </p>
+    <pre>push:  bscp local_file        HOST:remote_file
+pull:  bscp HOST:remote_file  local_file</pre>
+    <p>
+      SRC and DST may each be a regular file or a block device, and the
+      destination must already exist.
+      Blocks are 64&nbsp;KiB and hashed with SHA-256 by default.
+      For the full list of options — block size, hash algorithm, resume,
+      retries, dry-run, multi-threaded hashing and more — see the
+      <a href="https://github.com/&lt;your-account&gt;/bscp">README</a>.
+    </p>
     <h2>Comparison</h2>
     <p>
       Bscp is similar to the classic
@@ -69,14 +90,87 @@
         network connections with bad latency.
       </li>
     </ul>
+    <h2>Portability</h2>
+    <ul>
+      <li>
+        No installation on the remote host: the embedded remote runs under
+        <code>python3</code>, <code>python2</code>/<code>python</code> or Perl,
+        so it works on ancient appliances and minimal images as well as modern
+        hosts.
+        (<a href="https://github.com/&lt;your-account&gt;/bscp/blob/main/docs/remote-execution.md">details</a>)
+      </li>
+      <li>
+        <code>bscp</code> can be compiled with Nuitka into a single
+        self-contained executable that embeds the interpreter, so the client
+        host needs no Python at all.
+        (<a href="https://github.com/&lt;your-account&gt;/bscp/blob/main/docs/nuitka.md">details</a>)
+      </li>
+      <li>
+        <code>bscp.python2</code> is a parallel client that runs under
+        Python 2.7 or 3.x, for legacy local hosts without Python 3.
+        (<a href="https://github.com/&lt;your-account&gt;/bscp/blob/main/docs/python2-client.md">details</a>)
+      </li>
+    </ul>
+    <h2>Use cases</h2>
+    <h3>Off-site disk imaging</h3>
+    <p>
+      Pull a remote machine's whole system disk — virtual or physical — into
+      a local image file over nothing but SSH.
+      Useful when a budget hoster (e.g. Strato.de) offers no backup or
+      snapshot facility of its own.
+      The first run images the whole disk; every later run copies only the
+      blocks that changed.
+    </p>
+    <pre>bscp root@server:/dev/sda /mnt/backup/server-sda.img</pre>
+    <p>
+      To image a live root device consistently, boot the remote host with a
+      read-only root using
+      <a href="https://manpages.ubuntu.com/manpages/man8/overlayroot.8.html">overlayroot</a>
+      (kernel parameter <code>overlayroot=tmpfs:recurse=0</code>, added via a
+      dedicated GRUB entry in <code>/boot/grub/custom.cfg</code>).
+      All writes go to a tmpfs overlay, so the underlying device stays frozen
+      while you image it.
+    </p>
+    <h3>SSD-friendly incremental backups</h3>
+    <p>
+      Because only modified blocks are written, the destination device sees
+      far fewer writes than a full-copy tool would issue — extending the
+      service life of a backup SSD (finite program/erase cycles), and running
+      faster too (writing is slower than reading, and Bscp writes only the
+      differences).
+    </p>
+    <h3>Compressed, sparse, mountable images</h3>
+    <p>
+      Write the image onto a compression-enabled filesystem (ZFS, bcachefs,
+      btrfs), into a pre-created sparse file.
+      Filesystem compression shrinks the image, and all-zero blocks — unused
+      regions of the source disk — are stored as holes, so empty space costs
+      nothing.
+      The result stays an ordinary file, so it can be loop-mounted and
+      browsed to inspect it or selectively restore individual files or whole
+      directory trees with <code>cp</code>, <code>rsync</code> or
+      <code>scp</code> — no full restore needed.
+    </p>
+    <h2 id="credits">Credits</h2>
+    <p>
+      This is a fork of <strong>bscp</strong>, originally created by Volker
+      Diels-Grabsch and contributors. That work inspired and forms the basis
+      of this version. All original copyright notices are retained, and the
+      software remains under its original ISC-style license.
+    </p>
+    <ul>
+      <li>Canonical project (latest master): <a href="https://github.com/bscp-tool/bscp">github.com/bscp-tool/bscp</a></li>
+      <li>Original author's repository: <a href="https://github.com/vog/bscp">github.com/vog/bscp</a></li>
+      <li>This fork: <code>https://github.com/&lt;your-account&gt;/bscp</code> (TBD)</li>
+    </ul>
     <h2>Contact</h2>
     <ul>
-      <li><a href="https://github.com/bscp-tool/bscp/issues">Bscp issue tracker</a></li>
+      <li><a href="https://github.com/&lt;your-account&gt;/bscp/issues">Bscp issue tracker (this fork)</a></li>
     </ul>
     <h2>See also</h2>
     <ul>
       <li><a href="https://vog.github.io/shasplit">Shasplit</a></li>
-      <li><a href="https://github.com/systemd/casync">casync</a>
+      <li><a href="https://github.com/systemd/casync">casync</a></li>
       <li><a href="https://www.bouncybouncy.net/programs/blocksync.py">blocksync.py</a></li>
       <li><a href="https://theshed.hezmatt.org/lvmsync/">lvmsync</a></li>
       <li><a href="https://github.com/vog/scs">Scs</a></li>

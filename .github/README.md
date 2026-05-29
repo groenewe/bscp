@@ -1,5 +1,10 @@
 # Bscp — Secure and efficient copying of block devices
 
+> **This is a fork.**  It builds on, and is inspired by, the original
+> [bscp](https://github.com/bscp-tool/bscp) by Volker Diels-Grabsch
+> ([vog/bscp](https://github.com/vog/bscp)).  Maintained at
+> `https://github.com/<your-account>/bscp` (TBD); see [Credits](#credits).
+
 Bscp copies a single file or block device over SSH, transferring only the
 blocks that have changed.  It fills the gap where `rsync` fails — most
 notably when the source or destination is a raw block device.
@@ -12,6 +17,23 @@ with a Perl fallback for hosts that have no Python interpreter.
 
 Python 3 on the local host and Python 2/3 *or* Perl 5.10+ on the remote
 host.  SSH access to the remote host.
+
+**Runs almost anywhere.**  The remote side needs no installation and speaks
+the same protocol whether it runs under `python3`, `python2`/`python`, or
+Perl — so it works on ancient appliances and minimal images as well as
+modern hosts.  On the local side you have three options when Python 3 is
+inconvenient:
+
+- **Single-file binary** — `bscp` can be compiled with Nuitka into one
+  self-contained executable that embeds the interpreter, so the client host
+  needs no Python at all.  Not shipped — build your own; see
+  [docs/nuitka.md](../docs/nuitka.md).
+- **`bscp.python2`** — a parallel client that runs under Python 2.7 *or* 3.x,
+  for legacy hosts with no Python 3.  See
+  [docs/python2-client.md](../docs/python2-client.md).
+- The remote execution model (interpreter dispatch, the Perl fallback,
+  multi-threaded hashing) is documented in
+  [docs/remote-execution.md](../docs/remote-execution.md).
 
 By default bscp passes `-o ServerAliveInterval=15 -o ServerAliveCountMax=4`
 to ssh so a silently-dropped TCP connection is detected within about 60
@@ -139,6 +161,88 @@ The remote helper process is tagged `bscp-remote` on its command line, so
 
 See [PROTOCOL.md](../PROTOCOL.md) for the full wire-format specification.
 
+## Use cases
+
+### 1. Off-site disk imaging for hosts with no backup facility
+
+Pull a remote machine's whole system disk — virtual or physical — into a
+local image file.  Many budget cloud / dedicated hosters (e.g. Strato.de)
+provide no snapshot or backup service of their own; with nothing more than
+SSH access you get a full block-level image, and every run after the first
+copies only the blocks that changed.
+
+```bash
+# First run images the whole disk; later runs are incremental
+bscp root@server:/dev/sda /mnt/backup/server-sda.img
+```
+
+**Consistency — imaging a live root disk.**  Reading a raw device while its
+filesystem is mounted and being written risks a torn image (blocks change
+mid-scan).  On Linux, freeze the root device for the duration with
+[`overlayroot`](https://manpages.ubuntu.com/manpages/man8/overlayroot.8.html):
+install the package and add a dedicated GRUB entry whose kernel command line
+includes `overlayroot=tmpfs:recurse=0`.  All root writes are then redirected
+to a tmpfs overlay and the underlying device stays read-only and quiescent
+("GHOST mode") — safe to image — until you reboot back into the normal
+entry.
+
+Put the entry in `/boot/grub/custom.cfg` (GRUB sources it automatically; see
+the `source .../custom.cfg` lines near the end of `/boot/grub/grub.cfg`).
+The only change versus a normal entry is the added boot parameter on the
+`linux` line:
+
+```
+menuentry 'GHOST mode (read-only root for imaging)' --class gnu-linux {
+        # ... recordfail / load_video / insmod / search --set=root ... as usual ...
+        linux   /vmlinuz root=UUID=<your-root-uuid> ro overlayroot=tmpfs:recurse=0 quiet splash
+        initrd  /initrd.img
+}
+```
+
+Boot that entry on the remote host, run the `bscp` pull above against
+`/dev/sda`, then reboot into the normal entry.
+
+### 2. SSD-friendly incremental backups (destination longevity)
+
+Because only modified blocks are written, the destination device sees far
+fewer writes than a full-copy tool would issue.  On an SSD that directly
+extends service life — NAND has a finite number of program/erase cycles — and
+it is faster too: writing is typically slower than reading, and `bscp` reads
+both sides but writes only the differences.  Re-imaging a mostly-unchanged
+disk touches almost nothing on the destination.
+
+### 3. Compressed, sparse, mountable backup images (ZFS, bcachefs, …)
+
+Write the image onto a filesystem with compression enabled (ZFS, bcachefs,
+btrfs).  Pre-create the destination as a sparse file and let `bscp` overwrite
+it in place:
+
+```bash
+# Create a sparse destination the size of the source, then image into it
+truncate -s 500G /tank/backups/server-sda.img      # /tank = ZFS, compression=on
+bscp root@server:/dev/sda /tank/backups/server-sda.img
+```
+
+Three space wins stack up:
+
+- **Filesystem compression** shrinks the stored image.
+- **All-zero blocks** — unused regions of the source disk — are detected by
+  the destination filesystem and stored as holes (nothing on disk), so empty
+  space costs nothing.  (Zero the source's free space first — `fstrim`,
+  `zerofree`, or writing and deleting a large zero file — so unused blocks
+  actually read back as zeros.)
+- Only changed blocks are written on each run (use case 2).
+
+The result is still an ordinary file, so it can be **loop-mounted and
+browsed** without a full restore — inspect it, or selectively pull out
+individual files or whole directory trees with `cp` / `rsync` / `scp`:
+
+```bash
+losetup -fP /tank/backups/server-sda.img           # /dev/loopN, partitions as loopNp1...
+mount -o ro /dev/loopNp2 /mnt/restore
+# copy out what you need, then: umount /mnt/restore && losetup -d /dev/loopN
+```
+
 ## Comparison with similar tools
 
 | ---------------------- | ---------------- | ------------ | ------- |
@@ -151,6 +255,20 @@ See [PROTOCOL.md](../PROTOCOL.md) for the full wire-format specification.
 | Resume support         | ✓                | —            | Partial |
 | Memory bounded         | ✓ (section size) | —            | —       |
 | ---------------------- | ---------------- | ------------ | ------- |
+
+## Credits
+
+This is a fork of **bscp**, originally created by Volker Diels-Grabsch and
+contributors.  That work inspired and forms the basis of this version:
+
+- Canonical project (latest master): <https://github.com/bscp-tool/bscp>
+- Original author's repository: <https://github.com/vog/bscp>
+
+This fork is maintained at `https://github.com/<your-account>/bscp` (TBD).
+It extends the original — see the commit history and the deep-dive docs under
+`docs/` for what changed.  All original copyright notices are retained; the
+software remains under its original ISC-style license (see the header of
+`bscp`).
 
 ## See also
 

@@ -4,12 +4,18 @@
 over SSH, transferring only changed blocks.  It is intended for the use case
 where `rsync` fails — most commonly raw block devices.
 
+This repository is a **fork** of the original bscp
+(<https://github.com/bscp-tool/bscp>, by Volker Diels-Grabsch —
+<https://github.com/vog/bscp>), which inspired and forms the basis of this
+version.  Original copyright notices are retained (ISC-style license, see the
+header of `bscp`).  Fork URL: `https://github.com/<your-account>/bscp` (TBD).
+
 The whole client lives in one file: `bscp`.  There are no external
 dependencies beyond the Python 3 stdlib and an installed `ssh` binary.
 
-Two prebuilt single-file Nuitka binaries are checked in for hosts that have
-no Python interpreter installed: `bscp.amd64` (x86-64) and `bscp.arm64`
-(aarch64).  See [docs/nuitka.md](docs/nuitka.md).
+For a client host with no Python interpreter, `bscp` can be compiled into a
+single self-contained Nuitka binary (not shipped in the repo — build your
+own).  See [docs/nuitka.md](docs/nuitka.md).
 
 ## Documentation map
 
@@ -60,8 +66,8 @@ subsystem:
   model, rate EMAs, and display damping.
 - **[docs/python2-client.md](docs/python2-client.md)** — the `bscp.python2`
   Py2.7 client fallback, its compatibility shims, and maintenance policy.
-- **[docs/nuitka.md](docs/nuitka.md)** — the prebuilt `bscp.amd64` /
-  `bscp.arm64` single-file binaries and how to rebuild them.
+- **[docs/nuitka.md](docs/nuitka.md)** — building a single-file Nuitka binary
+  so the client host needs no Python (not shipped in the repo).
 ## Architecture
 
 ```
@@ -312,8 +318,8 @@ Prerequisites: `python3` on PATH, and passwordless `ssh localhost`.  Run:
 
 ```bash
 ./tests.sh
-# or, when testing a different binary:
-BSCP=./bscp.amd64 ./tests.sh
+# or, when testing a different binary (e.g. a Nuitka build):
+BSCP=./bscp.nuitka ./tests.sh
 ```
 
 The script writes its fixtures into a `mktemp -d` directory and removes

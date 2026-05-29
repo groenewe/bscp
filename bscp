@@ -2,6 +2,11 @@
 
 # Copyright (C) 2012-2024  The Bscp Authors <https://github.com/bscp-tool/bscp/graphs/contributors>
 #
+# This is a fork.  It builds on, and is inspired by, the original bscp:
+#   https://github.com/bscp-tool/bscp   (canonical project, latest master)
+#   https://github.com/vog/bscp         (original author, Volker Diels-Grabsch)
+# Fork: https://github.com/<your-account>/bscp
+#
 # Permission to use, copy, modify, and/or distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
 # copyright notice and this permission notice appear in all copies.

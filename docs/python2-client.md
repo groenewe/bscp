@@ -80,8 +80,7 @@ the `IOTimeout` class, the `IOCounter` raw-fd paths (`_read_raw`,
 `_write_raw`), the `popen_bufsize` branch, the `DEFAULT_IO_TIMEOUT`
 constant, and the argparse entry.
 
-`bscp.python2` is **not** built with Nuitka — the prebuilt
-`bscp.amd64` / `bscp.arm64` binaries already cover the no-Python-on-the-
-client case, and they embed Python 3.14.  `bscp.python2` covers the
-remaining corner: a client host that has Python 2.7 but neither
-Python 3 nor a working Nuitka binary.
+`bscp.python2` is **not** built with Nuitka — a Nuitka binary (see
+[nuitka.md](nuitka.md)) already covers the no-Python-on-the-client case and
+embeds Python 3.  `bscp.python2` covers the remaining corner: a client host
+that has Python 2.7 but neither Python 3 nor a working Nuitka binary.
