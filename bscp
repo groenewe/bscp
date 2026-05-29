@@ -1353,7 +1353,7 @@ if __name__ == '__main__':
                              'rounded up to a whole number of blocks.')
 
     perf = parser.add_argument_group('performance')
-    perf.add_argument('--hash-threads',         default=DEFAULT_HASH_THREADS, type=int, metavar='N',
+    perf.add_argument('-T', '--hash-threads',   default=DEFAULT_HASH_THREADS, type=int, metavar='N',
                         help='number of threads used to hash blocks during the scan phase, on '
                              'both client and remote (default 0 = auto: min(CPU cores, %d)). '
                              'Speeds up the scan when hashing is CPU-bound (fast NVMe/local). '
@@ -1380,7 +1380,7 @@ if __name__ == '__main__':
                         help='resume from byte offset (K/M/G/T suffix accepted), '
                              'or NN[.N]%% of the local file size; rounded down '
                              'to section boundary')
-    resilience.add_argument('--retries',        default=DEFAULT_RETRIES, type=int, metavar='N',
+    resilience.add_argument('-R', '--retries',  default=DEFAULT_RETRIES, type=int, metavar='N',
                         help='auto-retry attempts on connection failure (default %d; 0 disables)' % DEFAULT_RETRIES)
     resilience.add_argument('--io-timeout',     default=DEFAULT_IO_TIMEOUT, type=float, metavar='SECS',
                         help='abort the transfer (engaging --retries) if no SSH-pipe I/O progress is observed '

@@ -71,7 +71,7 @@ prefix that fits.
 |                              |          | Perl). Other `hashlib` algorithms (`sha3_256`, `blake2b`, …) need a python3/python2 remote with that algorithm;  |
 |                              |          | the Perl remote supports only the six portable ones. `bscp -h` lists the full set available on the local host.   |
 | `-r OFFSET` / `--resume-from`| `0`      | Skip ahead to this byte offset, or to `NN%` / `NN.N%` of the local file (rounded down to a section boundary).    |
-| `--retries N`                | `3`      | Automatically retry on connection failure, up to N times, with exponential back-off (`0` disables).              |
+| `-R N` / `--retries`         | `3`      | Automatically retry on connection failure, up to N times, with exponential back-off (`0` disables).              |
 | `--io-timeout SECS`          | `0`      | Abort (engaging `--retries`) if no SSH-pipe I/O progress for SECS seconds. Catches stuck remote process or       |
 |                              |          | hung disk while TCP is still alive. `0` disables, falling back to the SSH keepalive (~60s).                      |
 | `-i FILE` / `--identity`     |          | SSH identity file (`-i FILE`).                                                                                   |
@@ -85,7 +85,7 @@ prefix that fits.
 |                              |          | only the bytes that fit are copied.                                                                              |
 | `--buffer`                   |          | Push: buffer differing blocks in memory during phase B instead of re-reading them from disk.                     |
 |                              |          | Higher memory use, fewer disk reads. Experimental. Auto-disabled if available memory is too low.                 |
-| `--hash-threads N`           | `0`      | Threads used to hash blocks during the scan phase, on both client and remote (`0` = auto: `min(cores, 4)`).      |
+| `-T N` / `--hash-threads`    | `0`      | Threads used to hash blocks during the scan phase, on both client and remote (`0` = auto: `min(cores, 4)`).      |
 |                              |          | Speeds up scanning when hashing is CPU-bound (fast NVMe/local). python2 and Perl remotes stay single-threaded.   |
 | `-q` / `--quiet`             |          | Suppress scan/copy progress lines. Errors and warnings are still shown.                                          |
 | `--batch`                    |          | Suppress all stderr output; use the exit status to detect errors (implies `-q`).                                 |

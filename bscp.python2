@@ -1287,7 +1287,7 @@ if __name__ == '__main__':
                         help='resume from byte offset (K/M/G/T suffix accepted), '
                              'or NN[.N]%% of the local file size; rounded down '
                              'to section boundary')
-    resilience.add_argument('--retries',        default=DEFAULT_RETRIES, type=int, metavar='N',
+    resilience.add_argument('-R', '--retries',  default=DEFAULT_RETRIES, type=int, metavar='N',
                         help='auto-retry attempts on connection failure (default %d; 0 disables)' % DEFAULT_RETRIES)
 
     safety = parser.add_argument_group('safety')
