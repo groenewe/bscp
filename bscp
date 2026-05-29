@@ -1402,7 +1402,7 @@ if __name__ == '__main__':
     output.add_argument('--batch',                    action='store_true',
                         help='suppress all stderr output; use exit status to detect errors (implies -q). '
                              'Exit 0=success, 1=fatal error, 2=bad arguments, '
-                             '3=connection lost (resume with --resume-from), 130=interrupted. '
+                             '3=connection lost, 130=interrupted. '
                              'Note: the exit code cannot convey the resume offset; '
                              'callers that need to resume should use -q instead and '
                              'parse the "Resume with:" line from stderr.')
