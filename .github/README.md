@@ -60,6 +60,8 @@ prefix that fits.
 |                              |          | only the bytes that fit are copied.                                                                              |
 | `--buffer`                   |          | Push: buffer differing blocks in memory during phase B instead of re-reading them from disk.                     |
 |                              |          | Higher memory use, fewer disk reads. Experimental. Auto-disabled if available memory is too low.                 |
+| `--hash-threads N`           | `0`      | Threads used to hash blocks during the scan phase, on both client and remote (`0` = auto: `min(cores, 4)`).      |
+|                              |          | Speeds up scanning when hashing is CPU-bound (fast NVMe/local). python2 and Perl remotes stay single-threaded.   |
 | `-q` / `--quiet`             |          | Suppress scan/copy progress lines. Errors and warnings are still shown.                                          |
 | `--batch`                    |          | Suppress all stderr output; use the exit status to detect errors (implies `-q`).                                 |
 |                              |          | Cannot convey a resume offset — use `-q` instead if a caller needs to parse the "Resume with:" stderr line.      |

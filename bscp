@@ -20,13 +20,16 @@
 # "python(/2/3) -c", with a Perl fallback for hosts without Python, so
 # no installation on the remote host is required.
 # Features: section-based processing to bound memory use, single-pass
-# scan+copy, windowed pull to avoid SSH pipe deadlock, resume on failure
-# (byte offset or percentage of source), automatic retry with exponential
-# back-off, and dry-run mode.
+# scan+copy, optional multi-threaded block hashing on both ends
+# (--hash-threads; python3 only), windowed pull to avoid SSH pipe deadlock,
+# resume on failure (byte offset or percentage of source), automatic retry
+# with exponential back-off, and dry-run mode.
 #
 # Changes from branch main-HG onward were made mostly by Claude (Anthropic).
 
 from argparse import ArgumentParser
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import math
 import os
@@ -54,6 +57,20 @@ DEFAULT_SECTION    = 10 * 1024**3
 DEFAULT_RETRIES    = 3
 DEFAULT_IO_TIMEOUT = 0    # 0 = disabled; --io-timeout SECS aborts if no I/O progress for SECS seconds
 MIN_MEMORY_PUSH    = 64 * DEFAULT_BLOCK
+
+# Hashing is single-core-bound on fast (NVMe) storage.  --hash-threads fans
+# the per-block hashing across a thread pool on both client and remote;
+# hashlib releases the GIL for blocks >= 2048 bytes, so threads give true
+# parallelism at the default 64 KiB block size.  0 = auto (min(cores, CAP)).
+# Each side picks its own count independently — the wire contract is digest
+# order only, so no negotiation or protocol change is involved.  The py2 and
+# Perl remotes stay single-threaded; threading is python3-only on both ends.
+DEFAULT_HASH_THREADS = 0
+HASH_THREADS_CAP     = 4
+
+
+def resolve_hash_threads(n):
+    return n if n and n > 0 else min(os.cpu_count() or 1, HASH_THREADS_CAP)
 
 REPORT_INTERVAL = 0.5 # status line should update after this many seconds have passed
 last_report_len = 0   # last progress or error length message on screen, if any; used by report()
@@ -169,6 +186,145 @@ def _remote():
                 pos = sec_end
         except (struct.error, IOError, OSError, EOFError):
             sys.exit(1)
+'''
+
+# Multi-threaded python3 remote.  Functionally identical to remote_script
+# on the wire — same handshake, same phase A/B contract — but phase-A
+# hashing fans out across a ThreadPoolExecutor.  python3-only (uses
+# concurrent.futures, sys.stdin.buffer unconditionally), so build_ssh_cmd()
+# dispatches it ONLY to python3 and falls back to the single-threaded
+# remote_script for python2/python and to remote_perl for Perl-only hosts.
+#
+# Because build_ssh_cmd() hex-encodes this and runs it via
+#   python3 -O -B -c "exec(bytes.fromhex('...').decode())"
+# the no-"/no-$/no-% constraints that apply to remote_script do NOT apply
+# here — the hex alphabet is inert in every shell quoting context.  The
+# thread count is baked into the trailing _remote(N) call by build_ssh_cmd
+# (N = client --hash-threads; 0 = let the remote auto-detect its own cores).
+#
+# Protocol constants are duplicated here too (see CLAUDE.md): any change to
+# HEADER_FMT / the mode bits / the phase contract must be made in FOUR
+# places now — client, remote_script, remote_script_mt, and remote_perl.
+remote_script_mt = '''
+def _remote(nthreads):
+    import hashlib, os, struct, sys
+    from collections import deque
+    from concurrent.futures import ThreadPoolExecutor
+
+    stdin  = sys.stdin.buffer
+    stdout = sys.stdout.buffer
+
+    def rd(n):
+        buf = b""
+        while len(buf) < n:
+            chunk = stdin.read(n - len(buf))
+            if not chunk:
+                raise EOFError
+            buf += chunk
+        return buf
+
+    HEADER_FMT     = "<QQQQQQB"
+    HEADER_SIZE    = struct.calcsize(HEADER_FMT)
+    MODE_PUSH, MODE_PULL = 0, 1
+    PUSH_PULL_MASK = 1
+    ALLOW_TRUNCATE = 2
+    HASH_THREADS_CAP = 4
+
+    if nthreads <= 0:
+        nthreads = min(os.cpu_count() or 1, HASH_THREADS_CAP)
+    window = max(2, nthreads * 2)
+
+    try:
+        data = rd(HEADER_SIZE)
+    except EOFError:
+        sys.exit(1)
+    (size, blocksize, section_size, start_offset,
+     filename_len, hashname_len, mode) = struct.unpack(HEADER_FMT, data)
+    allow_truncate = mode & ALLOW_TRUNCATE
+    mode = mode & PUSH_PULL_MASK
+
+    try:
+        fn_bytes = rd(filename_len)
+        hashname = rd(hashname_len).decode("ascii")
+        filename = fn_bytes.decode("utf-8")
+        stdout.write(hashlib.new(hashname, fn_bytes).digest())
+        stdout.flush()
+        if rd(2) != b"go":
+            sys.exit(1)
+    except EOFError:
+        sys.exit(1)
+
+    try:
+        fobj = open(filename, "rb+" if mode == MODE_PUSH else "rb")
+    except OSError:
+        stdout.write(struct.pack("<Q", 0))
+        stdout.flush()
+        sys.exit(1)
+
+    def hashfn(block):
+        return hashlib.new(hashname, block).digest()
+
+    with fobj as f:
+        f.seek(0, 2)
+        remote_size = f.tell()
+        stdout.write(struct.pack("<Q", remote_size))
+        stdout.flush()
+
+        dst_size = remote_size if mode == MODE_PUSH else size
+        src_size = size        if mode == MODE_PUSH else remote_size
+        if dst_size < src_size and not allow_truncate:
+            sys.exit(1)
+
+        sync_size = min(size, remote_size)
+        eff_section = section_size or sync_size
+        if sync_size == 0:
+            sys.exit(0)
+
+        ex = ThreadPoolExecutor(max_workers=nthreads)
+        try:
+            pos = start_offset
+            while pos < sync_size:
+                sec_end = min(pos + eff_section, sync_size)
+
+                # Phase A: reads stay single-threaded and sequential (fast on
+                # NVMe); only hashing fans out.  Digests are written in block
+                # order, so the wire stream is identical to remote_script.
+                f.seek(pos)
+                p = pos
+                inflight = deque()
+                while p < sec_end and len(inflight) < window:
+                    bl = min(blocksize, sec_end - p)
+                    inflight.append(ex.submit(hashfn, f.read(bl)))
+                    p += bl
+                while inflight:
+                    stdout.write(inflight.popleft().result())
+                    if p < sec_end:
+                        bl = min(blocksize, sec_end - p)
+                        inflight.append(ex.submit(hashfn, f.read(bl)))
+                        p += bl
+                stdout.flush()
+
+                (count,) = struct.unpack("<Q", rd(8))
+
+                if mode == MODE_PUSH:
+                    for _ in range(count):
+                        (wpos,) = struct.unpack("<Q", rd(8))
+                        bl = min(blocksize, sync_size - wpos)
+                        f.seek(wpos)
+                        f.write(rd(bl))
+                else:
+                    for _ in range(count):
+                        (rpos,) = struct.unpack("<Q", rd(8))
+                        bl = min(blocksize, sync_size - rpos)
+                        f.seek(rpos)
+                        stdout.write(f.read(bl))
+                        stdout.flush()
+
+                pos = sec_end
+        except (struct.error, IOError, OSError, EOFError):
+            sys.exit(1)
+        finally:
+            ex.shutdown(wait=False)
 '''
 
 # Perl fallback for hosts that have no Python.  Functionally identical to
@@ -499,6 +655,8 @@ def build_resume_cmd(argv0, args, src, dst, offset, block_count=None):
         parts += ['--retries', str(args.retries)]
     if args.io_timeout != DEFAULT_IO_TIMEOUT:
         parts += ['--io-timeout', str(args.io_timeout)]
+    if args.hash_threads != DEFAULT_HASH_THREADS:
+        parts += ['--hash-threads', str(args.hash_threads)]
     if args.identity:
         parts += ['-i', args.identity]
     for opt in (args.ssh_opt or []):
@@ -546,12 +704,33 @@ def build_ssh_cmd(remote_host, args):
     cmd += ['-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4']
     script_py = remote_script + '\n_remote()'
     hex_pl    = remote_perl.encode('utf-8').hex()
-    # BSCP_FORCE_PERL skips the Python branch — used by tests.sh to exercise
-    # the Perl fallback on a host that has both interpreters.
-    py_branch = '' if os.environ.get('BSCP_FORCE_PERL') else (
-        'for py in python3 python2 python; do '
-        'command -v "$py" >/dev/null 2>&1 && exec "$py" -O -B -c "%s"; '
-        'done; ' % script_py)
+    # python3 runs the multi-threaded remote; the thread count is baked into
+    # the _remote() call (0 = remote auto-detects its own cores).  The source
+    # is hex-encoded so the shell sees only inert hex inside the -c arg,
+    # sidestepping the no-"/no-$/no-% rules.  python2/python fall back to the
+    # single-threaded remote_script.
+    remote_threads = (args.get('hash_threads') or 0)
+    script_mt = remote_script_mt + '\n_remote(%d)\n' % remote_threads
+    hex_mt    = script_mt.encode('utf-8').hex()
+    # BSCP_FORCE_PERL skips both Python branches; BSCP_FORCE_PYTHON2 skips the
+    # python3/remote_script_mt branch so the single-threaded legacy
+    # remote_script is exercised even where python3 is present.  Both are
+    # test hooks (tests.sh) for paths that a fully-equipped host would
+    # otherwise never reach.
+    if os.environ.get('BSCP_FORCE_PERL'):
+        py_branch = ''
+    elif os.environ.get('BSCP_FORCE_PYTHON2'):
+        py_branch = (
+            'for py in python3 python2 python; do '
+            'command -v "$py" >/dev/null 2>&1 && exec "$py" -O -B -c "%s"; '
+            'done; ' % script_py)
+    else:
+        py_branch = (
+            'command -v python3 >/dev/null 2>&1 && '
+            'exec python3 -O -B -c "exec(bytes.fromhex(\'%s\').decode())"; '
+            'for py in python2 python; do '
+            'command -v "$py" >/dev/null 2>&1 && exec "$py" -O -B -c "%s"; '
+            'done; ' % (hex_mt, script_py))
     wrapper = (
         py_branch +
         "command -v perl >/dev/null 2>&1 && "
@@ -565,12 +744,13 @@ def build_ssh_cmd(remote_host, args):
 def do_sync(local_file, remote_host, remote_file, mode,
             blocksize, section_size, hashname,
             start_offset=0, dry_run=False, block_count=0, allow_truncate=False, buffer=False,
-            io_timeout=0, ssh_args=None):
+            io_timeout=0, hash_threads=0, ssh_args=None):
 
     ssh_args = ssh_args or {}
     fn_bytes = remote_file.encode('utf-8')
     hn_bytes = hashname.encode('ascii')
     dig_size = hashlib.new(hashname).digest_size
+    nthreads = resolve_hash_threads(hash_threads)
 
     # Local is the destination on pull (we write blocks back into it) and the
     # source on push (read-only).  The remote uses the symmetric inverse —
@@ -874,6 +1054,17 @@ def do_sync(local_file, remote_host, remote_file, mode,
             remaining_copy_time = remaining_copy / copy_rate if copy_rate > 0 else 0.0
             return remaining_scan_time + remaining_copy_time
 
+        # Client-side hashing pool — parallelises phase-A digest computation,
+        # the single-core bottleneck on fast storage.  hashlib releases the
+        # GIL for >= 2048-byte blocks, so this is true parallelism at the
+        # default 64 KiB block size.  hash_window bounds in-flight blocks
+        # (and thus memory) to 2x the worker count.  The remote parallelises
+        # its own hashing independently (see remote_script_mt).
+        def hashfn(block):
+            return hashlib.new(hashname, block).digest()
+        hash_window = max(2, nthreads * 2)
+        ex_hash     = ThreadPoolExecutor(max_workers=nthreads)
+
         try:
             pos = start_offset
             while pos < sync_size:
@@ -885,22 +1076,38 @@ def do_sync(local_file, remote_host, remote_file, mode,
                 diff_positions = []   # pull: [rpos]
 
                 t_phase_a_start = time()
+                # Reads stay single-threaded and sequential; only the hashing
+                # fans out across ex_hash.  A bounded window of in-flight
+                # (pos, block, future) triples caps memory at hash_window
+                # blocks while preserving wire order — futures are drained in
+                # submission order, so digests are compared against the
+                # remote's stream in the same order it produced them.
                 f.seek(pos)
                 p = pos
-                while p < sec_end:
-                    bl         = min(blocksize, sec_end - p)
-                    block      = f.read(bl)
-                    local_dig  = hashlib.new(hashname, block).digest()
+                inflight = deque()
+                while p < sec_end and len(inflight) < hash_window:
+                    bl  = min(blocksize, sec_end - p)
+                    blk = f.read(bl)
+                    inflight.append((p, blk, ex_hash.submit(hashfn, blk)))
+                    p += bl
+                while inflight:
+                    blk_pos, block, fut = inflight.popleft()
+                    local_dig  = fut.result()
                     remote_dig = io.read(dig_size)
                     if len(remote_dig) < dig_size:
                         raise EOFError('SSH pipe closed during phase-A hash read '
                                        '(got %d of %d bytes)' % (len(remote_dig), dig_size))
                     if local_dig != remote_dig:
                         if mode == MODE_PUSH and buffer:
-                            diff_blocks.append((p, block))
+                            diff_blocks.append((blk_pos, block))
                         else:
-                            diff_positions.append(p)
-                    p             += bl
+                            diff_positions.append(blk_pos)
+                    if p < sec_end:
+                        bl  = min(blocksize, sec_end - p)
+                        blk = f.read(bl)
+                        inflight.append((p, blk, ex_hash.submit(hashfn, blk)))
+                        p += bl
+                    done_pos       = blk_pos + len(block)
                     total_scanned += 1
                     now = time()
                     if now - t_last_progress >= REPORT_INTERVAL:
@@ -930,8 +1137,8 @@ def do_sync(local_file, remote_host, remote_file, mode,
                         confident    = ema_scan_rate is not None and (
                                            dry_run or ema_copy_rate is not None
                                            or scan_frac >= CONFIDENT_SCAN_FRAC)
-                        sec_blk_done = (p   - pos + blocksize - 1) // blocksize
-                        sec_blk_tot  = (sec_end - pos + blocksize - 1) // blocksize
+                        sec_blk_done = (done_pos - pos + blocksize - 1) // blocksize
+                        sec_blk_tot  = (sec_end  - pos + blocksize - 1) // blocksize
                         eta          = display_eta(estimate_eta(now,
                                                     live_diffs=sec_diffs,
                                                     scan_active_since=t_phase_a_start,
@@ -1053,6 +1260,8 @@ def do_sync(local_file, remote_host, remote_file, mode,
             # proc.wait() hanging forever and the user sees no resume hint.
             _shutdown_proc(proc)
             raise ConnectionLost(last_sec_start, interrupted=True)
+        finally:
+            ex_hash.shutdown(wait=False)
 
         _shutdown_proc(proc)
 
@@ -1116,6 +1325,12 @@ if __name__ == '__main__':
                              'Note: the exit code cannot convey the resume offset; '
                              'callers that need to resume should use -q instead and '
                              'parse the "Resume with:" line from stderr.')
+    parser.add_argument('--hash-threads',       default=DEFAULT_HASH_THREADS, type=int, metavar='N',
+                        help='number of threads used to hash blocks during the scan phase, on '
+                             'both client and remote (default 0 = auto: min(CPU cores, %d)). '
+                             'Speeds up the scan when hashing is CPU-bound (fast NVMe/local). '
+                             'Each side picks its own count; the python2 and Perl remotes always '
+                             'run single-threaded.' % HASH_THREADS_CAP)
     parser.add_argument('-p', '--port',         default=22, type=int, metavar='PORT',
                         help='SSH port (default 22)')
     parser.add_argument('src', help='source — local path or HOST:path')
@@ -1200,7 +1415,8 @@ if __name__ == '__main__':
                     mode, blocksize, section_size, hashname,
                     start_offset=start_offset, dry_run=dry_run,
                     block_count=args.block_count, allow_truncate=args.allow_truncate,
-                    buffer=buffer, io_timeout=args.io_timeout, ssh_args=ssh_args)
+                    buffer=buffer, io_timeout=args.io_timeout,
+                    hash_threads=args.hash_threads, ssh_args=ssh_args)
                 break
             except ConnectionLost as exc:
                 if attempt < args.retries and not exc.interrupted:

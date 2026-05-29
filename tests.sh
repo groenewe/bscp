@@ -128,12 +128,55 @@ test_perl_remote_pull() {
         && cmp -s "$SRC" "$DST"
 }
 
+# BSCP_FORCE_PYTHON2=1 makes build_ssh_cmd skip the python3/remote_script_mt
+# branch, exercising the single-threaded legacy remote_script even on a host
+# that has python3 (where the default path would always pick the threaded
+# remote).  Runs the legacy script under whichever python is found first.
+test_legacy_remote_push() {
+    make_src 8
+    copy_src_to "$DST"
+    randomise_in "$DST" 12 200
+    BSCP_FORCE_PYTHON2=1 "$BSCP" -s 2M "$SRC" "localhost:$DST" >/dev/null 2>&1 \
+        && cmp -s "$SRC" "$DST"
+}
+
+test_legacy_remote_pull() {
+    make_src 8
+    copy_src_to "$DST2"
+    randomise_in "$DST2" 12 300
+    BSCP_FORCE_PYTHON2=1 "$BSCP" -s 2M "localhost:$SRC" "$DST2" >/dev/null 2>&1 \
+        && cmp -s "$SRC" "$DST2"
+}
+
 test_buffer_push() {
     make_src 10
     copy_src_to "$DST"
     randomise_in "$DST" 8 300
     "$BSCP" -s 2M --buffer "$SRC" "localhost:$DST" >/dev/null 2>&1 \
         && cmp -s "$SRC" "$DST"
+}
+
+test_hash_threads_push() {
+    # Multi-section push with diffs scattered across sections, hashing fanned
+    # out over 4 threads — exercises the threaded phase-A feed/drain window
+    # and that digests stay in wire order across section boundaries.
+    make_src 20
+    copy_src_to "$DST"
+    randomise_in "$DST" 4 50
+    randomise_in "$DST" 4 2000
+    randomise_in "$DST" 4 4900
+    "$BSCP" -s 4M --hash-threads 4 "$SRC" "localhost:$DST" >/dev/null 2>&1 \
+        && cmp -s "$SRC" "$DST"
+}
+
+test_hash_threads_single_pull() {
+    # --hash-threads 1 forces a one-worker pool: verifies the threaded path is
+    # correct when it degenerates to serial, on the pull side.
+    make_src 12
+    copy_src_to "$DST2"
+    randomise_in "$DST2" 6 600
+    "$BSCP" -s 3M --hash-threads 1 "localhost:$SRC" "$DST2" >/dev/null 2>&1 \
+        && cmp -s "$SRC" "$DST2"
 }
 
 test_allow_truncate_push() {
@@ -312,7 +355,11 @@ run "resume from a mid-file section boundary"        test_resume_from_section
 run "resume from a percentage of local file size"    test_resume_from_percent
 run "perl remote: push (BSCP_FORCE_PERL=1)"          test_perl_remote_push
 run "perl remote: pull (BSCP_FORCE_PERL=1)"          test_perl_remote_pull
+run "legacy remote: push (BSCP_FORCE_PYTHON2=1)"     test_legacy_remote_push
+run "legacy remote: pull (BSCP_FORCE_PYTHON2=1)"     test_legacy_remote_pull
 run "--buffer push"                                  test_buffer_push
+run "--hash-threads 4 push (multi-section)"          test_hash_threads_push
+run "--hash-threads 1 pull (serial pool path)"       test_hash_threads_single_pull
 run "--allow-truncate push (smaller dst)"            test_allow_truncate_push
 run "--allow-truncate pull (smaller dst)"            test_allow_truncate_pull
 run "--batch is silent on success and exits 0"       test_batch_silent_success

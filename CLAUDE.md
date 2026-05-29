@@ -46,23 +46,36 @@ the maintainer chooses.  Day-to-day commits to `bscp` should leave
 
 ```
 bscp (single file)
-├── remote_script      — Triple-quoted Python source for the remote-side
-│                        process.  build_ssh_cmd() appends "\n_remote()"
-│                        and embeds the result inside a "$py" -O -B -c "..."
-│                        shell command.  The remote shell tries python3,
-│                        python2, python in order ("command -v" + exec; first
-│                        found wins), so client and server are always the
-│                        same protocol version.
-│                        The script body is compatible with Python 2.6+ and
+├── remote_script      — Triple-quoted Python source for the single-threaded
+│                        remote-side process.  build_ssh_cmd() appends
+│                        "\n_remote()" and embeds the result inside a
+│                        "$py" -O -B -c "..." shell command.  The remote shell
+│                        tries python3 (→ remote_script_mt), then python2 and
+│                        python (→ this script), then perl, in order
+│                        ("command -v" + exec; first found wins), so client
+│                        and server are always the same protocol version.
+│                        This script body is compatible with Python 2.6+ and
 │                        3.x, so no inspect/getsource is needed and the file
-│                        works under Nuitka onefile builds.
+│                        works under Nuitka onefile builds.  It runs on
+│                        python2/python and on a python3 reached only via the
+│                        `python` name (rare: no `python3` binary present).
+├── remote_script_mt   — python3-only multi-threaded twin of remote_script.
+│                        Phase-A hashing fans out over a ThreadPoolExecutor
+│                        (reads stay sequential; only hashing parallelises).
+│                        Same wire protocol as remote_script.  Hex-encoded by
+│                        build_ssh_cmd() and run via
+│                        `python3 -c "exec(bytes.fromhex('...').decode())"`,
+│                        so the no-$/no-%/no-" rules do NOT apply here.  The
+│                        thread count is baked into the trailing _remote(N)
+│                        call (N from --hash-threads; 0 = remote auto-detects
+│                        its own cores).  See "Multi-threaded hashing" below.
 ├── remote_perl        — Triple-quoted Perl translation of remote_script,
 │                        used as a fallback when no Python interpreter is
 │                        on the remote.  Hex-encoded by build_ssh_cmd() and
 │                        decoded with `perl -e 'eval pack(qq{H*}, q{...})'`,
 │                        which sidesteps the no-$, no-%, no-" rules that
-│                        apply to remote_script.  Requires Perl 5.10+ for
-│                        little-endian Q< pack format.
+│                        apply to remote_script.  Single-threaded.  Requires
+│                        Perl 5.10+ for little-endian Q< pack format.
 ├── IOCounter          — thin wrapper around subprocess stdin/stdout that
 │                        tracks total bytes sent/received.  Flushes after
 │                        every write to prevent buffering deadlocks.  When
@@ -103,6 +116,10 @@ bscp (single file)
 ├── build_resume_cmd() — assembles a copy-pasteable resume command line from
 │                        the current argv and the failed section offset.
 ├── build_ssh_cmd()    — assembles the ssh argv list from ssh_args dict.
+│                        Dispatches three remote variants in order: python3 →
+│                        remote_script_mt (threaded, hex-encoded), python2/
+│                        python → remote_script (single-threaded), perl →
+│                        remote_perl.  First interpreter found wins.
 │                        Appends `-o ServerAliveInterval=15 -o ServerAliveCountMax=4`
 │                        after the user's `-o` options so a dropped TCP
 │                        connection surfaces as a BrokenPipeError within
@@ -111,6 +128,10 @@ bscp (single file)
 ├── do_sync()          — all transfer logic for both push and pull.  Hosts
 │                        a `show_copy_progress` closure that all three
 │                        phase-B branches (push, push --buffer, pull) share.
+│                        Phase A hashes local blocks on a ThreadPoolExecutor
+│                        (`ex_hash`) via a bounded feed/drain window
+│                        (`hash_window` = 2× workers) that preserves wire
+│                        order; see "Multi-threaded hashing" below.
 └── __main__           — argparse, push/pull auto-detection, retry loop.
 ```
 
@@ -119,6 +140,14 @@ bscp (single file)
 `DEFAULT_BLOCK` and `DEFAULT_SECTION` are defined at module level (not inside
 `__main__`) so that `build_resume_cmd()` can compare against them to decide
 which options to omit from the reconstructed command line.
+
+`DEFAULT_HASH_THREADS` (0 = auto) and `HASH_THREADS_CAP` (4) configure the
+phase-A hashing pool; `resolve_hash_threads(n)` maps the user value to a
+concrete worker count (`n` if positive, else `min(os.cpu_count(), CAP)`).
+The client resolves its own count via this helper; the remote receives the
+raw `--hash-threads` value baked into its `_remote(N)` call and resolves it
+the same way internally (so a `0` lets the remote auto-detect its own cores
+independently of the client's core count).
 
 `MODE_PUSH`, `MODE_PULL`, and `ALLOW_TRUNCATE` are also defined at module
 level for use throughout the client.  Because the remote runs from a string
@@ -164,9 +193,10 @@ See `PROTOCOL.md` for the full wire-format spec.  Short version:
 ### Critical: keep client and remote constants in sync
 
 `HEADER_FMT`, `MODE_PUSH`, `MODE_PULL`, `PUSH_PULL_MASK`, and
-`ALLOW_TRUNCATE` are defined **in both** the client module and inside the
-`remote_script` string.  Any protocol change must be made in both places.
-The `PULL_WINDOW` constant lives only in the client — the server is
+`ALLOW_TRUNCATE` are defined in the client module **and** inside **both**
+remote Python strings (`remote_script` and `remote_script_mt`) **and** the
+`remote_perl` string.  Any protocol change must be made in **all four**
+places.  The `PULL_WINDOW` constant lives only in the client — the server is
 stateless with respect to window size.
 
 ## Protocol invariants to preserve
@@ -258,6 +288,57 @@ custom block sizes, blocks would otherwise sit in the remote's Python or
 Perl I/O buffer waiting for buffer-fill before reaching the wire — a
 read-side stall that looks identical to a deadlock under load.
 
+## Multi-threaded hashing (`--hash-threads`)
+
+On fast storage (NVMe, or any local/loopback transfer) the scan phase is
+CPU-bound: a single core computing one digest after another saturates while
+the disk sits idle.  `--hash-threads N` fans the per-block hashing across a
+thread pool.
+
+**Why threads, not processes.** CPython's `hashlib` releases the GIL while
+hashing buffers ≥ 2048 bytes, so a `ThreadPoolExecutor` gives true
+parallelism at the default 64 KiB block size — no `multiprocessing`, no
+pickling, no IPC.  With a custom `blocksize` below ~2 KiB the GIL is not
+released and threading yields nothing; that is an accepted edge, not a bug.
+
+**No protocol change, no negotiation.** The wire contract is digest *order*
+only.  Each side hashes its own file independently and emits digests in
+block order, so client and remote pick their thread counts independently —
+nothing about parallelism crosses the wire.  The 49-byte header is
+untouched.  The client controls the remote count only by baking the integer
+into the remote's `_remote(N)` call (`N` = `--hash-threads`; `0` lets the
+remote auto-detect its own cores via `min(os.cpu_count(), 4)`).
+
+**Where it runs.** python3 only, on *both* ends: the client (`do_sync`
+phase A) and the python3 remote (`remote_script_mt`).  The python2/python
+remote (`remote_script`), the Perl remote (`remote_perl`), and the
+`bscp.python2` client are all single-threaded by design — speeding only one
+side leaves the other core-bound, so the gain there would be marginal and
+not worth the complexity/fragility on the fallback paths.
+
+**Order-preserving bounded pipeline.** Both ends use the same shape: reads
+stay single-threaded and sequential (fast, and avoids seek thrash); only
+hashing is offloaded.  A `deque` of in-flight work is filled up to
+`hash_window = max(2, 2 × workers)` blocks, then drained in submission
+order — `future.result()` blocks until that specific block's digest is
+ready, so digests reach the wire (remote) or the comparison loop (client)
+in exactly the order `remote_script` would have produced them.  Peak extra
+memory is `hash_window × blocksize` (e.g. 8 × 64 KiB = 512 KiB at 4
+threads), independent of section size.  On the client the in-flight tuple is
+`(pos, block, future)` so `--buffer` push still has the block in hand when a
+diff is recorded; `done_pos = pos + len(block)` drives the scan-progress
+counter (the feed pointer `p` runs ahead by the window and must not be used
+for progress).
+
+The pool is created once per `do_sync` call / per remote invocation and
+`shutdown(wait=False)` on exit (client: a `finally` on the section loop;
+remote: a `finally` around the loop).
+
+**Tuning.** Auto caps at 4 (`HASH_THREADS_CAP`) — hashing parallelism
+plateaus once cores outrun sequential read + pipe drain, and higher counts
+add scheduler/pipe contention for little gain.  A measured localhost run
+(16 cores, 600 MiB, both ends hashing) went 3.6 s → 1.9 s from N=1 to N=4.
+
 ## Memory model
 
 | --------------------- | ------------------------------------ | ---------------------------------------------- | ------------------------------------ |
@@ -323,8 +404,8 @@ This means:
 `remote_perl` is a functional twin of `remote_script` for hosts that have
 no Python interpreter on `PATH`.  It speaks the same wire protocol — any
 change to `HEADER_FMT`, the mode bits, or the section/phase-A/phase-B
-contract must be made in **three** places now: client constants,
-`remote_script`, and `remote_perl`.
+contract must be made in **four** places now: client constants,
+`remote_script`, `remote_script_mt`, and `remote_perl`.
 
 Unlike the Python remote, `remote_perl` is **not** subject to the no-`$` /
 no-`%` / no-`"` rules.  `build_ssh_cmd()` hex-encodes the source and the
@@ -345,11 +426,21 @@ format and the `\z` regex anchor.  The body uses `Digest::SHA` (core since
 5.9.3) and `Digest::MD5` (core since 5.7.3); both are universal in modern
 Perl distributions.
 
-The wrapper tries Python first, then Perl, then prints
-`bscp: no python or perl found on remote` and exits 127.  Setting
-`BSCP_FORCE_PERL=1` in the **client** environment makes `build_ssh_cmd()`
-skip the Python branch entirely; this is the hook tests.sh uses to
-exercise the Perl path on a host where both interpreters are installed.
+The wrapper tries python3 (threaded `remote_script_mt`), then python2/python
+(single-threaded `remote_script`), then Perl, then prints
+`bscp: no python or perl found on remote` and exits 127.  Two **client**
+environment hooks let tests.sh reach paths a fully-equipped host would
+otherwise never run:
+
+- `BSCP_FORCE_PERL=1` makes `build_ssh_cmd()` skip both Python branches, so
+  the Perl fallback runs even where python is installed.
+- `BSCP_FORCE_PYTHON2=1` skips the python3/`remote_script_mt` branch, so the
+  single-threaded legacy `remote_script` runs even where python3 is present
+  (it executes under the first of `python3 python2 python` found — testing
+  the *script*, not specifically the python2 *binary*, so it works on a
+  python3-only host).
+
+`BSCP_FORCE_PERL` takes precedence over `BSCP_FORCE_PYTHON2` if both are set.
 
 When editing `remote_perl`, remember the file is read by Python first:
 backslashes that need to reach Perl (e.g. `\n`, `\&`, `\z` in regex)
@@ -365,8 +456,10 @@ Two single-file binaries are checked in next to the source: `bscp.amd64`
 `--mode=onefile` against Python 3.14.3 and **do not require Python on the
 client host** (the binary embeds the interpreter and the `bscp` source).
 The remote side still needs `python3`, `python2`, `python`, or `perl` on
-`PATH` (the binary embeds both `remote_script` and `remote_perl`); it
-only replaces the local interpreter, not the embedded protocol.
+`PATH` (the binary embeds `remote_script`, `remote_script_mt`, and
+`remote_perl`); it only replaces the local interpreter, not the embedded
+protocol.  The checked-in binaries predate `--hash-threads`; rebuild them
+to pick up the threaded client/remote path.
 
 Build environments:
 
@@ -409,7 +502,7 @@ exercises it implicitly when run against `bscp.python2`, but that is
 opt-in via `BSCP=./bscp.python2 ./tests.sh`.
 
 **Feature parity vs. `bscp`.**  `bscp.python2` carries the full feature
-set with one deliberate exception:
+set with two deliberate exceptions:
 
 - `--io-timeout` is dropped.  Its raw-fd `os.read` / `os.write` path
   driven by `select.select()` works cleanly in Python 3 with
@@ -419,6 +512,18 @@ set with one deliberate exception:
   `ServerAliveInterval=15` keepalive (kept) still surfaces a dropped
   TCP connection within ~60 s, which is good enough for the rare hosts
   that need the Py2 client.
+
+- `--hash-threads` is dropped.  Multi-threaded hashing is a python3-only
+  efficiency feature (see "Multi-threaded hashing"); the Py2 client is a
+  last-resort path for ancient hosts where the marginal throughput gain
+  does not justify the threading complexity.  When refreshing
+  `bscp.python2`, omit the `--hash-threads` argparse entry, the
+  `ThreadPoolExecutor`/`deque` imports, the `DEFAULT_HASH_THREADS` /
+  `HASH_THREADS_CAP` / `resolve_hash_threads` definitions, the `ex_hash`
+  pool and `finally` shutdown, and keep the original serial phase-A loop
+  (read → hash → compare).  Note that the *remote* it talks to is
+  unaffected: a python3 remote still runs the threaded `remote_script_mt`
+  regardless of which client drives it.
 
 Everything else — section-based scan/copy, `--buffer`,
 `--allow-truncate`, `-B`, resume, retries, the unified ETA model with
@@ -479,7 +584,11 @@ to cover, plus a few that were easy to forget:
 | resume from a percentage of local file size      | `-r NN%` resolves against local size, then rounds |
 | perl remote: push (`BSCP_FORCE_PERL=1`)          | wire compatibility of the Perl fallback (push)    |
 | perl remote: pull (`BSCP_FORCE_PERL=1`)          | wire compatibility of the Perl fallback (pull)    |
+| legacy remote: push (`BSCP_FORCE_PYTHON2=1`)     | single-threaded `remote_script` push (not the MT) |
+| legacy remote: pull (`BSCP_FORCE_PYTHON2=1`)     | single-threaded `remote_script` pull (not the MT) |
 | `--buffer` push                                  | the in-memory diff-block buffer path              |
+| `--hash-threads 4` push (multi-section)          | threaded phase-A feed/drain, digest wire order    |
+| `--hash-threads 1` pull (serial pool path)       | threaded path correct when degenerate to 1 worker |
 | `--allow-truncate` push (smaller dst)            | both refusal-without-flag and warning-with-flag   |
 | `--allow-truncate` pull (smaller dst)            | symmetric pull behaviour                          |
 | `--batch` is silent on success and exits 0       | no stderr leakage; exit-code-only contract        |
