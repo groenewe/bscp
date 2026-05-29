@@ -3,7 +3,7 @@
 > **This is a fork.**  It builds on, and is inspired by, the original
 > [bscp](https://github.com/bscp-tool/bscp) by Volker Diels-Grabsch
 > ([vog/bscp](https://github.com/vog/bscp)).  Maintained at
-> `https://github.com/<your-account>/bscp` (TBD); see [Credits](#credits).
+> `https://github.com/groenewe/bscp`; see [Credits](#credits).
 
 Bscp copies a single file or block device over SSH, transferring only the
 blocks that have changed.  It fills the gap where `rsync` fails — most
@@ -67,15 +67,18 @@ prefix that fits.
 | ---------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------- |
 | `-b SIZE` / `--block-size`   | `64K`    | Comparison/transfer granularity. Supports `K`/`M`/`G` suffixes.                                                  |
 | `-s SIZE` / `--section-size` | `10G`    | File is processed in sections of this size. Bounds peak memory to roughly `diff_blocks_per_section × blocksize`. |
-| `-a ALGO` / `--algorithm`    | `sha256` | Hash algorithm. Any algorithm supported by Python's `hashlib` is accepted (e.g. `sha512`, `sha3-256`).           |
+| `-a ALGO` / `--algorithm`    | `sha256` | Hash algorithm. `md5`, `sha1`, `sha224`, `sha256`, `sha384`, `sha512` work on every remote (python3/python2/     |
+|                              |          | Perl). Other `hashlib` algorithms (`sha3_256`, `blake2b`, …) need a python3/python2 remote with that algorithm;  |
+|                              |          | the Perl remote supports only the six portable ones. `bscp -h` lists the full set available on the local host.   |
 | `-r OFFSET` / `--resume-from`| `0`      | Skip ahead to this byte offset, or to `NN%` / `NN.N%` of the local file (rounded down to a section boundary).    |
 | `--retries N`                | `3`      | Automatically retry on connection failure, up to N times, with exponential back-off (`0` disables).              |
 | `--io-timeout SECS`          | `0`      | Abort (engaging `--retries`) if no SSH-pipe I/O progress for SECS seconds. Catches stuck remote process or       |
 |                              |          | hung disk while TCP is still alive. `0` disables, falling back to the SSH keepalive (~60s).                      |
 | `-i FILE` / `--identity`     |          | SSH identity file (`-i FILE`).                                                                                   |
 | `-o OPT` / `--ssh-opt`       |          | Extra SSH option, repeatable (passed as `-o OPT`). Takes precedence over the defaults below.                     |
-| `-C` / `--compress`          |          | Enable SSH compression.                                                                                          |
-| `-N` / `--dry-run`           |          | Count differing blocks only; do not update destination.                                                          |
+| `-C` / `--compress`          |          | Enable SSH compression. Often a big win over a bandwidth-limited WAN link; usually a slowdown on a fast LAN      |
+|                              |          | (compression CPU cost outweighs the bandwidth saved). Enable for remote/WAN copies, leave off on local ones.     |
+| `-N` / `--dry-run`           |          | Count differing blocks and their total size in bytes only; do not update destination.                            |
 | `-B N` / `--block-count`     | `0`      | Limit sync to the first N blocks (0 = no limit). A `K`/`M`/`G`/`T` suffix interprets the value as bytes,         |
 |                              |          | rounded up to whole blocks (e.g. `-B 4M`). A warning is printed if the limit exceeds the source size.            |
 | `--allow-truncate`           |          | Allow the destination to be smaller than the source (or, with `-B`, smaller than the requested limit);           |
@@ -264,7 +267,7 @@ contributors.  That work inspired and forms the basis of this version:
 - Canonical project (latest master): <https://github.com/bscp-tool/bscp>
 - Original author's repository: <https://github.com/vog/bscp>
 
-This fork is maintained at `https://github.com/<your-account>/bscp` (TBD).
+This fork is maintained at `https://github.com/groenewe/bscp`.
 It extends the original — see the commit history and the deep-dive docs under
 `docs/` for what changed.  All original copyright notices are retained; the
 software remains under its original ISC-style license (see the header of

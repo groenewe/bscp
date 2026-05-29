@@ -136,6 +136,17 @@ format and the `\z` regex anchor.  The body uses `Digest::SHA` (core since
 5.9.3) and `Digest::MD5` (core since 5.7.3); both are universal in modern
 Perl distributions.
 
+Hash-algorithm support on the Perl remote is limited to `make_hash`'s set:
+`md5` plus `sha1`/`sha224`/`sha256`/`sha384`/`sha512` — the portable six
+(`PORTABLE_ALGOS` on the client).  The Python remotes accept anything their
+`hashlib` exposes, so a `sha3_*`/`blake2*` etc. `-a` value only works when
+the remote resolves to python3 or python2 *and* that build's `hashlib` has
+the algorithm.  The client lists its own locally-available extras in
+`bscp -h` but cannot know the remote's set in advance; an unsupported
+algorithm surfaces as a remote handshake error.  XOF/variable-length
+functions (`shake_*`, `digest_size == 0`) are filtered out of the help
+list because the wire protocol assumes a fixed digest size.
+
 The wrapper tries python3 (threaded `remote_script_mt`), then python2/python
 (single-threaded `remote_script`), then Perl, then prints
 `bscp: no python or perl found on remote` and exits 127.  Two **client**

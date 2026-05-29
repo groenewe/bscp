@@ -292,6 +292,16 @@ test_friendly_error_for_missing_local() {
     (( rc == 1 )) && grep -q 'Cannot open local file' <<<"$out"
 }
 
+test_reject_bad_algorithm() {
+    # Unknown algorithm and XOF/zero-digest algorithm both rejected at
+    # arg-parse with exit 2; the message names the algorithm.
+    local out rc
+    out=$("$BSCP" -a notahash "$SRC" "localhost:$DST" 2>&1); rc=$?
+    (( rc == 2 )) && grep -q "unknown hash algorithm 'notahash'" <<<"$out" || return 1
+    out=$("$BSCP" -a shake_128 "$SRC" "localhost:$DST" 2>&1); rc=$?
+    (( rc == 2 )) && grep -q "no fixed digest size" <<<"$out"
+}
+
 test_format_size_unit_tests() {
     # The unit tests `import` the helpers as a module, so we need Python source.
     # When $BSCP points at a Nuitka binary, fall back to the checked-in source.
@@ -371,6 +381,7 @@ run "-B overshoot prints warning, exits 0"           test_block_count_overshoot_
 run "-B overshoot + smaller dst exits without hang"  test_block_count_overshoot_smaller_dst_no_hang
 run "exit 2 when neither side is HOST:path"          test_exit2_when_no_host
 run "friendly error when local file is missing"      test_friendly_error_for_missing_local
+run "reject unknown / zero-digest -a algorithm"      test_reject_bad_algorithm
 run "format_size + parse_size unit tests"            test_format_size_unit_tests
 
 echo

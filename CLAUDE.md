@@ -8,7 +8,7 @@ This repository is a **fork** of the original bscp
 (<https://github.com/bscp-tool/bscp>, by Volker Diels-Grabsch —
 <https://github.com/vog/bscp>), which inspired and forms the basis of this
 version.  Original copyright notices are retained (ISC-style license, see the
-header of `bscp`).  Fork URL: `https://github.com/<your-account>/bscp` (TBD).
+header of `bscp`).  Fork URL: `https://github.com/groenewe/bscp`.
 
 The whole client lives in one file: `bscp`.  There are no external
 dependencies beyond the Python 3 stdlib and an installed `ssh` binary.
@@ -311,6 +311,7 @@ to cover, plus a few that were easy to forget:
 | `-B` overshoot prints warning, exits 0           | calculated size > actual source warns, syncs rest |
 | exit 2 when neither side is HOST:path            | argparse path                                     |
 | friendly error when local file is missing        | OSError → `Error: Cannot open local file ...`     |
+| reject unknown / zero-digest `-a` algorithm      | `parse_algorithm` guard: exit 2, names the algo   |
 | `format_size` + `parse_size` unit tests          | display 4-digit cap rule + lossless round-trip    |
 | ------------------------------------------------ | ------------------------------------------------- |
 

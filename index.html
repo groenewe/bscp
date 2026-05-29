@@ -45,7 +45,7 @@
       See <a href="#credits">Credits</a> below.
     </p>
     <h2>Download</h2>
-    <pre>git clone https://github.com/&lt;your-account&gt;/bscp</pre>
+    <pre>git clone https://github.com/groenewe/bscp</pre>
     <h2>Usage</h2>
     <pre>bscp [options] SRC DST</pre>
     <p>
@@ -60,7 +60,7 @@ pull:  bscp HOST:remote_file  local_file</pre>
       Blocks are 64&nbsp;KiB and hashed with SHA-256 by default.
       For the full list of options — block size, hash algorithm, resume,
       retries, dry-run, multi-threaded hashing and more — see the
-      <a href="https://github.com/&lt;your-account&gt;/bscp">README</a>.
+      <a href="https://github.com/groenewe/bscp">README</a>.
     </p>
     <h2>Comparison</h2>
     <p>
@@ -89,6 +89,14 @@ pull:  bscp HOST:remote_file  local_file</pre>
         so it is more suitable to
         network connections with bad latency.
       </li>
+      <li>
+        SSH compression (<code>-C</code>) can be enabled to shrink the
+        block data on the wire. On a bandwidth-limited WAN link this often
+        speeds the transfer up considerably; on a fast LAN it usually
+        <em>slows</em> things down, as the CPU cost of compression outweighs
+        the bandwidth saved — so enable it for remote/WAN copies and leave it
+        off on local-network transfers.
+      </li>
     </ul>
     <h2>Portability</h2>
     <ul>
@@ -97,18 +105,18 @@ pull:  bscp HOST:remote_file  local_file</pre>
         <code>python3</code>, <code>python2</code>/<code>python</code> or Perl,
         so it works on ancient appliances and minimal images as well as modern
         hosts.
-        (<a href="https://github.com/&lt;your-account&gt;/bscp/blob/main/docs/remote-execution.md">details</a>)
+        (<a href="https://github.com/groenewe/bscp/blob/main/docs/remote-execution.md">details</a>)
       </li>
       <li>
         <code>bscp</code> can be compiled with Nuitka into a single
         self-contained executable that embeds the interpreter, so the client
         host needs no Python at all.
-        (<a href="https://github.com/&lt;your-account&gt;/bscp/blob/main/docs/nuitka.md">details</a>)
+        (<a href="https://github.com/groenewe/bscp/blob/main/docs/nuitka.md">details</a>)
       </li>
       <li>
         <code>bscp.python2</code> is a parallel client that runs under
         Python 2.7 or 3.x, for legacy local hosts without Python 3.
-        (<a href="https://github.com/&lt;your-account&gt;/bscp/blob/main/docs/python2-client.md">details</a>)
+        (<a href="https://github.com/groenewe/bscp/blob/main/docs/python2-client.md">details</a>)
       </li>
     </ul>
     <h2>Use cases</h2>
@@ -121,7 +129,12 @@ pull:  bscp HOST:remote_file  local_file</pre>
       The first run images the whole disk; every later run copies only the
       blocks that changed.
     </p>
-    <pre>bscp root@server:/dev/sda /mnt/backup/server-sda.img</pre>
+    <pre>bscp -C root@server:/dev/sda /mnt/backup/server-sda.img</pre>
+    <p>
+      <code>-C</code> turns on SSH compression — worthwhile over a WAN link
+      like this, where bandwidth is the bottleneck; drop it for fast
+      local-network copies.
+    </p>
     <p>
       To image a live root device consistently, boot the remote host with a
       read-only root using
@@ -161,11 +174,11 @@ pull:  bscp HOST:remote_file  local_file</pre>
     <ul>
       <li>Canonical project (latest master): <a href="https://github.com/bscp-tool/bscp">github.com/bscp-tool/bscp</a></li>
       <li>Original author's repository: <a href="https://github.com/vog/bscp">github.com/vog/bscp</a></li>
-      <li>This fork: <code>https://github.com/&lt;your-account&gt;/bscp</code> (TBD)</li>
+      <li>This fork: <code>https://github.com/groenewe/bscp</code></li>
     </ul>
     <h2>Contact</h2>
     <ul>
-      <li><a href="https://github.com/&lt;your-account&gt;/bscp/issues">Bscp issue tracker (this fork)</a></li>
+      <li><a href="https://github.com/groenewe/bscp/issues">Bscp issue tracker (this fork)</a></li>
     </ul>
     <h2>See also</h2>
     <ul>

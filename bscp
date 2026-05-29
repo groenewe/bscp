@@ -5,7 +5,7 @@
 # This is a fork.  It builds on, and is inspired by, the original bscp:
 #   https://github.com/bscp-tool/bscp   (canonical project, latest master)
 #   https://github.com/vog/bscp         (original author, Volker Diels-Grabsch)
-# Fork: https://github.com/<your-account>/bscp
+# Fork: https://github.com/groenewe/bscp
 #
 # Permission to use, copy, modify, and/or distribute this software for any
 # purpose with or without fee is hereby granted, provided that the above
@@ -32,7 +32,7 @@
 #
 # Changes from branch main-HG onward were made mostly by Claude (Anthropic).
 
-from argparse import ArgumentParser
+from argparse import ArgumentParser, ArgumentTypeError
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
@@ -76,6 +76,46 @@ HASH_THREADS_CAP     = 4
 
 def resolve_hash_threads(n):
     return n if n and n > 0 else min(os.cpu_count() or 1, HASH_THREADS_CAP)
+
+# Hash algorithms guaranteed on every remote variant: python3, python2, and
+# the Perl fallback (Digest::MD5 + Digest::SHA).  hashlib offers more
+# locally, but only these are portable to all three remotes.
+PORTABLE_ALGOS = ('md5', 'sha1', 'sha224', 'sha256', 'sha384', 'sha512')
+
+
+def algorithm_help():
+    # Local-only extras: anything hashlib can do here that is not in the
+    # portable set.  Drop uppercase aliases (e.g. 'SHA256') for a clean list,
+    # and skip XOF/variable-length functions (shake_*, digest_size 0) — they
+    # have no fixed digest and would break the wire protocol.
+    portable = set(PORTABLE_ALGOS)
+    extra = sorted(a for a in hashlib.algorithms_available
+                   if a.lower() not in portable and a == a.lower()
+                   and hashlib.new(a).digest_size > 0)
+    h = ('hash algorithm (default sha256). Portable to all remotes: %s.'
+         % ', '.join(PORTABLE_ALGOS))
+    if extra:
+        h += (' Also usable locally: %s — these need the remote to be '
+              'python3/python2 with the same algorithm; the Perl remote '
+              'supports only the portable set.' % ', '.join(extra))
+    return h
+
+
+def parse_algorithm(name):
+    # Reject anything the local hashlib cannot build, and XOF/variable-length
+    # functions (shake_*, digest_size 0) — the wire protocol assumes a fixed
+    # digest size per block.  Remote availability still varies (Perl supports
+    # only PORTABLE_ALGOS); that surfaces as a remote handshake error.
+    try:
+        if hashlib.new(name).digest_size <= 0:
+            raise ArgumentTypeError(
+                "hash algorithm %r has no fixed digest size and cannot be "
+                "used (variable-length/XOF functions are unsupported)" % name)
+    except ArgumentTypeError:
+        raise
+    except (ValueError, TypeError):
+        raise ArgumentTypeError("unknown hash algorithm %r" % name)
+    return name
 
 REPORT_INTERVAL = 0.5 # status line should update after this many seconds have passed
 last_report_len = 0   # last progress or error length message on screen, if any; used by report()
@@ -1297,64 +1337,76 @@ if __name__ == '__main__':
         usage='%(prog)s [options] SRC DST\n'
               '  push:  bscp [options] local_file   HOST:remote_file\n'
               '  pull:  bscp [options] HOST:remote_file   local_file')
-    parser.add_argument('-b', '--block-size',   default=DEFAULT_BLOCK,
+    transfer = parser.add_argument_group('transfer tuning')
+    transfer.add_argument('-b', '--block-size',   default=DEFAULT_BLOCK,
                         type=parse_size, metavar='SIZE',
                         help='block size (default 64K; supports K/M/G/T suffix)')
-    parser.add_argument('-s', '--section-size', default=DEFAULT_SECTION,
+    transfer.add_argument('-s', '--section-size', default=DEFAULT_SECTION,
                         type=parse_size, metavar='SIZE',
                         help='section size (default 10G; bounds memory use per pass)')
-    parser.add_argument('-a', '--algorithm',    default='sha256',
-                        metavar='ALGO',
-                        help='hash algorithm (default sha256)')
-    parser.add_argument('-r', '--resume-from',  default=0,
+    transfer.add_argument('-a', '--algorithm',    default='sha256',
+                        type=parse_algorithm, metavar='ALGO',
+                        help=algorithm_help())
+    transfer.add_argument('-B', '--block-count',      default=0, type=parse_block_count, metavar='N',
+                        help='limit sync to first N blocks (default 0 = no limit). '
+                             'A K/M/G/T suffix interprets the value as bytes, '
+                             'rounded up to a whole number of blocks.')
+
+    perf = parser.add_argument_group('performance')
+    perf.add_argument('--hash-threads',         default=DEFAULT_HASH_THREADS, type=int, metavar='N',
+                        help='number of threads used to hash blocks during the scan phase, on '
+                             'both client and remote (default 0 = auto: min(CPU cores, %d)). '
+                             'Speeds up the scan when hashing is CPU-bound (fast NVMe/local). '
+                             'Each side picks its own count; the python2 and Perl remotes always '
+                             'run single-threaded.' % HASH_THREADS_CAP)
+    perf.add_argument('--buffer',                     action='store_true',
+                        help='push: buffer differing blocks in memory during '
+                             'transfer instead of re-reading them from disk. '
+                             'Higher memory use, but only one disk read pass needed. Experimental.')
+
+    ssh = parser.add_argument_group('SSH connection')
+    ssh.add_argument('-p', '--port',            default=22, type=int, metavar='PORT',
+                        help='SSH port (default 22)')
+    ssh.add_argument('-i', '--identity',        metavar='FILE',
+                        help='SSH identity file (-i FILE)')
+    ssh.add_argument('-o', '--ssh-opt',         action='append', metavar='OPT',
+                        help='extra SSH option, repeatable (passed as -o OPT)')
+    ssh.add_argument('-C', '--compress',        action='store_true',
+                        help='enable SSH compression')
+
+    resilience = parser.add_argument_group('resilience and resume')
+    resilience.add_argument('-r', '--resume-from',  default=0,
                         type=parse_resume_from, metavar='OFFSET',
                         help='resume from byte offset (K/M/G/T suffix accepted), '
                              'or NN[.N]%% of the local file size; rounded down '
                              'to section boundary')
-    parser.add_argument('--retries',            default=DEFAULT_RETRIES, type=int, metavar='N',
+    resilience.add_argument('--retries',        default=DEFAULT_RETRIES, type=int, metavar='N',
                         help='auto-retry attempts on connection failure (default %d; 0 disables)' % DEFAULT_RETRIES)
-    parser.add_argument('--io-timeout',         default=DEFAULT_IO_TIMEOUT, type=float, metavar='SECS',
+    resilience.add_argument('--io-timeout',     default=DEFAULT_IO_TIMEOUT, type=float, metavar='SECS',
                         help='abort the transfer (engaging --retries) if no SSH-pipe I/O progress is observed '
                              'for SECS seconds. Catches stuck remote processes or hung disks while TCP itself '
                              'is still alive. Default %g = disabled, relying on the SSH ServerAliveInterval '
                              'keepalive (~60s to detect a dropped connection).' % DEFAULT_IO_TIMEOUT)
-    parser.add_argument('-i', '--identity',     metavar='FILE',
-                        help='SSH identity file (-i FILE)')
-    parser.add_argument('-o', '--ssh-opt',      action='append', metavar='OPT',
-                        help='extra SSH option, repeatable (passed as -o OPT)')
-    parser.add_argument('-C', '--compress',     action='store_true',
-                        help='enable SSH compression')
-    parser.add_argument('-N', '--dry-run',      action='store_true',
+
+    safety = parser.add_argument_group('safety')
+    safety.add_argument('-N', '--dry-run',      action='store_true',
                         help='count differences only; do not update destination')
-    parser.add_argument('-B', '--block-count',        default=0, type=parse_block_count, metavar='N',
-                        help='limit sync to first N blocks (default 0 = no limit). '
-                             'A K/M/G/T suffix interprets the value as bytes, '
-                             'rounded up to a whole number of blocks.')
-    parser.add_argument('--allow-truncate',           action='store_true',
+    safety.add_argument('--allow-truncate',           action='store_true',
                         help='allow destination to be smaller than source; '
                              'syncs only the bytes that fit. '
                              'WARNING: data beyond destination size is not copied.')
-    parser.add_argument('--buffer',                   action='store_true',
-                        help='push: buffer differing blocks in memory during '
-                             'transfer instead of re-reading them from disk. '
-                             'Higher memory use, but only one disk read pass needed. Experimental.')
-    parser.add_argument('-q', '--quiet',              action='store_true',
+
+    output = parser.add_argument_group('output')
+    output.add_argument('-q', '--quiet',              action='store_true',
                         help='suppress scan/copy progress lines; errors and warnings are still shown')
-    parser.add_argument('--batch',                    action='store_true',
+    output.add_argument('--batch',                    action='store_true',
                         help='suppress all stderr output; use exit status to detect errors (implies -q). '
                              'Exit 0=success, 1=fatal error, 2=bad arguments, '
                              '3=connection lost (resume with --resume-from), 130=interrupted. '
                              'Note: the exit code cannot convey the resume offset; '
                              'callers that need to resume should use -q instead and '
                              'parse the "Resume with:" line from stderr.')
-    parser.add_argument('--hash-threads',       default=DEFAULT_HASH_THREADS, type=int, metavar='N',
-                        help='number of threads used to hash blocks during the scan phase, on '
-                             'both client and remote (default 0 = auto: min(CPU cores, %d)). '
-                             'Speeds up the scan when hashing is CPU-bound (fast NVMe/local). '
-                             'Each side picks its own count; the python2 and Perl remotes always '
-                             'run single-threaded.' % HASH_THREADS_CAP)
-    parser.add_argument('-p', '--port',         default=22, type=int, metavar='PORT',
-                        help='SSH port (default 22)')
+
     parser.add_argument('src', help='source — local path or HOST:path')
     parser.add_argument('dst', help='destination — HOST:path or local path')
 
