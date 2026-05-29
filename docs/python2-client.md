@@ -61,24 +61,25 @@ and the Perl remote fallback — is identical to `bscp`.
 
 **Py2/3 compatibility shims** (all confined to `bscp.python2`):
 
-| ----------------------------------------------------------- | ---------------------------------------------------------------------- |
-| Shim                                                        | Why                                                                    |
-| ----------------------------------------------------------- | ---------------------------------------------------------------------- |
-| `#!/usr/bin/env python`                                     | Resolves to whichever `python` is on `PATH` (2 or 3).                  |
-| `# -*- coding: utf-8 -*-`                                   | Source contains em-dashes / box-drawing chars in strings and comments. |
-| `from __future__ import division`                           | `/` returns float on Py2 (matches Py3 semantics throughout the file).  |
-| `import binascii` + `hexlify(...).decode('ascii')`          | `bytes.hex()` is Py3.5+; used for both the Perl and `remote_script_mt` hex payloads. |
-| `try: from shlex import quote ...                           | `shlex.quote` is Py3.3+; Py2's `pipes.quote` is the same function.     |
-|  except ImportError: from pipes import quote as _shquote`   |                                                                        |
-| `_PIPE_ERRORS` tuple defined via try/except `NameError`     | `BrokenPipeError` / `ConnectionResetError` are Py3.3+.                 |
-| `super(ConnectionLost, self).__init__(...)`                 | Py2 requires the explicit class+instance form.                         |
-| `except (IOError, OSError) as e` on `open()`                | Py2 raises `IOError`; Py3 aliases it to `OSError`.                     |
-| Single-element list-cell shims (`var[0]`) inside closures   | Py2 has no `nonlocal`.  Used for `t_last_progress`,                    |
-|                                                             | `eta_displayed`, `eta_displayed_at`, `ema_scan_rate`, `ema_copy_rate`, |
-|                                                             | `rate_prev_scan_secs`, `rate_prev_scanned`, `rate_prev_copy_secs`,     |
-|                                                             | `rate_prev_written` — every variable mutated by a closure.             |
-| `raise ConnectionLost(...)` without `from exc`              | `raise X from Y` is Py3-only; cause chain is dropped on Py2.           |
-| ----------------------------------------------------------- | ---------------------------------------------------------------------- |
+| --------------------------------------------------------- | ---------------------------------------------------------------------- |
+| Shim                                                      | Why                                                                    |
+| --------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `#!/usr/bin/env python`                                   | Resolves to whichever `python` is on `PATH` (2 or 3).                  |
+| `# -*- coding: utf-8 -*-`                                 | Source contains em-dashes / box-drawing chars in strings and comments. |
+| `from __future__ import division`                         | `/` returns float on Py2 (matches Py3 semantics throughout the file).  |
+| `import binascii` + `hexlify(...).decode('ascii')`        | `bytes.hex()` is Py3.5+; used for both the                             |
+|                                                           |  Perl and `remote_script_mt` hex payloads.                             |
+| `try: from shlex import quote ...                         | `shlex.quote` is Py3.3+; Py2's `pipes.quote` is the same function.     |
+|  except ImportError: from pipes import quote as _shquote` |                                                                        |
+| `_PIPE_ERRORS` tuple defined via try/except `NameError`   | `BrokenPipeError` / `ConnectionResetError` are Py3.3+.                 |
+| `super(ConnectionLost, self).__init__(...)`               | Py2 requires the explicit class+instance form.                         |
+| `except (IOError, OSError) as e` on `open()`              | Py2 raises `IOError`; Py3 aliases it to `OSError`.                     |
+| Single-element list-cell shims (`var[0]`) inside closures | Py2 has no `nonlocal`.  Used for `t_last_progress`,                    |
+|                                                           | `eta_displayed`, `eta_displayed_at`, `ema_scan_rate`, `ema_copy_rate`, |
+|                                                           | `rate_prev_scan_secs`, `rate_prev_scanned`, `rate_prev_copy_secs`,     |
+|                                                           | `rate_prev_written` — every variable mutated by a closure.             |
+| `raise ConnectionLost(...)` without `from exc`            | `raise X from Y` is Py3-only; cause chain is dropped on Py2.           |
+| --------------------------------------------------------- | ---------------------------------------------------------------------- |
 
 When updating `bscp.python2`, the procedure is `cp bscp bscp.python2`
 followed by re-applying the shims above (the diff is mechanical and the
