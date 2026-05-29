@@ -337,8 +337,9 @@ def _remote(nthreads):
 '''
 
 # Perl fallback for hosts that have no Python.  Functionally identical to
-# remote_script above; see CLAUDE.md ("Remote script constraints") for why
-# this exists as a hex-pack-eval payload rather than an inline -c argument.
+# remote_script above; see docs/remote-execution.md ("Remote script
+# constraints") for why this exists as a hex-pack-eval payload rather than
+# an inline -c argument.
 remote_perl = '''
 use strict; use warnings;
 binmode STDIN; binmode STDOUT;
