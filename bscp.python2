@@ -30,7 +30,8 @@
 # (byte offset or percentage of source), automatic retry with exponential
 # back-off, and dry-run mode.
 #
-# Changes from branch main-HG onward were made mostly by Claude (Anthropic).
+# Changes in this fork were made with extensive help of Claude Code, Sonnet
+# and Opus models (Anthropic).
 
 from __future__ import division
 
