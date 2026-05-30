@@ -66,29 +66,20 @@ prefix that fits.
 | ----------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------- |
 | `-b SIZE` / `--block-size`    | `64K`    | Comparison/transfer granularity. Supports `K`/`M`/`G` suffixes.                                                  |
 | `-s SIZE` / `--section-size`  | `10G`    | File is processed in sections of this size. Bounds peak memory to roughly `diff_blocks_per_section × blocksize`. |
-| `-a ALGO` / `--algorithm`     | `sha256` | Hash algorithm. `md5`, `sha1`, `sha224`, `sha256`, `sha384`, `sha512` work on every remote (python3/python2/     |
-|                               |          | Perl). Other `hashlib` algorithms (`sha3_256`, `blake2b`, …) need a python3/python2 remote with that algorithm;  |
-|                               |          | the Perl remote supports only the six portable ones. `bscp -h` lists the full set available on the local host.   |
+| `-a ALGO` / `--algorithm`     | `sha256` | Hash algorithm. `md5`, `sha1`, `sha224`, `sha256`, `sha384`, `sha512` work on every remote (python3/python2/Perl). Other `hashlib` algorithms (`sha3_256`, `blake2b`, …) need a python3/python2 remote with that algorithm; the Perl remote supports only the six portable ones. `bscp -h` lists the full set available on the local host. |
 | `-r OFFSET` / `--resume-from` | `0`      | Skip ahead to this byte offset, or to `NN%` / `NN.N%` of the local file (rounded down to a section boundary).    |
 | `-R N` / `--retries`          | `3`      | Automatically retry on connection failure, up to N times, with exponential back-off (`0` disables).              |
-| `--io-timeout SECS`           | `0`      | Abort (engaging `--retries`) if no SSH-pipe I/O progress for SECS seconds. Catches stuck remote process or       |
-|                               |          | hung disk while TCP is still alive. `0` disables, falling back to the SSH keepalive (~60s).                      |
+| `--io-timeout SECS`           | `0`      | Abort (engaging `--retries`) if no SSH-pipe I/O progress for SECS seconds. Catches stuck remote process or | hung disk while TCP is still alive. `0` disables, falling back to the SSH keepalive (~60s). |
 | `-i FILE` / `--identity`      |          | SSH identity file (`-i FILE`).                                                                                   |
 | `-o OPT` / `--ssh-opt`        |          | Extra SSH option, repeatable (passed as `-o OPT`). Takes precedence over the defaults below.                     |
-| `-C` / `--compress`           |          | Enable SSH compression. Often a big win over a bandwidth-limited WAN link; usually a slowdown on a fast LAN      |
-|                               |          | (compression CPU cost outweighs the bandwidth saved). Enable for remote/WAN copies, leave off on local ones.     |
+| `-C` / `--compress`           |          | Enable SSH compression. Often a big win over a bandwidth-limited WAN link; usually a slowdown on a fast LAN (compression CPU cost outweighs the bandwidth saved). Enable for remote/WAN copies, leave off on local ones. |
 | `-N` / `--dry-run`            |          | Count differing blocks and their total size in bytes only; do not update destination.                            |
-| `-B N` / `--block-count`      | `0`      | Limit sync to the first N blocks (0 = no limit). A `K`/`M`/`G`/`T` suffix interprets the value as bytes,         |
-|                               |          | rounded up to whole blocks (e.g. `-B 4M`). A warning is printed if the limit exceeds the source size.            |
-| `--allow-truncate`            |          | Allow the destination to be smaller than the source (or, with `-B`, smaller than the requested limit);           |
-|                               |          | only the bytes that fit are copied.                                                                              |
-| `--buffer`                    |          | Push: buffer differing blocks in memory during phase B instead of re-reading them from disk.                     |
-|                               |          | Higher memory use, fewer disk reads. Experimental. Auto-disabled if available memory is too low.                 |
-| `-T N` / `--hash-threads`     | `0`      | Threads used to hash blocks during the scan phase, on both client and remote (`0` = auto: `min(cores, 4)`).      |
-|                               |          | Speeds up scanning when hashing is CPU-bound (fast NVMe/local). python2 and Perl remotes stay single-threaded.   |
+| `-B N` / `--block-count`      | `0`      | Limit sync to the first N blocks (0 = no limit). A `K`/`M`/`G`/`T` suffix interprets the value as bytes, rounded up to whole blocks (e.g. `-B 4M`). A warning is printed if the limit exceeds the source size. |
+| `--allow-truncate`            |          | Allow the destination to be smaller than the source (or, with `-B`, smaller than the requested limit); only the bytes that fit are copied. |
+| `--buffer`                    |          | Push: buffer differing blocks in memory during phase B instead of re-reading them from disk. | Higher memory use, fewer disk reads. Experimental. Auto-disabled if available memory is too low. |
+| `-T N` / `--hash-threads`     | `0`      | Threads used to hash blocks during the scan phase, on both client and remote (`0` = auto: `min(cores, 4)`). | Speeds up scanning when hashing is CPU-bound (fast NVMe/local). python2 and Perl remotes stay single-threaded. |
 | `-q` / `--quiet`              |          | Suppress scan/copy progress lines. Errors and warnings are still shown.                                          |
-| `--batch`                     |          | Suppress all stderr output; use the exit status to detect errors (implies `-q`).                                 |
-|                               |          | Cannot convey a resume offset — use `-q` instead if a caller needs to parse the "Resume with:" stderr line.      |
+| `--batch`                     |          | Suppress all stderr output; use the exit status to detect errors (implies `-q`). | Cannot convey a resume offset — use `-q` instead if a caller needs to parse the "Resume with:" stderr line. |
 | `-p PORT` / `--port`          | `22`     | SSH port.                                                                                                        |
 
 ### Examples
