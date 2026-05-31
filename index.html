@@ -129,7 +129,7 @@ pull:  bscp HOST:remote_file  local_file</pre>
       The first run images the whole disk; every later run copies only the
       blocks that changed.
     </p>
-    <pre>bscp -C root@server:/dev/sda /mnt/backup/server-sda.img</pre>
+    <pre>bscp -C root@server:/dev/vda /mnt/backup/server-vda.img</pre>
     <p>
       <code>-C</code> turns on SSH compression — worthwhile over a WAN link
       like this, where bandwidth is the bottleneck; drop it for fast

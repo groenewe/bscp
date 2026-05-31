@@ -1256,7 +1256,8 @@ if __name__ == '__main__':
     transfer = parser.add_argument_group('transfer tuning')
     transfer.add_argument('-b', '--block-size',   default=DEFAULT_BLOCK,
                         type=parse_size, metavar='SIZE',
-                        help='block size (default 64K; supports K/M/G/T suffix)')
+                        help='block size (default 64K; supports K/M/G/T suffix. Increasing block '
+                             'size, e.g. to 256K, might be beneficial to throughput on fast devices.)')
     transfer.add_argument('-s', '--section-size', default=DEFAULT_SECTION,
                         type=parse_size, metavar='SIZE',
                         help='section size (default 10G; bounds memory use per pass)')
