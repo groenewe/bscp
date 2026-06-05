@@ -338,6 +338,17 @@ test_reject_bad_algorithm() {
     (( rc == 2 )) && grep -q "no fixed digest size" <<<"$out"
 }
 
+test_conn_failure_retries_exit3() {
+    # An unreachable host (RFC5737 TEST-NET-1, never routable) must engage the
+    # --retries loop and exit 3, NOT fail hard with exit 1.  Regression for the
+    # handshake-stage bug where ssh "no route to host" raised a plain
+    # RuntimeError ("Remote script failed to execute") that bypassed retries.
+    local out rc
+    out=$("$BSCP" -R 1 -o ConnectTimeout=1 -o BatchMode=yes \
+                  "192.0.2.1:/dev/null" "$DST" 2>&1); rc=$?
+    (( rc == 3 )) && grep -q 'retrying (1/1)' <<<"$out"
+}
+
 test_format_size_unit_tests() {
     # The unit tests `import` the helpers as a module, so we need Python source.
     # When $BSCP points at a Nuitka binary, fall back to the checked-in source.
@@ -418,6 +429,7 @@ run "-B overshoot + smaller dst exits without hang"  test_block_count_overshoot_
 run "exit 2 when neither side is HOST:path"          test_exit2_when_no_host
 run "friendly error when local file is missing"      test_friendly_error_for_missing_local
 run "reject unknown / zero-digest -a algorithm"      test_reject_bad_algorithm
+run "connection failure engages retries, exits 3"    test_conn_failure_retries_exit3
 run "format_size + parse_size unit tests"            test_format_size_unit_tests
 
 echo

@@ -307,6 +307,7 @@ to cover, plus a few that were easy to forget:
 | exit 2 when neither side is HOST:path            | argparse path                                     |
 | friendly error when local file is missing        | OSError → `Error: Cannot open local file ...`     |
 | reject unknown / zero-digest `-a` algorithm      | `parse_algorithm` guard: exit 2, names the algo   |
+| connection failure engages retries, exits 3 | handshake-stage conn loss → `ConnectionLost`, not fatal exit 1 |
 | `format_size` + `parse_size` unit tests          | display 4-digit cap rule + lossless round-trip    |
 
 Prerequisites: `python3` on PATH, and passwordless `ssh localhost`.  Run:

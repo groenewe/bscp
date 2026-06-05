@@ -853,11 +853,6 @@ def do_sync(local_file, remote_host, remote_file, mode,
         # so set the wire-side ALLOW_TRUNCATE bit whenever -B caps wire_size.
         wire_truncate = allow_truncate or block_count > 0
         mode_byte = mode | (ALLOW_TRUNCATE if wire_truncate else 0)
-        io.write(struct.pack(HEADER_FMT,
-                             wire_size, blocksize, section_size, start_offset,
-                             len(fn_bytes), len(hn_bytes), mode_byte))
-        io.write(fn_bytes)
-        io.write(hn_bytes)
 
         def fail(msg):
             # Closing stdout too unblocks the remote if it is mid-stream on
@@ -867,14 +862,39 @@ def do_sync(local_file, remote_host, remote_file, mode,
             _shutdown_proc(proc)
             raise RuntimeError(msg)
 
-        if io.read(dig_size) != hashlib.new(hashname, fn_bytes).digest():
-            fail('Remote script failed to execute')
-        io.write(b'go')
+        def lost(msg):
+            # Handshake-stage connection failure: the SSH pipe never produced a
+            # valid reply (no route to host, dropped link, dead peer).  Unlike
+            # fail(), raise ConnectionLost so the --retries loop re-establishes
+            # the connection — a transient outage between attempts (the link was
+            # up on a prior attempt) must not be mistaken for a permanent error.
+            # Exception: rc 127 is our SSH wrapper's "no python or perl found on
+            # remote", a genuinely fatal config error that retrying cannot fix.
+            _shutdown_proc(proc)
+            if proc.returncode == 127:
+                raise RuntimeError(msg)
+            raise ConnectionLost(start_offset)
 
-        size_bytes = io.read(8)
-        if len(size_bytes) < 8:
-            fail('Remote closed connection during handshake (got %d of 8 size bytes)'
-                 % len(size_bytes))
+        try:
+            io.write(struct.pack(HEADER_FMT,
+                                 wire_size, blocksize, section_size, start_offset,
+                                 len(fn_bytes), len(hn_bytes), mode_byte))
+            io.write(fn_bytes)
+            io.write(hn_bytes)
+
+            if io.read(dig_size) != hashlib.new(hashname, fn_bytes).digest():
+                lost('Remote script failed to execute')
+            io.write(b'go')
+
+            size_bytes = io.read(8)
+            if len(size_bytes) < 8:
+                lost('Remote closed connection during handshake (got %d of 8 size bytes)'
+                     % len(size_bytes))
+        except (BrokenPipeError, ConnectionResetError, IOTimeout):
+            # A pipe error while still shipping the header is the same transient
+            # connection loss, just surfaced on the write side; route it through
+            # the same retry path.
+            lost('Connection lost during handshake')
         (remote_size,) = struct.unpack('<Q', size_bytes)
         if remote_size == 0:
             fail('Remote file not found or inaccessible')
@@ -1499,7 +1519,7 @@ if __name__ == '__main__':
             except ConnectionLost as exc:
                 if attempt < args.retries and not exc.interrupted:
                     delay = min(2 ** attempt, 60)
-                    report('\nConnection lost — retrying (%d/%d) in %ds...\n'
+                    report('\rConnection lost — retrying (%d/%d) in %ds...\n'
                             'Resume manually with:\n  %s\n' % (
                             attempt + 1, args.retries, delay,
                             resume_cmd(exc.offset)))
