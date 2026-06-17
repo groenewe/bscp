@@ -20,7 +20,10 @@ exercises it implicitly when run against `bscp.python2`, but that is
 opt-in via `BSCP=./bscp.python2 ./tests.sh`.
 
 **Feature parity vs. `bscp`.**  `bscp.python2` carries the full feature
-set with two deliberate exceptions:
+set with two deliberate exceptions.  Note that of the resilience-group
+flags only `--io-timeout` is dropped — `--retries` and `--bwlimit` are both
+present (`--bwlimit`'s combined-direction token bucket is plain arithmetic
+that ports cleanly to Python 2):
 
 - `--io-timeout` is dropped.  Its raw-fd `os.read` / `os.write` path
   driven by `select.select()` works cleanly in Python 3 with

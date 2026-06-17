@@ -517,15 +517,38 @@ class IOCounter:
     subprocess (set by the caller when timeout > 0) is what keeps raw fd
     reads from racing with a stale Python read-ahead buffer."""
 
-    def __init__(self, in_stream, out_stream, timeout=0):
+    def __init__(self, in_stream, out_stream, timeout=0, bwlimit=0):
         self.in_stream  = in_stream
         self.out_stream = out_stream
         self.in_total   = 0
         self.out_total  = 0
         self.timeout    = timeout
+        # Combined-direction token bucket: in + out share one rate so the
+        # cap matches the single SSH connection's actual link usage.  0 =
+        # unlimited.  _bw_allow starts full so the first read/write is free.
+        self.bwlimit    = bwlimit
+        self._bw_allow  = float(bwlimit)
+        self._bw_last   = time()
         if timeout > 0:
             self._in_fd  = in_stream.fileno()
             self._out_fd = out_stream.fileno()
+
+    def _throttle(self, nbytes):
+        if not self.bwlimit:
+            return
+        now = time()
+        # Refill, then cap the burst budget at one second's worth so an idle
+        # gap (e.g. a slow phase-A scan) cannot bank credit for a later flood.
+        self._bw_allow = min(self._bw_allow + (now - self._bw_last) * self.bwlimit,
+                             float(self.bwlimit))
+        self._bw_last  = now
+        self._bw_allow -= nbytes
+        # Leave a negative balance negative: the next call's refill is sized
+        # by the elapsed sleep and repays exactly this deficit.  Zeroing it
+        # here would double-credit (refill PLUS a fresh zero) and let the rate
+        # run ~2x over the cap.
+        if self._bw_allow < 0:
+            sleep(-self._bw_allow / self.bwlimit)
 
     def read(self, n):
         if self.timeout > 0:
@@ -533,6 +556,7 @@ class IOCounter:
         else:
             data = self.in_stream.read(n)
         self.in_total += len(data)
+        self._throttle(len(data))
         return data
 
     def _read_raw(self, n):
@@ -554,6 +578,7 @@ class IOCounter:
             self.out_stream.write(data)
             self.out_stream.flush()
         self.out_total += len(data)
+        self._throttle(len(data))
 
     def _write_raw(self, data):
         mv = memoryview(data)
@@ -716,6 +741,8 @@ def build_resume_cmd(argv0, args, src, dst, offset, block_count=None):
         parts += ['--retries', str(args.retries)]
     if args.io_timeout != DEFAULT_IO_TIMEOUT:
         parts += ['--io-timeout', str(args.io_timeout)]
+    if args.bwlimit:
+        parts += ['--bwlimit', format_size(args.bwlimit)]
     if args.hash_threads != DEFAULT_HASH_THREADS:
         parts += ['--hash-threads', str(args.hash_threads)]
     if args.identity:
@@ -809,7 +836,7 @@ def build_ssh_cmd(remote_host, args):
 def do_sync(local_file, remote_host, remote_file, mode,
             blocksize, section_size, hashname,
             start_offset=0, dry_run=False, block_count=0, allow_truncate=False, buffer=False,
-            io_timeout=0, hash_threads=0, ssh_args=None):
+            io_timeout=0, bwlimit=0, hash_threads=0, ssh_args=None):
 
     ssh_args = ssh_args or {}
     fn_bytes = remote_file.encode('utf-8')
@@ -844,7 +871,7 @@ def do_sync(local_file, remote_host, remote_file, mode,
         # original buffered I/O for performance parity.
         popen_bufsize = 0 if io_timeout > 0 else -1
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=popen_bufsize)
-        io   = IOCounter(proc.stdout, proc.stdin, timeout=io_timeout)
+        io   = IOCounter(proc.stdout, proc.stdin, timeout=io_timeout, bwlimit=bwlimit)
 
         # The remote runs its own size-mismatch check on the wire-side `size`,
         # which is wire_size (the -B-capped local size) — so when -B is in use
@@ -1411,6 +1438,9 @@ if __name__ == '__main__':
                              'for SECS seconds. Catches stuck remote processes or hung disks while TCP itself '
                              'is still alive. Default %g = disabled, relying on the SSH ServerAliveInterval '
                              'keepalive (~60s to detect a dropped connection).' % DEFAULT_IO_TIMEOUT)
+    resilience.add_argument('--bwlimit',        default=0, type=parse_size, metavar='RATE',
+                        help='limit network I/O to RATE bytes per second (K/M/G/T suffix accepted); '
+                             'governs both directions combined. Default 0 = unlimited.')
 
     safety = parser.add_argument_group('safety')
     safety.add_argument('-N', '--dry-run',      action='store_true',
@@ -1514,6 +1544,7 @@ if __name__ == '__main__':
                     start_offset=start_offset, dry_run=dry_run,
                     block_count=args.block_count, allow_truncate=args.allow_truncate,
                     buffer=buffer, io_timeout=args.io_timeout,
+                    bwlimit=args.bwlimit,
                     hash_threads=args.hash_threads, ssh_args=ssh_args)
                 break
             except ConnectionLost as exc:

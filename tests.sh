@@ -192,6 +192,21 @@ test_buffer_push() {
         && cmp -s "$SRC" "$DST"
 }
 
+test_bwlimit_push() {
+    # 8 MiB of all-different blocks at 2 MiB/s should take ~3s (8 MiB minus a
+    # 1s = 2 MiB burst budget, all over 2 MiB/s).  Unthrottled this transfer
+    # finishes well under 1s, so a >= 2s floor proves the throttle engaged
+    # without being so tight it flakes under load.  Correctness still checked.
+    make_src 8
+    make_blank "$DST" 8          # random dst => every block differs
+    local start elapsed
+    start=$SECONDS
+    "$BSCP" -s 8M --bwlimit 2M "$SRC" "localhost:$DST" >/dev/null 2>&1 || return 1
+    elapsed=$((SECONDS - start))
+    cmp -s "$SRC" "$DST" || return 1
+    (( elapsed >= 2 ))
+}
+
 test_hash_threads_push() {
     # Multi-section push with diffs scattered across sections, hashing fanned
     # out over 4 threads — exercises the threaded phase-A feed/drain window
@@ -415,6 +430,7 @@ run "perl remote: pull (BSCP_FORCE_PERL=1)"          test_perl_remote_pull
 run "legacy remote: push (BSCP_FORCE_PYTHON2=1)"     test_legacy_remote_push
 run "legacy remote: pull (BSCP_FORCE_PYTHON2=1)"     test_legacy_remote_pull
 run "--buffer push"                                  test_buffer_push
+run "--bwlimit push throttles to rate"               test_bwlimit_push
 run "--hash-threads 4 push (multi-section)"          test_hash_threads_push
 run "--hash-threads 1 pull (serial pool path)"       test_hash_threads_single_pull
 run "--allow-truncate push (smaller dst)"            test_allow_truncate_push

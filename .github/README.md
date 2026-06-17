@@ -70,6 +70,7 @@ prefix that fits.
 | `-r OFFSET` / `--resume-from` | `0`      | Skip ahead to this byte offset, or to `NN%` / `NN.N%` of the local file (rounded down to a section boundary).    |
 | `-R N` / `--retries`          | `3`      | Automatically retry on connection failure, up to N times, with exponential back-off (`0` disables).              |
 | `--io-timeout SECS`           | `0`      | Abort (engaging `--retries`) if no SSH-pipe I/O progress for SECS seconds. Catches stuck remote process or | hung disk while TCP is still alive. `0` disables, falling back to the SSH keepalive (~60s). |
+| `--bwlimit RATE`              | `0`      | Limit network I/O to RATE bytes per second (`K`/`M`/`G`/`T` suffix accepted, e.g. `--bwlimit 5M`); both directions combined. `0` = unlimited. The rate is measured on the data handed to `ssh` (pre-compression), so with `-C` the actual wire usage stays at or below RATE — lower for compressible data. For raw block devices (incompressible) the two coincide. |
 | `-i FILE` / `--identity`      |          | SSH identity file (`-i FILE`).                                                                                   |
 | `-o OPT` / `--ssh-opt`        |          | Extra SSH option, repeatable (passed as `-o OPT`). Takes precedence over the defaults below.                     |
 | `-C` / `--compress`           |          | Enable SSH compression. Often a big win over a bandwidth-limited WAN link; usually a slowdown on a fast LAN (compression CPU cost outweighs the bandwidth saved). Enable for remote/WAN copies, leave off on local ones. |
@@ -105,6 +106,9 @@ bscp -r 50% /dev/sda myhost:/dev/sda
 
 # Disable auto-retry on connection failures (default is --retries 3)
 bscp --retries 0 /dev/sda myhost:/dev/sda
+
+# Cap network bandwidth at 5 MiB/s (e.g. to leave a WAN link usable)
+bscp --bwlimit 5M /dev/sda myhost:/dev/sda
 
 # Limit a long sync to just the first 1 GiB (suffix is bytes, rounded up to blocks)
 bscp -B 1G /dev/sda myhost:/dev/sda

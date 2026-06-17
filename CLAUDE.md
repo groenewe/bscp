@@ -114,6 +114,18 @@ bscp (single file)
 │                        so select on the fd is authoritative — no hidden
 │                        Python BufferedReader read-ahead.  Default
 │                        (timeout = 0) keeps the buffered path for parity.
+│                        When --bwlimit > 0 a combined-direction token bucket
+│                        (_throttle, called from both read and write) sleeps
+│                        to hold total wire throughput at the rate; burst is
+│                        capped at one second's worth.  Client-side only — no
+│                        protocol or remote-script change (pull is throttled
+│                        via read() backpressure on the SSH pipe).  Bytes are
+│                        counted pre-compression (upstream of ssh -C), so the
+│                        limit is an upper bound on wire usage — exact for
+│                        incompressible data, conservative (wire below RATE)
+│                        for compressible.  The deficit-carry detail (do NOT
+│                        zero a negative balance after sleeping) is load-
+│                        bearing: zeroing double-credits and runs ~2x over.
 ├── IOTimeout          — OSError subclass raised by IOCounter when the
 │                        --io-timeout watchdog fires.  Listed alongside
 │                        BrokenPipeError / ConnectionResetError / EOFError
@@ -294,6 +306,7 @@ to cover, plus a few that were easy to forget:
 | legacy remote: push (`BSCP_FORCE_PYTHON2=1`)     | single-threaded `remote_script` push (not the MT) |
 | legacy remote: pull (`BSCP_FORCE_PYTHON2=1`)     | single-threaded `remote_script` pull (not the MT) |
 | `--buffer` push                                  | the in-memory diff-block buffer path              |
+| `--bwlimit` push throttles to rate               | token-bucket rate limit engages (timing floor)    |
 | `--hash-threads 4` push (multi-section)          | threaded phase-A feed/drain, digest wire order    |
 | `--hash-threads 1` pull (serial pool path)       | threaded path correct when degenerate to 1 worker |
 | `--allow-truncate` push (smaller dst)            | both refusal-without-flag and warning-with-flag   |

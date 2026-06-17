@@ -505,21 +505,43 @@ exit 0;
 
 
 class IOCounter:
-    def __init__(self, in_stream, out_stream):
+    def __init__(self, in_stream, out_stream, bwlimit=0):
         self.in_stream  = in_stream
         self.out_stream = out_stream
         self.in_total   = 0
         self.out_total  = 0
+        # Combined-direction token bucket (mirrors the python3 client); 0 =
+        # unlimited.  _bw_allow starts full so the first read/write is free.
+        self.bwlimit    = bwlimit
+        self._bw_allow  = float(bwlimit)
+        self._bw_last   = time()
+
+    def _throttle(self, nbytes):
+        if not self.bwlimit:
+            return
+        now = time()
+        # Refill, capped at one second's worth so an idle gap cannot bank
+        # credit for a later flood.  Leave a negative balance negative: the
+        # next call's refill is sized by the elapsed sleep and repays exactly
+        # this deficit; zeroing it here would double-credit and run ~2x over.
+        self._bw_allow = min(self._bw_allow + (now - self._bw_last) * self.bwlimit,
+                             float(self.bwlimit))
+        self._bw_last  = now
+        self._bw_allow -= nbytes
+        if self._bw_allow < 0:
+            sleep(-self._bw_allow / self.bwlimit)
 
     def read(self, n):
         data = self.in_stream.read(n)
         self.in_total += len(data)
+        self._throttle(len(data))
         return data
 
     def write(self, data):
         self.out_stream.write(data)
         self.out_total += len(data)
         self.out_stream.flush()
+        self._throttle(len(data))
 
 
 class ConnectionLost(RuntimeError):
@@ -673,6 +695,8 @@ def build_resume_cmd(argv0, args, src, dst, offset, block_count=None):
         parts += ['-a', args.algorithm]
     if args.retries != DEFAULT_RETRIES:
         parts += ['--retries', str(args.retries)]
+    if args.bwlimit:
+        parts += ['--bwlimit', format_size(args.bwlimit)]
     if args.identity:
         parts += ['-i', args.identity]
     for opt in (args.ssh_opt or []):
@@ -766,7 +790,8 @@ def build_ssh_cmd(remote_host, args):
 
 def do_sync(local_file, remote_host, remote_file, mode,
             blocksize, section_size, hashname,
-            start_offset=0, dry_run=False, block_count=0, allow_truncate=False, buffer=False, ssh_args=None):
+            start_offset=0, dry_run=False, block_count=0, allow_truncate=False, buffer=False,
+            bwlimit=0, ssh_args=None):
 
     ssh_args = ssh_args or {}
     fn_bytes = remote_file.encode('utf-8')
@@ -794,7 +819,7 @@ def do_sync(local_file, remote_host, remote_file, mode,
 
         cmd  = build_ssh_cmd(remote_host, ssh_args)
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-        io   = IOCounter(proc.stdout, proc.stdin)
+        io   = IOCounter(proc.stdout, proc.stdin, bwlimit=bwlimit)
 
         # The remote runs its own size-mismatch check on the wire-side `size`,
         # which is wire_size (the -B-capped local size) — so when -B is in use
@@ -1322,6 +1347,9 @@ if __name__ == '__main__':
                              'to section boundary')
     resilience.add_argument('-R', '--retries',  default=DEFAULT_RETRIES, type=int, metavar='N',
                         help='auto-retry attempts on connection failure (default %d; 0 disables)' % DEFAULT_RETRIES)
+    resilience.add_argument('--bwlimit',        default=0, type=parse_size, metavar='RATE',
+                        help='limit network I/O to RATE bytes per second (K/M/G/T suffix accepted); '
+                             'governs both directions combined. Default 0 = unlimited.')
 
     safety = parser.add_argument_group('safety')
     safety.add_argument('-N', '--dry-run',      action='store_true',
@@ -1424,7 +1452,7 @@ if __name__ == '__main__':
                     mode, blocksize, section_size, hashname,
                     start_offset=start_offset, dry_run=dry_run,
                     block_count=args.block_count, allow_truncate=args.allow_truncate,
-                    buffer=buffer, ssh_args=ssh_args)
+                    buffer=buffer, bwlimit=args.bwlimit, ssh_args=ssh_args)
                 break
             except ConnectionLost as exc:
                 if attempt < args.retries and not exc.interrupted:
