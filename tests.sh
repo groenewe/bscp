@@ -15,10 +15,12 @@
 #   ./tests.sh --force-all          # run every test even under a python2 client
 #
 # When $BSCP runs under a Python 2 interpreter (e.g. bscp.python2 where
-# `python` resolves to Python 2.x), three tests are skipped by default:
-# the two --hash-threads tests (the option is python3-only by design) and
-# the -a algorithm-rejection test (Py2's hashlib lacks the shake_* XOF
-# functions the test probes).  Pass --force-all to run them anyway.
+# `python` resolves to Python 2.x), seven tests are skipped by default:
+# the two --hash-threads tests (the option is python3-only by design), the
+# -a algorithm-rejection test (Py2's hashlib lacks the shake_* XOF functions
+# the test probes), and the four --verify tests (the convenience b3sum
+# cross-check is not implemented in the python2 client).  Pass --force-all
+# to run them anyway.
 #
 # Exit status: 0 if all tests pass, non-zero otherwise.
 
@@ -42,8 +44,12 @@ case $(head -1 "$BSCP" 2>/dev/null) in
     *python*)  python -V 2>&1 | grep -q '^Python 2\.' && PY2_CLIENT=1 ;;
 esac
 
-# Tests skipped under a python2 client unless --force-all is given.
-PY2_SKIP="test_hash_threads_push test_hash_threads_single_pull test_reject_bad_algorithm"
+# Tests skipped under a python2 client unless --force-all is given.  The
+# --verify tests are skipped because the python2 client does not implement
+# the (convenience-only) b3sum cross-check, so the flag is unrecognised.
+PY2_SKIP="test_hash_threads_push test_hash_threads_single_pull test_reject_bad_algorithm \
+test_verify_push_match test_verify_mismatch_exit4 test_verify_skips_when_b3sum_unusable \
+test_verify_size_mismatch_skips"
 
 WORK=$(mktemp -d)
 SRC="$WORK/src.img"

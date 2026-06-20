@@ -20,7 +20,7 @@ exercises it implicitly when run against `bscp.python2`, but that is
 opt-in via `BSCP=./bscp.python2 ./tests.sh`.
 
 **Feature parity vs. `bscp`.**  `bscp.python2` carries the full feature
-set with two deliberate exceptions.  Note that of the resilience-group
+set with three deliberate exceptions.  Note that of the resilience-group
 flags only `--io-timeout` is dropped — `--retries` and `--bwlimit` are both
 present (`--bwlimit`'s combined-direction token bucket is plain arithmetic
 that ports cleanly to Python 2):
@@ -54,6 +54,17 @@ that ports cleanly to Python 2):
   Net effect: driving a modern python3 host *from* the Py2 client still
   gets multi-threaded remote hashing; only the local client's own hashing
   is single-threaded.
+
+- `--verify` is dropped.  The post-copy b3sum cross-check is a
+  convenience-only addition to the python3 client; it is **out of band** —
+  it shells out to `b3sum` on each side (locally, and `ssh HOST b3sum` on
+  the remote) with no protocol or remote-script involvement — so leaving it
+  out of `bscp.python2` costs nothing on the wire.  When refreshing
+  `bscp.python2`, omit the `--verify` argparse entry, the `ssh_base` /
+  `external_hash_local` / `external_hash_remote` / `verify_digest` /
+  `device_size` helpers, and the post-copy verify block in `__main__`
+  (`do_sync` then need not return `remote_size`).  `tests.sh` skips the four
+  `--verify` tests under a Python 2 client.
 
 Everything else — section-based scan/copy, `--buffer`,
 `--allow-truncate`, `-B`, resume, retries, the unified ETA model with
@@ -91,11 +102,13 @@ place the kept-but-rewired MT path lives: rewrite its `.hex()` calls as
 to pass).  After the shims, re-run `python2 -m py_compile bscp.python2 &&
 python3 -m py_compile bscp.python2`, then `BSCP=./bscp.python2 ./tests.sh`
 under both interpreters.  When the client runs under Python 2, `tests.sh`
-auto-skips three tests (the two `--hash-threads` tests, since the option
-is absent, and the `-a` rejection test, since Py2's `hashlib` lacks the
-`shake_*` XOF functions it probes); pass `--force-all` to run them anyway
-and watch them fail in the documented ways.  Under python3 the same file
-passes all 25 tests with nothing skipped.  The `--io-timeout` removal also
+auto-skips seven tests (the two `--hash-threads` tests, since the option
+is absent; the `-a` rejection test, since Py2's `hashlib` lacks the
+`shake_*` XOF functions it probes; and the four `--verify` tests, since the
+b3sum cross-check is not implemented in the Py2 client); pass `--force-all`
+to run them anyway and watch them fail in the documented ways.  Under
+python3 the same file passes the tests for the features it implements.  The
+`--io-timeout` removal also
 requires deleting the
 `IOTimeout` class, the `IOCounter` raw-fd paths (`_read_raw`,
 `_write_raw`), the `popen_bufsize` branch, the `import select`, the
