@@ -580,6 +580,38 @@ if errs:
 PY
 }
 
+# resolve_hash_threads: an explicit -T N is clamped to the host's core count
+# (never more threads than cores), while auto (0) uses min(cores, CAP).  This
+# covers the client side; the python3 remote mirrors the same logic against
+# its own cores.  Self-skips on the python2 client (no --hash-threads there).
+test_hash_threads_clamped_to_cores() {
+    local mod_src=$BSCP
+    if ! head -1 "$BSCP" 2>/dev/null | grep -q '^#!.*python'; then
+        mod_src="$SCRIPT_DIR/bscp"
+    fi
+    cp "$mod_src" "$WORK/bscp_mod.py"
+    PYTHONPATH="$WORK" python3 - <<'PY'
+import os, bscp_mod as m
+if not hasattr(m, 'resolve_hash_threads'):
+    raise SystemExit(0)            # python2 client: --hash-threads absent
+cores = os.cpu_count() or 1
+errs = []
+cases = [
+    (cores + 100, cores),                       # explicit beyond cores -> clamped
+    (1,           1),                            # explicit within cores -> honoured
+    (max(1, cores - 1), min(max(1, cores - 1), cores)),
+    (0,           min(cores, m.HASH_THREADS_CAP)),  # auto -> min(cores, CAP)
+]
+for n, exp in cases:
+    got = m.resolve_hash_threads(n)
+    if got != exp:
+        errs.append('resolve_hash_threads(%d) = %d, expected %d' % (n, got, exp))
+if errs:
+    print('\n'.join(errs))
+    raise SystemExit(1)
+PY
+}
+
 # ---------- run ----------
 echo "Running bscp regression tests against localhost..."
 run "push: random 4K diffs in mid-file"              test_push
@@ -620,6 +652,7 @@ run "friendly error when local file is missing"      test_friendly_error_for_mis
 run "reject unknown / zero-digest -a algorithm"      test_reject_bad_algorithm
 run "connection failure engages retries, exits 3"    test_conn_failure_retries_exit3
 run "format_size + parse_size unit tests"            test_format_size_unit_tests
+run "resolve_hash_threads clamps -T N to cores"      test_hash_threads_clamped_to_cores
 
 echo
 echo "$PASSED passed, $FAILED failed, $SKIPPED skipped"

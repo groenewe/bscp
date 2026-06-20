@@ -78,7 +78,12 @@ HASH_THREADS_CAP     = 4
 
 
 def resolve_hash_threads(n):
-    return n if n and n > 0 else min(os.cpu_count() or 1, HASH_THREADS_CAP)
+    # Explicit -T N is honoured but never exceeds the actual core count (more
+    # threads than cores only adds contention); auto (n<=0) uses the
+    # conservative min(cores, CAP).  Each side resolves against its OWN cores,
+    # so -T 8 to a 4-core remote runs 4 threads there and up to 8 locally.
+    cores = os.cpu_count() or 1
+    return min(n, cores) if n and n > 0 else min(cores, HASH_THREADS_CAP)
 
 # Hash algorithms guaranteed on every remote variant: python3, python2, and
 # the Perl fallback (Digest::MD5 + Digest::SHA).  hashlib offers more
@@ -292,8 +297,14 @@ def _remote(nthreads):
 	ALLOW_TRUNCATE = 2
 	HASH_THREADS_CAP = 4
 
+	# Resolve against THIS host's cores (mirrors the client's
+	# resolve_hash_threads): auto (<=0) -> min(cores, CAP); explicit -T N ->
+	# honoured but clamped to the core count, so -T 8 to a 4-core box runs 4.
+	cores = os.cpu_count() or 1
 	if nthreads <= 0:
-		nthreads = min(os.cpu_count() or 1, HASH_THREADS_CAP)
+		nthreads = min(cores, HASH_THREADS_CAP)
+	else:
+		nthreads = min(nthreads, cores)
 	window = max(2, nthreads * 2)
 
 	try:
@@ -1477,9 +1488,11 @@ if __name__ == '__main__':
     perf.add_argument('-T', '--hash-threads',   default=DEFAULT_HASH_THREADS, type=int, metavar='N',
                         help='number of threads used to hash blocks during the scan phase, on '
                              'both client and remote (default 0 = auto: min(CPU cores, %d)). '
-                             'Speeds up the scan when hashing is CPU-bound (fast NVMe/local). '
-                             'Each side picks its own count; the python2 and Perl remotes always '
-                             'run single-threaded.' % HASH_THREADS_CAP)
+                             'An explicit N is clamped to each side\'s own core count (so -T 8 to '
+                             'a 4-core remote runs 4 threads there). Speeds up the scan when '
+                             'hashing is CPU-bound (fast NVMe/local). Each side picks its own '
+                             'count; the python2 and Perl remotes always run single-threaded.'
+                             % HASH_THREADS_CAP)
     perf.add_argument('--buffer',                     action='store_true',
                         help='push: buffer differing blocks in memory during '
                              'transfer instead of re-reading them from disk. '

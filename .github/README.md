@@ -80,7 +80,7 @@ prefix that fits.
 | `-B N` / `--block-count`      | `0`      | Limit sync to the first N blocks (0 = no limit). A `K`/`M`/`G`/`T` suffix interprets the value as bytes, rounded up to whole blocks (e.g. `-B 4M`). A warning is printed if the limit exceeds the source size. |
 | `--allow-truncate`            |          | Allow the destination to be smaller than the source (or, with `-B`, smaller than the requested limit); only the bytes that fit are copied. |
 | `--buffer`                    |          | Push: buffer differing blocks in memory during phase B instead of re-reading them from disk. | Higher memory use, fewer disk reads. Experimental. Auto-disabled if available memory is too low. |
-| `-T N` / `--hash-threads`     | `0`      | Threads used to hash blocks during the scan phase, on both client and remote (`0` = auto: `min(cores, 4)`). | Speeds up scanning when hashing is CPU-bound (fast NVMe/local). python2 and Perl remotes stay single-threaded. |
+| `-T N` / `--hash-threads`     | `0`      | Threads used to hash blocks during the scan phase, on both client and remote (`0` = auto: `min(cores, 4)`). An explicit `N` is clamped to each side's own core count, so `-T 8` to a 4-core remote runs 4 threads there. | Speeds up scanning when hashing is CPU-bound (fast NVMe/local). python2 and Perl remotes stay single-threaded. |
 | `-q` / `--quiet`              |          | Suppress scan/copy progress lines. Errors and warnings are still shown.                                          |
 | `--batch`                     |          | Suppress all stderr output; use the exit status to detect errors (implies `-q`). | Cannot convey a resume offset — use `-q` instead if a caller needs to parse the "Resume with:" stderr line. |
 | `-p PORT` / `--port`          | `22`     | SSH port.                                                                                                        |
@@ -146,8 +146,9 @@ Host backup-server
 | `BSCP_OPTIONS` | Default command-line options, applied *before* the real arguments so an explicit option still overrides them. For per-host tuning you don't want to repeat — e.g. `export BSCP_OPTIONS="-T 8 -b 192K"`. Options only (no `SRC`/`DST`). |
 
 `-T 8` raises the scan to 8 hashing threads — an explicit `-T N` bypasses the
-auto-detect cap of `min(cores, 4)`, useful on many-core hosts where `b3sum`
-otherwise outruns the scan.  `-b 192K` widens the block size, which can lift
+auto-detect cap of `min(cores, 4)` (though still clamped to each side's actual
+core count), useful on many-core hosts where `b3sum` otherwise outruns the
+scan.  `-b 192K` widens the block size, which can lift
 throughput on fast devices — but a larger block is a *coarser* comparison
 unit, so it increases the data re-sent per changed region, the write wear on
 the destination, and the size of a sparse destination file.  Tune with that

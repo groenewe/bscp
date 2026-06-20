@@ -108,6 +108,11 @@ remote: a `finally` around the loop).
 plateaus once cores outrun sequential read + pipe drain, and higher counts
 add scheduler/pipe contention for little gain.  A measured localhost run
 (16 cores, 600 MiB, both ends hashing) went 3.6 s → 1.9 s from N=1 to N=4.
+An explicit `-T N` overrides the cap but is still clamped to each side's own
+core count: the raw value is baked into `_remote(N)` and the remote resolves
+it against *its* `os.cpu_count()`, so `-T 8` to a 4-core box runs 4 threads
+there (never more threads than cores), matching the client's
+`resolve_hash_threads`.
 
 ## Perl fallback (`remote_perl`)
 

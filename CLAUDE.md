@@ -218,11 +218,13 @@ which options to omit from the reconstructed command line.
 
 `DEFAULT_HASH_THREADS` (0 = auto) and `HASH_THREADS_CAP` (4) configure the
 phase-A hashing pool; `resolve_hash_threads(n)` maps the user value to a
-concrete worker count (`n` if positive, else `min(os.cpu_count(), CAP)`).
-The client resolves its own count via this helper; the remote receives the
-raw `--hash-threads` value baked into its `_remote(N)` call and resolves it
-the same way internally (so a `0` lets the remote auto-detect its own cores
-independently of the client's core count).
+concrete worker count: an explicit `n > 0` is `min(n, os.cpu_count())` —
+honoured but never more threads than cores — and auto (`n <= 0`) is
+`min(os.cpu_count(), CAP)`.  The client resolves its own count via this
+helper; the remote receives the raw `--hash-threads` value baked into its
+`_remote(N)` call and resolves it the **same way against its own cores**, so
+`-T 8` to a 4-core remote runs 4 threads there (and up to 8 on an 8-core
+client), and `0` lets each side auto-detect independently.
 
 `MODE_PUSH`, `MODE_PULL`, and `ALLOW_TRUNCATE` are also defined at module
 level for use throughout the client.  Because the remote runs from a string
