@@ -111,6 +111,37 @@ connection reuses it — one authentication.  This was chosen over having bscp
 auto-enable multiplexing so the carefully-tuned transfer/retry connection
 path is left untouched; connection reuse is left to ssh, where it belongs.
 
+## Interruption and connection loss
+
+bscp installs no `SIGHUP`/`SIGTERM` handlers (only `SIGINT` → the
+`KeyboardInterrupt` path described above, which kills both `b3sum` children
+and exits `130`).  No others are needed — the default dispositions already
+give the desired "both ends die" outcome.  Two scenarios, both verified:
+
+- **The terminal running bscp goes away** (its login/SSH session times out or
+  is closed).  The kernel delivers `SIGHUP` to bscp's foreground process
+  group.  bscp dies on the default action (no `finally`/atexit — acceptable,
+  as there is no local cleanup to lose: no temp files, and a partially
+  written pull target is resumable).  The local verify `ssh` children are in
+  the **same** process group (plain `Popen`, no `start_new_session`), so they
+  receive the same `SIGHUP` and die too.  The remote `b3sum` then dies via
+  the `-tt` PTY hangup just as in the Ctrl+C case — there is a few-second lag
+  while a persistent multiplexing master notices the slave is gone, then
+  tears the channel (and its PTY) down.  Confirmed signal-agnostic:
+  `SIGHUP`, `SIGTERM`, and `SIGKILL` to the local slave all reap the remote
+  `b3sum` over a `ControlMaster`.
+
+- **The verify connection itself drops** (network partition, not the local
+  terminal).  `ssh_base()`'s `ServerAliveInterval=15` / `ServerAliveCountMax=4`
+  make the local `ssh` declare the link dead within ~60 s and exit; bscp then
+  treats the verify as unavailable.  The fate of the remote `b3sum` on the
+  far side of the dead link is the **remote sshd's** responsibility (its own
+  TCP keepalive / `ClientAliveInterval`), not the client's — inherent to a
+  partition and outside bscp's reach.
+
+Persistence across a dropped controlling terminal is intentionally *not*
+bscp's job: run it under `tmux`/`screen` if the session may disconnect.
+
 ## Comparison eligibility gate
 
 A whole-device `b3sum` of source and destination only matches when the
