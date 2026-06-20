@@ -121,6 +121,11 @@ def parse_algorithm(name):
     return name
 
 REPORT_INTERVAL = 0.5 # status line should update after this many seconds have passed
+# For the first ETA_WARMUP_SECS of a run the scan/copy progress omits the
+# (ETA) field (rate EMAs still seeding); --verify reuses the same threshold to
+# decide whether its estimate is worth showing as a countdown.  Module-level
+# so both do_sync (scan/copy) and __main__ (verify) share the one value.
+ETA_WARMUP_SECS = 20.0
 last_report_len = 0   # last progress or error length message on screen, if any; used by report()
 quiet = False         # option -q or --quiet: suppress '\r' progress report line normally updated via stderr
 batch = False         # option --batch: suppress all stderr output, return only a suitable exit code (see help)
@@ -1101,12 +1106,11 @@ def do_sync(local_file, remote_host, remote_file, mode,
         # drift independently of measured progress.  Damping is applied
         # from the start (not gated on `confident`), so an unseeded early
         # estimate never gets a chance to flicker — for the first
-        # ETA_WARMUP_SECS of the run, display_eta() returns None and the
-        # caller omits the `(ETA)` field from the progress line entirely,
-        # which gives the rate EMAs time to seed from real data before any
-        # number is shown.
+        # ETA_WARMUP_SECS (module-level) of the run, display_eta() returns
+        # None and the caller omits the `(ETA)` field from the progress line
+        # entirely, which gives the rate EMAs time to seed from real data
+        # before any number is shown.
         ETA_REFRESH_INTERVAL = 10.0
-        ETA_WARMUP_SECS      = 20.0
         # Confidence shortcut: once at least CONFIDENT_SCAN_FRAC of the
         # blocks-still-to-scan have been scanned, treat the scan-rate EMA
         # as authoritative even if the copy-rate EMA never seeds (e.g.
@@ -1519,10 +1523,11 @@ if __name__ == '__main__':
     verification = parser.add_argument_group('verification')
     verification.add_argument('--verify',              action='store_true',
                         help='after copying, run b3sum on the local and (when available) remote '
-                             'file concurrently and print both digests. If the whole device was '
-                             'copied and the local and remote sizes match, compare them and report '
-                             'OK / mismatch (exit 4 on mismatch). Prints a duration estimate from '
-                             'the scan time first. Independent of -a, so this external BLAKE3 check '
+                             'file concurrently and print both digests, with a live '
+                             'elapsed/remaining progress line (remaining estimated from the scan '
+                             'time). If the whole device was copied and the local and remote sizes '
+                             'match, compare them and report OK / mismatch (exit 4 on mismatch). '
+                             'Independent of -a, so this external BLAKE3 check '
                              'guards against block-hash weaknesses. A convenience check: needs '
                              'b3sum on each side, and warns + skips gracefully where it is missing. '
                              'Under --dry-run it runs only if the scan found zero diffs (an '
@@ -1731,25 +1736,50 @@ if __name__ == '__main__':
         # estimate, scaled up if a resume (-r) made phase A skip the head.
         scanned = max(1, sync_size - start_offset)
         eta = scan_seconds * sync_size / scanned
-        if eta >= 1:
-            report('verify: hashing both ends with b3sum (est. ~%s from scan time)\n'
-                   % format_time(eta))
-        else:
-            report('verify: hashing both ends with b3sum\n')
 
-        # Launch local and remote concurrently; collect local first (remote
-        # runs meanwhile), so total wall-clock ≈ max(local, remote).
+        # Launch local and remote concurrently, then poll both while showing a
+        # live "elapsed (remaining)" line (mirrors the scan/copy progress).
+        # The remaining counts down from the scan-based estimate and may go
+        # negative once the run outlasts it — shown as a negative second
+        # count, signalling the estimate was low.  Progress is gated on the
+        # user's original -q/--batch: the summary above reset `quiet=False`,
+        # so report() would otherwise un-silence it.  The first line printed
+        # after the loop is \r-prefixed to overwrite the live line.
+        verify_progress = not args.quiet and not args.batch
+        t_verify_start  = time()
         lp = spawn_hash(b3sum_local_cmd(local_file))
         rp = spawn_hash(b3sum_remote_cmd(remote_host, remote_file, ssh_args))
+        while (lp is not None and lp.poll() is None) or (rp is not None and rp.poll() is None):
+            # Local already finished and failed — its hash is unusable, so
+            # stop waiting on the remote rather than block for a discarded
+            # result.
+            if lp is not None and lp.poll() is not None and lp.returncode != 0:
+                if rp is not None and rp.poll() is None:
+                    rp.kill()
+                break
+            if verify_progress:
+                elapsed = time() - t_verify_start
+                # Only show the countdown when the estimate clears the same
+                # warmup threshold the scan/copy ETA uses — for shorter runs
+                # the number is noise, so show elapsed alone.
+                if eta > ETA_WARMUP_SECS:
+                    rem    = eta - elapsed
+                    rem_s  = format_time(rem, round_eta=True) if rem >= 0 else '-%d' % int(-rem)
+                    report('\rverify: hashing both ends with b3sum - %s (%s) '
+                           % (format_time(elapsed), rem_s))
+                else:
+                    report('\rverify: hashing both ends with b3sum - %s ' % format_time(elapsed))
+            sleep(REPORT_INTERVAL)
+
         local_hash, lerr = collect_hash(lp) if lp else (None, 'not found')
 
         if local_hash is None:
             if rp is not None:          # local failed — stop waiting on remote
                 rp.kill()
                 rp.communicate()
-            verify_unavailable('verify: skipped — b3sum failed on %s: %s\n' % (local_file, lerr))
+            verify_unavailable('\rverify: skipped — b3sum failed on %s: %s\n' % (local_file, lerr))
         else:
-            report('verify: local  b3sum %s = %s\n' % (local_file, local_hash))
+            report('\rverify: local  b3sum %s = %s\n' % (local_file, local_hash))
             remote_hash, _ = collect_hash(rp) if rp else (None, '')
             if remote_hash is None:
                 verify_unavailable('verify: remote b3sum unavailable on %s — comparison skipped\n'

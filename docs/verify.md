@@ -44,19 +44,26 @@ In `__main__`, after a successful copy:
    make b3sum mismatch, so verify is skipped.
 1. If `shutil.which('b3sum')` finds nothing locally, verify warns and stops
    (the remote is not contacted).
-2. A **duration estimate** is printed first.  `b3sum` reads the whole device
-   once, exactly as phase A did, so the scan time (`do_sync` now returns
-   `total_scan_time` — read+hash, *excluding* the copy) is a good predictor.
-   It is scaled by `sync_size / (sync_size − start_offset)` so a resumed run
-   (where phase A skipped the head) still estimates the full-device hash.
-   Shown only when the estimate is ≥ 1 s.
-3. The local `b3sum LOCAL` process and the remote `ssh … HOST 'b3sum REMOTE'`
+2. The local `b3sum LOCAL` process and the remote `ssh … HOST 'b3sum REMOTE'`
    are launched **concurrently** (`spawn_hash()`), so wall-clock is the
-   slower of the two, not their sum.  The local result is collected first
-   (`collect_hash()`) while the remote runs; if the local hash fails, the
-   remote process is killed rather than waited on.  `verify_digest()` takes
-   the leading hex token of each (the path field differs between the two
-   sides, so only the digest is compared).
+   slower of the two, not their sum.  Both are then polled in a loop that
+   renders a **live `elapsed (remaining)` progress line** every
+   `REPORT_INTERVAL`, mirroring the scan/copy display.  The *remaining* counts
+   down from a duration estimate: `b3sum` reads the whole device once, exactly
+   as phase A did, so the scan time (`do_sync` returns `total_scan_time` —
+   read+hash, *excluding* the copy) is a good predictor, scaled by
+   `sync_size / (sync_size − start_offset)` so a resumed run still estimates
+   the full-device hash.  The `(remaining)` countdown is shown only when the
+   estimate exceeds `ETA_WARMUP_SECS` (the same threshold the scan/copy ETA
+   uses); below that only the elapsed time is shown, since a sub-warmup
+   estimate is noise.  Once the run outlasts the estimate the remaining goes
+   negative (shown as a `-N` second count, signalling the estimate was low).
+   The line is gated on the *original* `-q`/`--batch` (the final summary
+   resets `quiet=False`, which must not un-silence it); the first line printed
+   after the loop is `\r`-prefixed to overwrite it.
+3. If the local hash fails, the remote process is killed rather than waited
+   on.  `verify_digest()` takes the leading hex token of each result (the
+   path field differs between the two sides, so only the digest is compared).
 4. The remote runs over the same `ssh_base()` options as the transfer,
    **including the `ServerAliveInterval=15` keepalive** — essential here,
    because `b3sum` can run for minutes with no channel data, and the

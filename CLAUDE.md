@@ -187,8 +187,10 @@ bscp (single file)
 │                        runs for minutes.  device_size() seek-to-end sizes a
 │                        path because os.path.getsize() reports 0 for block
 │                        devices.  Orchestrated in __main__ after a successful
-│                        copy, with a duration estimate from do_sync's
-│                        returned scan time; see docs/verify.md.
+│                        copy: both processes are polled in a loop that renders
+│                        a live elapsed/remaining progress line (remaining from
+│                        do_sync's returned scan time; goes negative if the run
+│                        outlasts it); see docs/verify.md.
 ├── do_sync()          — all transfer logic for both push and pull.  Hosts
 │                        a `show_copy_progress` closure that all three
 │                        phase-B branches (push, push --buffer, pull) share.
@@ -434,6 +436,19 @@ copy WPOS/TOTAL (PCT%) block C/N (SEC_PCT%) (SPEED KiB/s) ELAPSED (ETA)
   (`blocks_done_this_section / section_diff_count`).
 - `ELAPSED` / `(ETA)` — same convention as scan; same unified model
   (see [docs/eta-model.md](docs/eta-model.md)).
+
+Progress format during `--verify` (while the two `b3sum` processes run):
+```
+verify: hashing both ends with b3sum - ELAPSED (REMAINING)
+```
+- `ELAPSED` — wall-clock since the verify pass started (`m:ss`).
+- `REMAINING` — `eta − elapsed`, where `eta` is the scan-time estimate
+  (see docs/verify.md).  Formatted like the scan/copy ETA while positive;
+  once negative (the run outlasted the estimate) it is shown as a plain `-N`
+  second count.  The `(REMAINING)` field is shown only when the estimate
+  clears `ETA_WARMUP_SECS` (the same threshold the scan/copy ETA uses); for
+  shorter runs only `ELAPSED` is shown.  Suppressed by `-q`/`--batch` like
+  other progress.
 
 ## Quiet and batch modes
 
