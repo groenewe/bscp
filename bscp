@@ -1553,12 +1553,22 @@ if __name__ == '__main__':
     parser.add_argument('src', help='source — local path or HOST:path')
     parser.add_argument('dst', help='destination — HOST:path or local path')
 
-    if len(sys.argv) == 1:
+    # BSCP_OPTIONS supplies default command-line options for per-host tuning
+    # (e.g. `-T 8 -b 192k`), parsed as a shell word list and placed BEFORE the
+    # real argv so an explicit command-line option overrides the env default
+    # (argparse keeps the last occurrence).  Options only — not positionals.
+    # Distinct from the BSCP_FORCE_* test hooks, which select the remote path.
+    try:
+        env_opts = shlex.split(os.environ.get('BSCP_OPTIONS', ''))
+    except ValueError as exc:
+        parser.error('BSCP_OPTIONS: %s' % exc)
+
+    if len(sys.argv) == 1 and not env_opts:
         parser.print_usage(sys.stderr)
         sys.stderr.write('Use -h or --help for full option list.\n')
         sys.exit(2)
 
-    args = parser.parse_args()
+    args = parser.parse_args(env_opts + sys.argv[1:])
     quiet = args.quiet or args.batch
     batch = args.batch
 

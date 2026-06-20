@@ -139,6 +139,20 @@ Host backup-server
     ControlPersist 60
 ```
 
+### Environment
+
+| Variable       | Effect                                                                                                   |
+| -------------- | -------------------------------------------------------------------------------------------------------- |
+| `BSCP_OPTIONS` | Default command-line options, applied *before* the real arguments so an explicit option still overrides them. For per-host tuning you don't want to repeat — e.g. `export BSCP_OPTIONS="-T 8 -b 192K"`. Options only (no `SRC`/`DST`). |
+
+`-T 8` raises the scan to 8 hashing threads — an explicit `-T N` bypasses the
+auto-detect cap of `min(cores, 4)`, useful on many-core hosts where `b3sum`
+otherwise outruns the scan.  `-b 192K` widens the block size, which can lift
+throughput on fast devices — but a larger block is a *coarser* comparison
+unit, so it increases the data re-sent per changed region, the write wear on
+the destination, and the size of a sparse destination file.  Tune with that
+tradeoff in mind.
+
 ### Exit status
 
 | Code  | Meaning                                                                  |

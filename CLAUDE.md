@@ -204,7 +204,10 @@ bscp (single file)
 │                        --verify duration estimate).
 └── __main__           — argparse, push/pull auto-detection, retry loop, and
                          the post-copy --verify orchestration (exit 4 on a
-                         confirmed mismatch).
+                         confirmed mismatch).  BSCP_OPTIONS (shell-split) is
+                         prepended to argv before parse_args() so it supplies
+                         default options that an explicit flag still overrides
+                         (per-host tuning, e.g. `-T 8 -b 192K`).
 ```
 
 ## Module-level constants
@@ -365,6 +368,8 @@ to cover, plus a few that were easy to forget:
 | `--batch --verify` mismatch is silent, exits 4   | exit code is the only mismatch signal under batch |
 | `--batch --verify` size mismatch silent, exits 5 | verify-not-performed signalled when stderr muted  |
 | `--batch --verify` + `-B` rejected, exits 2      | argparse pre-validation of the impossible combo   |
+| `BSCP_OPTIONS` default options take effect       | env options prepended to argv before parse_args   |
+| `BSCP_OPTIONS` overridden by explicit CLI option | explicit flag wins (env placed first, last wins)  |
 
 Prerequisites: `python3` on PATH, and passwordless `ssh localhost`.  Run:
 
@@ -372,7 +377,7 @@ Prerequisites: `python3` on PATH, and passwordless `ssh localhost`.  Run:
 ./tests.sh
 # or, when testing a different binary (e.g. a Nuitka build):
 BSCP=./bscp.nuitka ./tests.sh
-# or the Py2 client (skips 12 py3-only tests when `python` is Python 2):
+# or the Py2 client (skips 14 py3-only tests when `python` is Python 2):
 BSCP=./bscp.python2 ./tests.sh
 ```
 
@@ -381,12 +386,13 @@ them on exit.  Exit status is `0` on success, `1` if any test failed (with
 the failing names listed at the end), or `2` on missing prerequisites.
 
 When `$BSCP` runs under a Python 2 interpreter (detected from its shebang
-plus `python -V`), twelve tests are skipped by default and reported as
+plus `python -V`), fourteen tests are skipped by default and reported as
 `skip`: the two `--hash-threads` tests (the option is python3-only), the
 `-a` algorithm-rejection test (Py2's `hashlib` lacks the `shake_*` XOF
-functions it probes), and the nine `--verify` tests (the convenience b3sum
+functions it probes), the nine `--verify` tests (the convenience b3sum
 cross-check is not implemented in the python2 client, so the flag is
-unrecognised).  Pass `--force-all` to run every test regardless of
+unrecognised), and the two `BSCP_OPTIONS` tests (that env var is not read by
+the python2 client).  Pass `--force-all` to run every test regardless of
 interpreter.
 
 When investigating a single failure interactively, the manual idiom is

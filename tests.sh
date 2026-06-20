@@ -15,12 +15,13 @@
 #   ./tests.sh --force-all          # run every test even under a python2 client
 #
 # When $BSCP runs under a Python 2 interpreter (e.g. bscp.python2 where
-# `python` resolves to Python 2.x), twelve tests are skipped by default:
+# `python` resolves to Python 2.x), fourteen tests are skipped by default:
 # the two --hash-threads tests (the option is python3-only by design), the
 # -a algorithm-rejection test (Py2's hashlib lacks the shake_* XOF functions
-# the test probes), and the nine --verify tests (the convenience b3sum
-# cross-check is not implemented in the python2 client).  Pass --force-all
-# to run them anyway.
+# the test probes), the nine --verify tests (the convenience b3sum
+# cross-check is not implemented in the python2 client), and the two
+# BSCP_OPTIONS tests (that env var is not read by the python2 client).  Pass
+# --force-all to run them anyway.
 #
 # Exit status: 0 if all tests pass, non-zero otherwise.
 
@@ -50,7 +51,8 @@ esac
 PY2_SKIP="test_hash_threads_push test_hash_threads_single_pull test_reject_bad_algorithm \
 test_verify_push_match test_verify_mismatch_exit4 test_verify_skips_when_b3sum_unusable \
 test_verify_size_mismatch_skips test_verify_dryrun_zero_diff_runs test_verify_dryrun_with_diff_skips \
-test_verify_batch_mismatch_exit4 test_verify_batch_size_mismatch_exit5 test_verify_batch_blockcount_rejected"
+test_verify_batch_mismatch_exit4 test_verify_batch_size_mismatch_exit5 test_verify_batch_blockcount_rejected \
+test_bscp_options_applies test_bscp_options_cli_overrides"
 
 WORK=$(mktemp -d)
 SRC="$WORK/src.img"
@@ -468,6 +470,29 @@ test_verify_batch_blockcount_rejected() {
     (( $? == 2 ))
 }
 
+# BSCP_OPTIONS supplies default options before the real argv.  -B 1M from the
+# env caps the sync to the first 1 MiB, which prints a "Continue with" hint —
+# observable proof the env option took effect.
+test_bscp_options_applies() {
+    make_src 4
+    copy_src_to "$DST"
+    randomise_in "$DST" 8 100
+    local out
+    out=$(BSCP_OPTIONS="-B 1M" "$BSCP" "$SRC" "localhost:$DST" 2>&1)
+    grep -q "Continue with" <<<"$out"
+}
+
+# An explicit command-line option overrides the env default: -B 0 (no limit)
+# on the CLI beats -B 1M from BSCP_OPTIONS, so no "Continue with" hint.
+test_bscp_options_cli_overrides() {
+    make_src 4
+    copy_src_to "$DST"
+    randomise_in "$DST" 8 100
+    local out
+    out=$(BSCP_OPTIONS="-B 1M" "$BSCP" -B 0 "$SRC" "localhost:$DST" 2>&1)
+    ! grep -q "Continue with" <<<"$out"
+}
+
 test_exit2_when_no_host() {
     "$BSCP" "$SRC" "$DST" >/dev/null 2>&1
     (( $? == 2 ))
@@ -588,6 +613,8 @@ run "--verify under -N skips when diffs are pending"  test_verify_dryrun_with_di
 run "--batch --verify mismatch: silent, exits 4"     test_verify_batch_mismatch_exit4
 run "--batch --verify size mismatch: silent, exits 5" test_verify_batch_size_mismatch_exit5
 run "--batch --verify + -B rejected at argparse (2)" test_verify_batch_blockcount_rejected
+run "BSCP_OPTIONS default options take effect"       test_bscp_options_applies
+run "BSCP_OPTIONS overridden by explicit CLI option" test_bscp_options_cli_overrides
 run "exit 2 when neither side is HOST:path"          test_exit2_when_no_host
 run "friendly error when local file is missing"      test_friendly_error_for_missing_local
 run "reject unknown / zero-digest -a algorithm"      test_reject_bad_algorithm
