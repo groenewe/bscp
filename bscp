@@ -1525,7 +1525,8 @@ if __name__ == '__main__':
                              'the scan time first. Independent of -a, so this external BLAKE3 check '
                              'guards against block-hash weaknesses. A convenience check: needs '
                              'b3sum on each side, and warns + skips gracefully where it is missing. '
-                             'Skipped under --dry-run.')
+                             'Under --dry-run it runs only if the scan found zero diffs (an '
+                             'independent confirmation the two already match).')
 
     output = parser.add_argument_group('output')
     output.add_argument('-q', '--quiet',              action='store_true',
@@ -1677,12 +1678,21 @@ if __name__ == '__main__':
     # destination legitimately differs, so the comparison is skipped with a
     # warning.  Never fatal except a confirmed mismatch (exit 4): a missing or
     # failing b3sum just warns and skips.
-    if verify_enabled and dry_run:
-        report('verify: skipped (--dry-run made no changes)\n')
+    #
+    # Under --dry-run nothing was written, so verify runs ONLY when the scan
+    # found zero diffs — i.e. it claims the two are already identical, and
+    # b3sum independently confirms that (a mismatch then is a real and useful
+    # finding).  With diffs pending, the un-applied changes would make b3sum
+    # mismatch, so it is skipped.
+    if verify_enabled and dry_run and total_diffs > 0:
+        report('verify: skipped (--dry-run found %d diff blocks; destination not updated)\n'
+               % total_diffs)
     elif verify_enabled and shutil.which('b3sum') is None:
         report('verify: skipped — b3sum not found on local host '
                '(see https://github.com/BLAKE3-team/BLAKE3)\n')
     elif verify_enabled:
+        if dry_run:
+            report('verify: --dry-run scan found no diff blocks; confirming with b3sum\n')
         try:
             local_size = device_size(local_file)
         except OSError:

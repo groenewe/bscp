@@ -102,9 +102,9 @@ place the kept-but-rewired MT path lives: rewrite its `.hex()` calls as
 to pass).  After the shims, re-run `python2 -m py_compile bscp.python2 &&
 python3 -m py_compile bscp.python2`, then `BSCP=./bscp.python2 ./tests.sh`
 under both interpreters.  When the client runs under Python 2, `tests.sh`
-auto-skips seven tests (the two `--hash-threads` tests, since the option
+auto-skips nine tests (the two `--hash-threads` tests, since the option
 is absent; the `-a` rejection test, since Py2's `hashlib` lacks the
-`shake_*` XOF functions it probes; and the four `--verify` tests, since the
+`shake_*` XOF functions it probes; and the six `--verify` tests, since the
 b3sum cross-check is not implemented in the Py2 client); pass `--force-all`
 to run them anyway and watch them fail in the documented ways.  Under
 python3 the same file passes the tests for the features it implements.  The

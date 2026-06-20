@@ -35,8 +35,13 @@ shells out to `b3sum`:
 
 ## Mechanism
 
-In `__main__`, after a successful (non-dry-run) copy:
+In `__main__`, after a successful copy:
 
+0. Under `--dry-run` nothing was written, so verify runs **only when the scan
+   found zero diff blocks** — the scan then claims the two are already
+   identical, and b3sum independently confirms it (a mismatch there is a real
+   finding worth exit `4`).  With diffs pending, the un-applied changes would
+   make b3sum mismatch, so verify is skipped.
 1. If `shutil.which('b3sum')` finds nothing locally, verify warns and stops
    (the remote is not contacted).
 2. A **duration estimate** is printed first.  `b3sum` reads the whole device

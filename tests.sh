@@ -15,10 +15,10 @@
 #   ./tests.sh --force-all          # run every test even under a python2 client
 #
 # When $BSCP runs under a Python 2 interpreter (e.g. bscp.python2 where
-# `python` resolves to Python 2.x), seven tests are skipped by default:
+# `python` resolves to Python 2.x), nine tests are skipped by default:
 # the two --hash-threads tests (the option is python3-only by design), the
 # -a algorithm-rejection test (Py2's hashlib lacks the shake_* XOF functions
-# the test probes), and the four --verify tests (the convenience b3sum
+# the test probes), and the six --verify tests (the convenience b3sum
 # cross-check is not implemented in the python2 client).  Pass --force-all
 # to run them anyway.
 #
@@ -49,7 +49,7 @@ esac
 # the (convenience-only) b3sum cross-check, so the flag is unrecognised.
 PY2_SKIP="test_hash_threads_push test_hash_threads_single_pull test_reject_bad_algorithm \
 test_verify_push_match test_verify_mismatch_exit4 test_verify_skips_when_b3sum_unusable \
-test_verify_size_mismatch_skips"
+test_verify_size_mismatch_skips test_verify_dryrun_zero_diff_runs test_verify_dryrun_with_diff_skips"
 
 WORK=$(mktemp -d)
 SRC="$WORK/src.img"
@@ -401,6 +401,33 @@ test_verify_size_mismatch_skips() {
     grep -q 'comparison skipped (sizes differ' <<<"$out"
 }
 
+# Under --dry-run, verify runs only when the scan found zero diffs (an
+# independent confirmation the two already match).
+test_verify_dryrun_zero_diff_runs() {
+    command -v b3sum >/dev/null || return 0
+    make_src 6
+    copy_src_to "$DST"            # identical -> scan finds 0 diffs
+    local out
+    out=$("$BSCP" -N --verify "$SRC" "localhost:$DST" 2>&1)
+    grep -q 'verify OK: local and remote b3sum match' <<<"$out"
+}
+
+# With diffs pending, --dry-run verify is skipped (un-applied changes would
+# make b3sum mismatch) and the destination is left untouched.
+test_verify_dryrun_with_diff_skips() {
+    command -v b3sum >/dev/null || return 0
+    make_src 6
+    copy_src_to "$DST"
+    randomise_in "$DST" 8 100     # introduce diffs
+    local before out rc
+    before=$(md5sum "$DST" | cut -d' ' -f1)
+    out=$("$BSCP" -N --verify "$SRC" "localhost:$DST" 2>&1)
+    rc=$?
+    [[ $(md5sum "$DST" | cut -d' ' -f1) == "$before" ]] || return 1
+    (( rc == 0 )) || return 1
+    grep -q 'verify: skipped (--dry-run found' <<<"$out"
+}
+
 test_exit2_when_no_host() {
     "$BSCP" "$SRC" "$DST" >/dev/null 2>&1
     (( $? == 2 ))
@@ -516,6 +543,8 @@ run "--verify push, matching b3sum digests"          test_verify_push_match
 run "--verify detects a mismatch, exits 4"           test_verify_mismatch_exit4
 run "--verify skips gracefully when b3sum unusable"  test_verify_skips_when_b3sum_unusable
 run "--verify skips compare on size mismatch"        test_verify_size_mismatch_skips
+run "--verify under -N runs when scan finds 0 diffs" test_verify_dryrun_zero_diff_runs
+run "--verify under -N skips when diffs are pending"  test_verify_dryrun_with_diff_skips
 run "exit 2 when neither side is HOST:path"          test_exit2_when_no_host
 run "friendly error when local file is missing"      test_friendly_error_for_missing_local
 run "reject unknown / zero-digest -a algorithm"      test_reject_bad_algorithm
