@@ -123,6 +123,22 @@ bscp --allow-truncate /var/backups/disk.img myhost:/data/disk-half.img
 bscp --verify /dev/sda myhost:/dev/sda
 ```
 
+**`--verify` and SSH authentication.**  `--verify` opens a *second* SSH
+connection to run `b3sum` on the remote, separate from the transfer.  With
+key-based auth (the usual case) this is seamless.  With password / encrypted-
+key / 2FA auth it would otherwise prompt a second time — and that prompt
+arrives only after the transfer finishes, so a scripted run could appear to
+hang.  bscp does not set `ControlMaster`, so enabling SSH connection
+multiplexing in `~/.ssh/config` makes both connections share one
+authenticated channel (one prompt):
+
+```
+Host backup-server
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 60
+```
+
 ### Exit status
 
 | Code  | Meaning                                                                  |

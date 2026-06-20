@@ -66,6 +66,33 @@ In `__main__`, after a successful copy:
    meaningful** (see the gate below), and the verdict (`verify OK` /
    `VERIFY FAILED`) is printed.
 
+## SSH connections and authentication
+
+The remote `b3sum` runs over a **second, independent** `ssh` invocation
+(`b3sum_remote_cmd()`), separate from the transfer's connection — it is
+deliberately out of band, not part of the bscp wire protocol.  With
+key-based auth (and an agent, or an unencrypted key) this is invisible.  With
+interactive auth — password, encrypted key without an agent, or 2FA/OTP — the
+two connections authenticate independently, so the operator is prompted
+twice, the second time *after* the transfer completes (which can also stall a
+non-interactive `--batch` caller waiting on input).
+
+bscp intentionally does **not** pass `-o ControlMaster=...`, so the operator
+can collapse both connections onto one authenticated channel via SSH
+connection multiplexing in `~/.ssh/config`:
+
+```
+Host backup-server
+    ControlMaster auto
+    ControlPath ~/.ssh/cm-%r@%h:%p
+    ControlPersist 60
+```
+
+With that in place the transfer connection becomes the master and the verify
+connection reuses it — one authentication.  This was chosen over having bscp
+auto-enable multiplexing so the carefully-tuned transfer/retry connection
+path is left untouched; connection reuse is left to ssh, where it belongs.
+
 ## Comparison eligibility gate
 
 A whole-device `b3sum` of source and destination only matches when the
