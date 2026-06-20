@@ -37,15 +37,29 @@ shells out to `b3sum`:
 
 In `__main__`, after a successful (non-dry-run) copy:
 
-1. `external_hash_local('b3sum', local_file)` runs `b3sum LOCAL` and
-   `verify_digest()` takes the leading hex token (the path field differs
-   between the two sides, so only the digest is compared).  The local digest
-   is always printed.
-2. `external_hash_remote()` runs `ssh … HOST 'b3sum REMOTE'`, reusing the
-   transfer's connection options via `ssh_base()` and shell-quoting the tool
-   and path.  The remote digest is printed when available.
-3. The two are compared **only when the comparison is meaningful** — see the
-   gate below — and the verdict (`verify OK` / `VERIFY FAILED`) is printed.
+1. If `shutil.which('b3sum')` finds nothing locally, verify warns and stops
+   (the remote is not contacted).
+2. A **duration estimate** is printed first.  `b3sum` reads the whole device
+   once, exactly as phase A did, so the scan time (`do_sync` now returns
+   `total_scan_time` — read+hash, *excluding* the copy) is a good predictor.
+   It is scaled by `sync_size / (sync_size − start_offset)` so a resumed run
+   (where phase A skipped the head) still estimates the full-device hash.
+   Shown only when the estimate is ≥ 1 s.
+3. The local `b3sum LOCAL` process and the remote `ssh … HOST 'b3sum REMOTE'`
+   are launched **concurrently** (`spawn_hash()`), so wall-clock is the
+   slower of the two, not their sum.  The local result is collected first
+   (`collect_hash()`) while the remote runs; if the local hash fails, the
+   remote process is killed rather than waited on.  `verify_digest()` takes
+   the leading hex token of each (the path field differs between the two
+   sides, so only the digest is compared).
+4. The remote runs over the same `ssh_base()` options as the transfer,
+   **including the `ServerAliveInterval=15` keepalive** — essential here,
+   because `b3sum` can run for minutes with no channel data, and the
+   keepalive probes hold an idle (possibly NAT'd) connection open instead of
+   letting it drop.
+5. Both digests are printed, then compared **only when the comparison is
+   meaningful** (see the gate below), and the verdict (`verify OK` /
+   `VERIFY FAILED`) is printed.
 
 ## Comparison eligibility gate
 

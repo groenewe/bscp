@@ -173,25 +173,33 @@ bscp (single file)
 │                        connection surfaces as a BrokenPipeError within
 │                        ~60s instead of hanging.  User `-o` wins because
 │                        ssh applies the first matching `-o`.
-├── external_hash_*    — the --verify BLAKE3 cross-check (out-of-band, NOT a
-│   / verify_digest()    protocol change).  external_hash_local() runs
-│   / device_size()      `b3sum LOCAL`; external_hash_remote() runs
-│                        `ssh HOST b3sum REMOTE` (shell-quoted) over a fresh
-│                        ssh; verify_digest() extracts the leading hex token
-│                        (paths differ between sides, so only the digest is
-│                        compared).  device_size() seek-to-end sizes a path
-│                        because os.path.getsize() reports 0 for block
-│                        devices.  Orchestrated in __main__ after a
-│                        successful copy; see docs/verify.md.
+├── spawn_hash()       — the --verify BLAKE3 cross-check (out-of-band, NOT a
+│   / collect_hash()     protocol change).  b3sum_local_cmd() / b3sum_remote_
+│   / b3sum_*_cmd()      cmd() build the `b3sum LOCAL` and `ssh HOST b3sum
+│   / verify_digest()    REMOTE` (shell-quoted) commands; spawn_hash() starts
+│   / device_size()      each as a Popen so __main__ runs both CONCURRENTLY
+│                        (wall-clock = slower side, not the sum); collect_hash()
+│                        waits one and returns its digest.  verify_digest()
+│                        extracts the leading hex token (paths differ between
+│                        sides, so only the digest is compared).  The remote
+│                        ssh reuses ssh_base() — its ServerAliveInterval
+│                        keepalive holds the idle channel open while b3sum
+│                        runs for minutes.  device_size() seek-to-end sizes a
+│                        path because os.path.getsize() reports 0 for block
+│                        devices.  Orchestrated in __main__ after a successful
+│                        copy, with a duration estimate from do_sync's
+│                        returned scan time; see docs/verify.md.
 ├── do_sync()          — all transfer logic for both push and pull.  Hosts
 │                        a `show_copy_progress` closure that all three
 │                        phase-B branches (push, push --buffer, pull) share.
 │                        Phase A hashes local blocks on a ThreadPoolExecutor
 │                        (`ex_hash`) via a bounded feed/drain window
 │                        (`hash_window` = 2× workers) that preserves wire
-│                        order; see docs/remote-execution.md.  Returns
-│                        `remote_size` as well, which __main__ uses to gate
-│                        the --verify whole-device comparison (equal sizes).
+│                        order; see docs/remote-execution.md.  Also returns
+│                        `remote_size` (gates the --verify equal-size
+│                        comparison) and `total_scan_time` (phase-A read+hash
+│                        seconds, excluding copy — __main__ turns it into the
+│                        --verify duration estimate).
 └── __main__           — argparse, push/pull auto-detection, retry loop, and
                          the post-copy --verify orchestration (exit 4 on a
                          confirmed mismatch).

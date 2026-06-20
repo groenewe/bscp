@@ -42,6 +42,7 @@ import math
 import os
 import select
 import shlex
+import shutil
 import struct
 import subprocess
 import sys
@@ -787,7 +788,10 @@ def ssh_base(args):
     # BrokenPipeError on the client and engages the ConnectionLost path
     # (and --retries, if set).  Appended after the user's -o options
     # because ssh applies the first matching -o, so a user-supplied
-    # override still wins.
+    # override still wins.  This also covers the --verify ssh: b3sum can run
+    # for minutes with no channel data, and ServerAliveInterval probes keep
+    # the (possibly NAT'd) connection alive across that idle window instead
+    # of letting it be silently dropped.
     cmd = []
     if args.get('compress'):
         cmd.append('-C')
@@ -855,28 +859,35 @@ def verify_digest(output):
     return out.split()[0] if out else ''
 
 
-def external_hash_local(tool, path):
-    # Hash `path` with the external `tool` on this host.  Returns the tool's
-    # raw stdout (native check-file format) so --verify-log can store it
-    # verbatim for a later `tool -c FILE`.  Raises FileNotFoundError if the
-    # tool is missing, CalledProcessError on a nonzero exit (e.g. unreadable
-    # block device).
-    res = subprocess.run([tool, path], stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, check=True)
-    return res.stdout.decode('utf-8', 'replace')
+def b3sum_local_cmd(path):
+    return ['b3sum', path]
 
 
-def external_hash_remote(remote_host, remote_file, args, tool):
-    # Run `tool remote_file` on the remote over ssh, reusing the same
-    # connection options as the transfer.  The remote shell re-parses the
-    # command, so tool and path are shell-quoted.  Returns the tool's stdout,
-    # or None if ssh/the tool exits nonzero (tool missing, unreadable device).
-    remote_cmd = '%s %s' % (shlex.quote(tool), shlex.quote(remote_file))
-    cmd = ['ssh'] + ssh_base(args) + [remote_host, remote_cmd]
-    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if res.returncode != 0:
+def b3sum_remote_cmd(remote_host, remote_file, args):
+    # Run b3sum on the remote over ssh, reusing the transfer's connection
+    # options (ssh_base, including the keepalive that holds the idle channel
+    # open while b3sum runs).  The remote shell re-parses the command, so the
+    # path is shell-quoted.
+    return ['ssh'] + ssh_base(args) + [remote_host, 'b3sum %s' % shlex.quote(remote_file)]
+
+
+def spawn_hash(cmd):
+    # Start an external hash process and return its Popen, or None if the
+    # executable is missing on this host (local b3sum absent).
+    try:
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except OSError:
         return None
-    return res.stdout.decode('utf-8', 'replace')
+
+
+def collect_hash(proc):
+    # Wait for a spawn_hash() process and return (digest, error_text).  digest
+    # is None on any nonzero exit (missing/failing b3sum, unreadable device),
+    # in which case error_text carries the captured stderr for reporting.
+    out, err = proc.communicate()
+    if proc.returncode != 0:
+        return None, err.decode('utf-8', 'replace').strip()
+    return verify_digest(out.decode('utf-8', 'replace')), ''
 
 
 def device_size(path):
@@ -1018,7 +1029,7 @@ def do_sync(local_file, remote_host, remote_file, mode,
         if sync_size == 0:
             # Server has already exited (matching `if sync_size == 0: sys.exit(0)`).
             _shutdown_proc(proc)
-            return io.in_total, io.out_total, 0, 0, 0, remote_size
+            return io.in_total, io.out_total, 0, 0, 0, remote_size, 0.0
         eff_section    = section_size or sync_size
         total_blocks   = max(1, (sync_size + blocksize - 1) // blocksize)
         skipped_blocks = start_offset // blocksize
@@ -1432,7 +1443,7 @@ def do_sync(local_file, remote_host, remote_file, mode,
 
         _shutdown_proc(proc)
 
-    return io.in_total, io.out_total, sync_size, total_diffs, total_written, remote_size
+    return io.in_total, io.out_total, sync_size, total_diffs, total_written, remote_size, total_scan_time
 
 
 if __name__ == '__main__':
@@ -1507,13 +1518,14 @@ if __name__ == '__main__':
 
     verification = parser.add_argument_group('verification')
     verification.add_argument('--verify',              action='store_true',
-                        help='after copying, run b3sum on the local file and (when available) on '
-                             'the remote file, and print both digests. If the whole device was '
+                        help='after copying, run b3sum on the local and (when available) remote '
+                             'file concurrently and print both digests. If the whole device was '
                              'copied and the local and remote sizes match, compare them and report '
-                             'OK / mismatch (exit 4 on mismatch). Independent of -a, so this '
-                             'external BLAKE3 check guards against block-hash weaknesses. A '
-                             'convenience check: needs b3sum on each side, and warns + skips '
-                             'gracefully where it is missing. Skipped under --dry-run.')
+                             'OK / mismatch (exit 4 on mismatch). Prints a duration estimate from '
+                             'the scan time first. Independent of -a, so this external BLAKE3 check '
+                             'guards against block-hash weaknesses. A convenience check: needs '
+                             'b3sum on each side, and warns + skips gracefully where it is missing. '
+                             'Skipped under --dry-run.')
 
     output = parser.add_argument_group('output')
     output.add_argument('-q', '--quiet',              action='store_true',
@@ -1604,7 +1616,7 @@ if __name__ == '__main__':
         while True:
             try:
                 (in_total, out_total, sync_size,
-                 total_diffs, total_written, remote_size) = do_sync(
+                 total_diffs, total_written, remote_size, scan_seconds) = do_sync(
                     local_file, remote_host, remote_file,
                     mode, blocksize, section_size, hashname,
                     start_offset=start_offset, dry_run=dry_run,
@@ -1658,44 +1670,60 @@ if __name__ == '__main__':
 
     # ── Post-copy verification (convenience BLAKE3 cross-check) ───────────
     # Run b3sum on the local file and, when present, on the remote file, and
-    # print both digests.  A verdict (OK / mismatch) is only issued when the
-    # whole device was copied to a same-size destination — otherwise a
-    # whole-device hash of source and destination legitimately differs, so the
-    # comparison is skipped with a warning.  Never fatal except a confirmed
-    # mismatch (exit 4): a missing or failing b3sum just warns and skips.
+    # print both digests.  The two runs are launched concurrently (local
+    # process + remote ssh) so wall-clock is the slower side, not the sum.  A
+    # verdict (OK / mismatch) is only issued when the whole device was copied
+    # to a same-size destination — otherwise a whole-device hash of source and
+    # destination legitimately differs, so the comparison is skipped with a
+    # warning.  Never fatal except a confirmed mismatch (exit 4): a missing or
+    # failing b3sum just warns and skips.
     if verify_enabled and dry_run:
         report('verify: skipped (--dry-run made no changes)\n')
+    elif verify_enabled and shutil.which('b3sum') is None:
+        report('verify: skipped — b3sum not found on local host '
+               '(see https://github.com/BLAKE3-team/BLAKE3)\n')
     elif verify_enabled:
-        local_hash = None
         try:
-            local_hash = verify_digest(external_hash_local('b3sum', local_file))
-            report('verify: local  b3sum %s = %s\n' % (local_file, local_hash))
-        except FileNotFoundError:
-            report('verify: skipped — b3sum not found on local host '
-                   '(see https://github.com/BLAKE3-team/BLAKE3)\n')
-        except (subprocess.CalledProcessError, OSError) as exc:
-            err = (exc.stderr.decode('utf-8', 'replace').strip()
-                   if isinstance(exc, subprocess.CalledProcessError) else exc)
-            report('verify: skipped — b3sum failed on %s: %s\n' % (local_file, err))
+            local_size = device_size(local_file)
+        except OSError:
+            local_size = -1
 
-        if local_hash is not None:
-            remote_out  = external_hash_remote(remote_host, remote_file, ssh_args, 'b3sum')
-            if remote_out is None:
+        # b3sum reads the whole device once, just as phase A did — so the
+        # scan time (read+hash, excluding the copy) is a good duration
+        # estimate, scaled up if a resume (-r) made phase A skip the head.
+        scanned = max(1, sync_size - start_offset)
+        eta = scan_seconds * sync_size / scanned
+        if eta >= 1:
+            report('verify: hashing both ends with b3sum (est. ~%s from scan time)\n'
+                   % format_time(eta))
+        else:
+            report('verify: hashing both ends with b3sum\n')
+
+        # Launch local and remote concurrently; collect local first (remote
+        # runs meanwhile), so total wall-clock ≈ max(local, remote).
+        lp = spawn_hash(b3sum_local_cmd(local_file))
+        rp = spawn_hash(b3sum_remote_cmd(remote_host, remote_file, ssh_args))
+        local_hash, lerr = collect_hash(lp) if lp else (None, 'not found')
+
+        if local_hash is None:
+            if rp is not None:          # local failed — stop waiting on remote
+                rp.kill()
+                rp.communicate()
+            report('verify: skipped — b3sum failed on %s: %s\n' % (local_file, lerr))
+        else:
+            report('verify: local  b3sum %s = %s\n' % (local_file, local_hash))
+            remote_hash, _ = collect_hash(rp) if rp else (None, '')
+            if remote_hash is None:
                 report('verify: remote b3sum unavailable on %s — comparison skipped\n' % remote_host)
             else:
-                remote_hash = verify_digest(remote_out)
                 report('verify: remote b3sum %s = %s\n' % (remote_file, remote_hash))
-                try:
-                    local_size = device_size(local_file)
-                except OSError:
-                    local_size = -1
                 if args.block_count:
                     report('verify: comparison skipped (partial copy: -B in effect)\n')
                 elif local_size != remote_size:
                     report('verify: comparison skipped (sizes differ: local %s, remote %s)\n' % (
                         format_size(local_size, floor=True) if local_size >= 0 else '?',
                         format_size(remote_size, floor=True)))
-                elif remote_hash and remote_hash == local_hash:
+                elif remote_hash == local_hash:
                     report('verify OK: local and remote b3sum match\n')
                 else:
                     report('VERIFY FAILED: b3sum digests differ\n')
