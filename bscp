@@ -1793,6 +1793,8 @@ if __name__ == '__main__':
         rp = spawn_hash(b3sum_remote_cmd(remote_host, remote_file, ssh_args),
                         stdin=subprocess.DEVNULL)
         try:
+            oldmsg = ''
+            last_report_len = 0 # no trailing spaces needed yet, we're on a new report() line
             while (lp is not None and lp.poll() is None) or (rp is not None and rp.poll() is None):
                 # Local already finished and failed — its hash is unusable, so
                 # stop waiting on the remote rather than block for a discarded
@@ -1806,13 +1808,21 @@ if __name__ == '__main__':
                     # Only show the countdown when the estimate clears the same
                     # warmup threshold the scan/copy ETA uses — for shorter runs
                     # the number is noise, so show elapsed alone.
-                    if eta > ETA_WARMUP_SECS:
-                        rem    = eta - elapsed
-                        rem_s  = format_time(rem, round_eta=True) if rem >= 0 else '-' + format_time(-rem, round_eta=True)
-                        report('\rverify: hashing both ends with b3sum - %s (%s) '
-                               % (format_time(elapsed), rem_s))
+                    if elapsed > ETA_WARMUP_SECS:
+                        rem_s = ''
+                        rem = eta - elapsed
+                        if rem >= 0:
+                           rem_s = '-'
+                        elif rem < 0:
+                           rem = -rem
+                           rem_s = '+'
+                        rem_s = "(%c%s) " % (rem_s, format_time(rem, round_eta=True))
                     else:
-                        report('\rverify: hashing both ends with b3sum - %s ' % format_time(elapsed))
+                        rem_s = '... '
+                    vermsg = '\rverify: hashing both ends with b3sum %s' % rem_s
+                    if vermsg != oldmsg:
+                        oldmsg = vermsg
+                        report(vermsg) # only update verify "progress" if first or changed status
                 sleep(REPORT_INTERVAL)
 
             local_hash, lerr = collect_hash(lp) if lp else (None, 'not found')
