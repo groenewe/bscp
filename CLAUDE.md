@@ -184,7 +184,10 @@ bscp (single file)
 │                        sides, so only the digest is compared).  The remote
 │                        ssh reuses ssh_base() — its ServerAliveInterval
 │                        keepalive holds the idle channel open while b3sum
-│                        runs for minutes.  device_size() seek-to-end sizes a
+│                        runs for minutes — and adds `-tt` (force remote PTY)
+│                        plus stdin=DEVNULL so a Ctrl+C SIGHUPs the remote
+│                        b3sum instead of orphaning it behind a multiplexing
+│                        master (see docs/verify.md).  device_size() seek-to-end sizes a
 │                        path because os.path.getsize() reports 0 for block
 │                        devices.  Orchestrated in __main__ after a successful
 │                        copy: both processes are polled in a loop that renders

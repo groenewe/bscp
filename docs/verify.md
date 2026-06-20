@@ -69,7 +69,17 @@ In `__main__`, after a successful copy:
    **including the `ServerAliveInterval=15` keepalive** — essential here,
    because `b3sum` can run for minutes with no channel data, and the
    keepalive probes hold an idle (possibly NAT'd) connection open instead of
-   letting it drop.
+   letting it drop.  The remote `ssh` is additionally given **`-tt`** (force
+   a remote PTY) and `stdin=DEVNULL`.  Without the PTY, a Ctrl+C during the
+   hash leaves the remote `b3sum` running to the end: the handler kills the
+   *local* `ssh`, but when that `ssh` is a multiplexing slave (the
+   recommended setup — see below), the persistent master keeps the channel
+   open, so the slave's death never tears it down; and `b3sum` writes nothing
+   until the final digest line, so it never trips `SIGPIPE` either.  A
+   controlling terminal closes that gap — the remote `b3sum` is `SIGHUP`'d
+   when the channel's PTY is hung up, even over a persistent master.  (The
+   PTY merges remote stderr into stdout and adds CRs; `verify_digest()` reads
+   the leading hex token, so the digest parse is unaffected.)
 5. Both digests are printed, then compared **only when the comparison is
    meaningful** (see the gate below), and the verdict (`verify OK` /
    `VERIFY FAILED`) is printed.

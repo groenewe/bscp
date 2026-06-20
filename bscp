@@ -884,14 +884,30 @@ def b3sum_remote_cmd(remote_host, remote_file, args):
     # options (ssh_base, including the keepalive that holds the idle channel
     # open while b3sum runs).  The remote shell re-parses the command, so the
     # path is shell-quoted.
-    return ['ssh'] + ssh_base(args) + [remote_host, 'b3sum %s' % shlex.quote(remote_file)]
+    #
+    # `-tt` forces a remote PTY (double -t: even though our stdin is not a
+    # tty).  Without it, Ctrl+C during verify can leave the remote b3sum
+    # running for the whole device: the handler kills the *local* ssh, but
+    # when that ssh is a multiplexing slave (ControlMaster — the common case
+    # here, used to avoid a second auth), the master keeps the channel open,
+    # so killing the slave never tears the b3sum channel down.  b3sum writes
+    # nothing until the final digest line, so it also never trips SIGPIPE on
+    # the dead client — it reads to the end, orphaned.  With a PTY the remote
+    # b3sum has a controlling terminal: when the client/channel goes, the pty
+    # is hung up and the kernel SIGHUPs it, even over a persistent master.
+    # The PTY merges remote stderr into stdout and adds CRs; verify_digest
+    # takes the leading hex token, so the digest parse is unaffected, and the
+    # remote-failure branch discards remote stderr anyway.
+    return ['ssh', '-tt'] + ssh_base(args) + [remote_host, 'b3sum %s' % shlex.quote(remote_file)]
 
 
-def spawn_hash(cmd):
+def spawn_hash(cmd, stdin=None):
     # Start an external hash process and return its Popen, or None if the
-    # executable is missing on this host (local b3sum absent).
+    # executable is missing on this host (local b3sum absent).  The remote
+    # invocation passes stdin=DEVNULL so its `ssh -tt` does not fight bscp
+    # for the user's controlling terminal.
     try:
-        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        return subprocess.Popen(cmd, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except OSError:
         return None
 
@@ -1774,7 +1790,8 @@ if __name__ == '__main__':
         verify_progress = not args.quiet and not args.batch
         t_verify_start  = time()
         lp = spawn_hash(b3sum_local_cmd(local_file))
-        rp = spawn_hash(b3sum_remote_cmd(remote_host, remote_file, ssh_args))
+        rp = spawn_hash(b3sum_remote_cmd(remote_host, remote_file, ssh_args),
+                        stdin=subprocess.DEVNULL)
         try:
             while (lp is not None and lp.poll() is None) or (rp is not None and rp.poll() is None):
                 # Local already finished and failed — its hash is unusable, so
