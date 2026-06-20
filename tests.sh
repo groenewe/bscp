@@ -15,10 +15,10 @@
 #   ./tests.sh --force-all          # run every test even under a python2 client
 #
 # When $BSCP runs under a Python 2 interpreter (e.g. bscp.python2 where
-# `python` resolves to Python 2.x), nine tests are skipped by default:
+# `python` resolves to Python 2.x), ten tests are skipped by default:
 # the two --hash-threads tests (the option is python3-only by design), the
 # -a algorithm-rejection test (Py2's hashlib lacks the shake_* XOF functions
-# the test probes), and the six --verify tests (the convenience b3sum
+# the test probes), and the seven --verify tests (the convenience b3sum
 # cross-check is not implemented in the python2 client).  Pass --force-all
 # to run them anyway.
 #
@@ -49,7 +49,8 @@ esac
 # the (convenience-only) b3sum cross-check, so the flag is unrecognised.
 PY2_SKIP="test_hash_threads_push test_hash_threads_single_pull test_reject_bad_algorithm \
 test_verify_push_match test_verify_mismatch_exit4 test_verify_skips_when_b3sum_unusable \
-test_verify_size_mismatch_skips test_verify_dryrun_zero_diff_runs test_verify_dryrun_with_diff_skips"
+test_verify_size_mismatch_skips test_verify_dryrun_zero_diff_runs test_verify_dryrun_with_diff_skips \
+test_verify_batch_mismatch_exit4"
 
 WORK=$(mktemp -d)
 SRC="$WORK/src.img"
@@ -428,6 +429,23 @@ test_verify_dryrun_with_diff_skips() {
     grep -q 'verify: skipped (--dry-run found' <<<"$out"
 }
 
+# --batch + --verify: a mismatch must still surface via exit 4 with NO stderr
+# (the only channel left under --batch; the combination the help documents).
+test_verify_batch_mismatch_exit4() {
+    command -v b3sum >/dev/null || return 0
+    make_src 4
+    copy_src_to "$DST"
+    local fake="$WORK/fakebin2"
+    mkdir -p "$fake"
+    printf '#!/bin/sh\nprintf "%%s  %%s\\n" "$(basename "$1" | md5sum | cut -d" " -f1)" "$1"\n' > "$fake/b3sum"
+    chmod +x "$fake/b3sum"
+    local out rc
+    out=$(PATH="$fake:$PATH" "$BSCP" --batch --verify "$SRC" "localhost:$DST" 2>&1)
+    rc=$?
+    rm -rf "$fake"
+    (( rc == 4 )) && [[ -z $out ]]
+}
+
 test_exit2_when_no_host() {
     "$BSCP" "$SRC" "$DST" >/dev/null 2>&1
     (( $? == 2 ))
@@ -545,6 +563,7 @@ run "--verify skips gracefully when b3sum unusable"  test_verify_skips_when_b3su
 run "--verify skips compare on size mismatch"        test_verify_size_mismatch_skips
 run "--verify under -N runs when scan finds 0 diffs" test_verify_dryrun_zero_diff_runs
 run "--verify under -N skips when diffs are pending"  test_verify_dryrun_with_diff_skips
+run "--batch --verify mismatch: silent, exits 4"     test_verify_batch_mismatch_exit4
 run "exit 2 when neither side is HOST:path"          test_exit2_when_no_host
 run "friendly error when local file is missing"      test_friendly_error_for_missing_local
 run "reject unknown / zero-digest -a algorithm"      test_reject_bad_algorithm

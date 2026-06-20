@@ -360,6 +360,7 @@ to cover, plus a few that were easy to forget:
 | `--verify` skips compare on size mismatch        | `--allow-truncate` smaller dst → "sizes differ"   |
 | `--verify` under `-N` runs when scan finds 0 diffs | dry-run + identical → b3sum confirms, "verify OK"  |
 | `--verify` under `-N` skips when diffs pending   | dry-run + diffs → skipped, destination untouched  |
+| `--batch --verify` mismatch is silent, exits 4   | exit code is the only mismatch signal under batch |
 
 Prerequisites: `python3` on PATH, and passwordless `ssh localhost`.  Run:
 
@@ -367,7 +368,7 @@ Prerequisites: `python3` on PATH, and passwordless `ssh localhost`.  Run:
 ./tests.sh
 # or, when testing a different binary (e.g. a Nuitka build):
 BSCP=./bscp.nuitka ./tests.sh
-# or the Py2 client (skips 9 py3-only tests when `python` is Python 2):
+# or the Py2 client (skips 10 py3-only tests when `python` is Python 2):
 BSCP=./bscp.python2 ./tests.sh
 ```
 
@@ -376,10 +377,10 @@ them on exit.  Exit status is `0` on success, `1` if any test failed (with
 the failing names listed at the end), or `2` on missing prerequisites.
 
 When `$BSCP` runs under a Python 2 interpreter (detected from its shebang
-plus `python -V`), nine tests are skipped by default and reported as
+plus `python -V`), ten tests are skipped by default and reported as
 `skip`: the two `--hash-threads` tests (the option is python3-only), the
 `-a` algorithm-rejection test (Py2's `hashlib` lacks the `shake_*` XOF
-functions it probes), and the six `--verify` tests (the convenience b3sum
+functions it probes), and the seven `--verify` tests (the convenience b3sum
 cross-check is not implemented in the python2 client, so the flag is
 unrecognised).  Pass `--force-all` to run every test regardless of
 interpreter.
