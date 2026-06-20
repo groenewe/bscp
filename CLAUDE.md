@@ -361,6 +361,8 @@ to cover, plus a few that were easy to forget:
 | `--verify` under `-N` runs when scan finds 0 diffs | dry-run + identical → b3sum confirms, "verify OK"  |
 | `--verify` under `-N` skips when diffs pending   | dry-run + diffs → skipped, destination untouched  |
 | `--batch --verify` mismatch is silent, exits 4   | exit code is the only mismatch signal under batch |
+| `--batch --verify` size mismatch silent, exits 5 | verify-not-performed signalled when stderr muted  |
+| `--batch --verify` + `-B` rejected, exits 2      | argparse pre-validation of the impossible combo   |
 
 Prerequisites: `python3` on PATH, and passwordless `ssh localhost`.  Run:
 
@@ -368,7 +370,7 @@ Prerequisites: `python3` on PATH, and passwordless `ssh localhost`.  Run:
 ./tests.sh
 # or, when testing a different binary (e.g. a Nuitka build):
 BSCP=./bscp.nuitka ./tests.sh
-# or the Py2 client (skips 10 py3-only tests when `python` is Python 2):
+# or the Py2 client (skips 12 py3-only tests when `python` is Python 2):
 BSCP=./bscp.python2 ./tests.sh
 ```
 
@@ -377,10 +379,10 @@ them on exit.  Exit status is `0` on success, `1` if any test failed (with
 the failing names listed at the end), or `2` on missing prerequisites.
 
 When `$BSCP` runs under a Python 2 interpreter (detected from its shebang
-plus `python -V`), ten tests are skipped by default and reported as
+plus `python -V`), twelve tests are skipped by default and reported as
 `skip`: the two `--hash-threads` tests (the option is python3-only), the
 `-a` algorithm-rejection test (Py2's `hashlib` lacks the `shake_*` XOF
-functions it probes), and the seven `--verify` tests (the convenience b3sum
+functions it probes), and the nine `--verify` tests (the convenience b3sum
 cross-check is not implemented in the python2 client, so the flag is
 unrecognised).  Pass `--force-all` to run every test regardless of
 interpreter.
@@ -448,12 +450,20 @@ rely solely on the exit status:
 | `2`       | Bad arguments                                  |
 | `3`       | Connection lost — resume with `--resume-from`  |
 | `4`       | `--verify` mismatch (local/remote b3sum differ)|
+| `5`       | `--verify` not performed under `--batch`       |
 | `130`     | Interrupted (Ctrl+C)                           |
 
-Exit `4` is the **only** thing `--verify` changes about the exit status: a
-missing or failing `b3sum`, a partial copy (`-B`), or differing sizes warn
-and skip the comparison without affecting the exit code.  Under `--batch`
-(all stderr suppressed) the mismatch is conveyed solely by exit `4`.
+`--verify` adds exit `4` (mismatch) and exit `5`.  Exit `5` exists only
+because `--batch` suppresses stderr: a verify that *could not run* (differing
+sizes, or `b3sum` missing/failing on either side) would otherwise warn and
+exit `0`, which under `--batch` is indistinguishable from a clean success.
+So under `--batch` those skip conditions exit `5` instead (see
+`verify_unavailable()` in `__main__`); **without** `--batch` they stay
+visible warnings with exit `0`.  The one statically-knowable impossible case
+— `-B` (partial copy) together with `--batch --verify` — is rejected at
+argparse with exit `2` rather than running a full copy first.  `--resume-from`
+is *not* blocked: verify hashes the final whole-device state, so an
+incomplete resume surfaces as a normal exit `4` mismatch.
 
 Both flags are forwarded into the resume command printed by
 `build_resume_cmd()`, so a resumed invocation keeps the same verbosity level.

@@ -1526,17 +1526,21 @@ if __name__ == '__main__':
                              'guards against block-hash weaknesses. A convenience check: needs '
                              'b3sum on each side, and warns + skips gracefully where it is missing. '
                              'Under --dry-run it runs only if the scan found zero diffs (an '
-                             'independent confirmation the two already match).')
+                             'independent confirmation the two already match). Under --batch a '
+                             'verify that cannot be performed exits 5, and combining it with -B '
+                             'is rejected (exit 2).')
 
     output = parser.add_argument_group('output')
     output.add_argument('-q', '--quiet',              action='store_true',
                         help='suppress scan/copy progress lines; errors and warnings are still shown')
     output.add_argument('--batch',                    action='store_true',
                         help='suppress all stderr output; use exit status to detect errors (implies -q). '
-                             'Exit 0=success, 1=fatal error, 2=bad arguments, '
-                             '3=connection lost, 4=verify mismatch (with --verify), 130=interrupted. '
-                             'With --verify, exit 4 is the only signal of a mismatch (the '
-                             '"VERIFY FAILED" line is suppressed). '
+                             'Exit 0=success, 1=fatal error, 2=bad arguments, 3=connection lost, '
+                             '4=verify mismatch, 5=verify not performed, 130=interrupted. '
+                             'With --verify, exit 4 (mismatch) and exit 5 (could not verify — '
+                             'differing sizes or b3sum missing/failing on either side) are the '
+                             'only signals, since their stderr lines are suppressed; the -B + '
+                             '--verify combination is rejected up front (exit 2). '
                              'Note: the exit code cannot convey the resume offset; '
                              'callers that need to resume should use -q instead and '
                              'parse the "Resume with:" line from stderr.')
@@ -1552,6 +1556,15 @@ if __name__ == '__main__':
     args = parser.parse_args()
     quiet = args.quiet or args.batch
     batch = args.batch
+
+    # Pre-validation: a -B partial copy can never be whole-device verified,
+    # and --batch suppresses the "comparison skipped" warning — so refuse the
+    # combination up front (exit 2) rather than run a full copy that ends in a
+    # guaranteed-useless, silently-skipped verify.  (-B with --verify but
+    # without --batch is fine: the skip warning is visible.)
+    if args.batch and args.verify and args.block_count:
+        parser.error('--batch --verify is incompatible with -B/--block-count '
+                     '(a partial copy cannot be whole-device verified)')
 
     src, dst = args.src, args.dst
     if ':' in src and ':' not in dst:
@@ -1677,21 +1690,34 @@ if __name__ == '__main__':
     # process + remote ssh) so wall-clock is the slower side, not the sum.  A
     # verdict (OK / mismatch) is only issued when the whole device was copied
     # to a same-size destination — otherwise a whole-device hash of source and
-    # destination legitimately differs, so the comparison is skipped with a
-    # warning.  Never fatal except a confirmed mismatch (exit 4): a missing or
-    # failing b3sum just warns and skips.
+    # destination legitimately differs, so the comparison is skipped.
+    #
+    # Outcomes: match -> exit 0; mismatch -> exit 4.  A verify that was
+    # requested but could NOT be performed (missing/failing b3sum on either
+    # side, or differing sizes) normally just warns and exits 0 — but under
+    # --batch that warning is suppressed, so it would look like success.  To
+    # avoid that false positive, verify_unavailable() exits 5 ("verification
+    # not performed") under --batch.  The -B + --batch + --verify combination
+    # is rejected even earlier, at argparse (exit 2), since a partial copy can
+    # never be whole-device verified and that is knowable from the args alone.
     #
     # Under --dry-run nothing was written, so verify runs ONLY when the scan
     # found zero diffs — i.e. it claims the two are already identical, and
     # b3sum independently confirms that (a mismatch then is a real and useful
     # finding).  With diffs pending, the un-applied changes would make b3sum
-    # mismatch, so it is skipped.
+    # mismatch, so it is skipped (this dry-run skip is expected, not a
+    # verify-impossible condition, so it does not trip exit 5).
+    def verify_unavailable(msg):
+        report(msg)
+        if batch:
+            sys.exit(5)
+
     if verify_enabled and dry_run and total_diffs > 0:
         report('verify: skipped (--dry-run found %d diff blocks; destination not updated)\n'
                % total_diffs)
     elif verify_enabled and shutil.which('b3sum') is None:
-        report('verify: skipped — b3sum not found on local host '
-               '(see https://github.com/BLAKE3-team/BLAKE3)\n')
+        verify_unavailable('verify: skipped — b3sum not found on local host '
+                           '(see https://github.com/BLAKE3-team/BLAKE3)\n')
     elif verify_enabled:
         if dry_run:
             report('verify: --dry-run scan found no diff blocks; confirming with b3sum\n')
@@ -1721,20 +1747,24 @@ if __name__ == '__main__':
             if rp is not None:          # local failed — stop waiting on remote
                 rp.kill()
                 rp.communicate()
-            report('verify: skipped — b3sum failed on %s: %s\n' % (local_file, lerr))
+            verify_unavailable('verify: skipped — b3sum failed on %s: %s\n' % (local_file, lerr))
         else:
             report('verify: local  b3sum %s = %s\n' % (local_file, local_hash))
             remote_hash, _ = collect_hash(rp) if rp else (None, '')
             if remote_hash is None:
-                report('verify: remote b3sum unavailable on %s — comparison skipped\n' % remote_host)
+                verify_unavailable('verify: remote b3sum unavailable on %s — comparison skipped\n'
+                                   % remote_host)
             else:
                 report('verify: remote b3sum %s = %s\n' % (remote_file, remote_hash))
                 if args.block_count:
+                    # Non-batch only: the --batch + -B combination is rejected
+                    # at argparse, so this branch is never reached under batch.
                     report('verify: comparison skipped (partial copy: -B in effect)\n')
                 elif local_size != remote_size:
-                    report('verify: comparison skipped (sizes differ: local %s, remote %s)\n' % (
-                        format_size(local_size, floor=True) if local_size >= 0 else '?',
-                        format_size(remote_size, floor=True)))
+                    verify_unavailable(
+                        'verify: comparison skipped (sizes differ: local %s, remote %s)\n' % (
+                            format_size(local_size, floor=True) if local_size >= 0 else '?',
+                            format_size(remote_size, floor=True)))
                 elif remote_hash == local_hash:
                     report('verify OK: local and remote b3sum match\n')
                 else:

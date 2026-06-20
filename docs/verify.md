@@ -70,7 +70,8 @@ In `__main__`, after a successful copy:
 
 A whole-device `b3sum` of source and destination only matches when the
 destination is a byte-for-byte copy of the source over the entire device.
-The comparison is therefore **skipped with a warning** (exit stays `0`) when:
+The comparison is therefore **skipped** (with a warning; see *Exit code* for
+how `--batch` changes this) when:
 
 - `-B` / `--block-count` capped the copy (only a prefix was synced);
 - the local and remote sizes differ (e.g. `--allow-truncate` to a smaller
@@ -83,10 +84,24 @@ final whole-device state, which a resumed run completes.
 
 ## Exit code
 
-A **confirmed** mismatch (both digests present, sizes equal, full copy, and
-the hex differs) exits `4`.  Every skip path above leaves the exit code
-unchanged.  Under `--batch` (all stderr suppressed) exit `4` is the only
-signal of a mismatch.
+| Outcome                                              | Exit |
+| ---------------------------------------------------- | ---- |
+| Digests match (or no comparison requested)           | `0`  |
+| Confirmed mismatch (sizes equal, full copy, hex differs) | `4`  |
+| Verify could not be performed, **under `--batch`**   | `5`  |
+| `-B` together with `--batch --verify`                | `2` (argparse) |
+
+Without `--batch`, the skip conditions above just print a warning and leave
+the exit code at `0` — the operator can see what happened.  Under `--batch`
+all stderr is suppressed, so a silent exit `0` would be indistinguishable
+from a verified success.  `verify_unavailable()` therefore exits `5` for any
+verify that was requested but could not run (differing sizes, or `b3sum`
+missing/failing on either side).  The one case knowable from the command line
+alone — a `-B` partial copy under `--batch --verify` — is rejected at
+argparse (exit `2`) so a full copy is not run just to end in a guaranteed
+skip.  (The dry-run "diffs pending, destination not updated" skip is an
+expected `-N` outcome, not a verify-impossible condition, so it does not trip
+exit `5`.)
 
 ## Limitations
 
