@@ -61,15 +61,18 @@ that ports cleanly to Python 2):
   the remote) with no protocol or remote-script involvement — so leaving it
   out of `bscp.python2` costs nothing on the wire.  When refreshing
   `bscp.python2`, omit the `--verify` argparse entry, the `ssh_base` /
-  `external_hash_local` / `external_hash_remote` / `verify_digest` /
-  `device_size` helpers, and the post-copy verify block in `__main__`
-  (`do_sync` then need not return `remote_size`).  `tests.sh` skips the nine
-  `--verify` tests under a Python 2 client.
+  `external_hash_local` / `external_hash_remote` / `verify_digest` helpers,
+  and the post-copy verify block in `__main__` (`do_sync` then need not
+  return `remote_size`).  `tests.sh` skips the nine `--verify` tests under a
+  Python 2 client.  Note `device_size` **is** carried (it predates `--verify`
+  in spirit): the `-r NN%` resume path resolves the percentage against it,
+  not `os.path.getsize`, which reports 0 for block devices and would
+  silently collapse any `NN%` to offset 0.
 
-The `BSCP_OPTIONS` env var (default command-line options, prepended to argv
-in the python3 client's `__main__`) is likewise not read by `bscp.python2` —
-trivial to port (`shlex.split` + prepend) when refreshing, but absent for
-now; `tests.sh` skips its two tests under a Python 2 client.
+The `BSCP_OPTIONS` env var (default command-line options, `shlex.split` and
+prepended to argv before `parse_args` so an explicit flag still overrides
+them) **is** honoured by `bscp.python2`, matching the python3 client;
+`tests.sh` runs its two tests under a Python 2 client.
 
 Everything else — section-based scan/copy, `--buffer`,
 `--allow-truncate`, `-B`, resume, retries, the unified ETA model with
@@ -107,12 +110,12 @@ place the kept-but-rewired MT path lives: rewrite its `.hex()` calls as
 to pass).  After the shims, re-run `python2 -m py_compile bscp.python2 &&
 python3 -m py_compile bscp.python2`, then `BSCP=./bscp.python2 ./tests.sh`
 under both interpreters.  When the client runs under Python 2, `tests.sh`
-auto-skips fourteen tests (the two `--hash-threads` tests, since the option
+auto-skips twelve tests (the two `--hash-threads` tests, since the option
 is absent; the `-a` rejection test, since Py2's `hashlib` lacks the
-`shake_*` XOF functions it probes; the nine `--verify` tests, since the
-b3sum cross-check is not implemented in the Py2 client; and the two
-`BSCP_OPTIONS` tests, since that env var is not read by the Py2 client);
-pass `--force-all`
+`shake_*` XOF functions it probes; and the nine `--verify` tests, since the
+b3sum cross-check is not implemented in the Py2 client).  The two
+`BSCP_OPTIONS` tests run under Py2 (the env var is honoured there too).
+Pass `--force-all`
 to run them anyway and watch them fail in the documented ways.  Under
 python3 the same file passes the tests for the features it implements.  The
 `--io-timeout` removal also

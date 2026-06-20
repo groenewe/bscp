@@ -57,7 +57,8 @@ In `__main__`, after a successful copy:
    estimate exceeds `ETA_WARMUP_SECS` (the same threshold the scan/copy ETA
    uses); below that only the elapsed time is shown, since a sub-warmup
    estimate is noise.  Once the run outlasts the estimate the remaining goes
-   negative (shown as a `-N` second count, signalling the estimate was low).
+   negative (shown as `-m:ss`, same format as the positive countdown,
+   signalling the estimate was low).
    The line is gated on the *original* `-q`/`--batch` (the final summary
    resets `quiet=False`, which must not un-silence it); the first line printed
    after the loop is `\r`-prefixed to overwrite it.

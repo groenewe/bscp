@@ -40,6 +40,7 @@ import binascii
 import hashlib
 import math
 import os
+import shlex
 import struct
 import subprocess
 import sys
@@ -629,6 +630,18 @@ def parse_resume_from(s):
             raise ValueError('resume-from percentage must be between 0 and 100')
         return -int(round(v * 10))
     return parse_size(s)
+
+
+def device_size(path):
+    # os.path.getsize() reports 0 for block devices (stat st_size is 0); a
+    # seek-to-end gives the true size for both regular files and block
+    # devices — the same method do_sync and the remote use for their sizes.
+    f = open(path, 'rb')
+    try:
+        f.seek(0, 2)
+        return f.tell()
+    finally:
+        f.close()
 
 
 def available_memory():
@@ -1373,12 +1386,23 @@ if __name__ == '__main__':
     parser.add_argument('src', help='source — local path or HOST:path')
     parser.add_argument('dst', help='destination — HOST:path or local path')
 
-    if len(sys.argv) == 1:
+    # BSCP_OPTIONS supplies default command-line options for per-host tuning
+    # (e.g. `-b 192k -s 64M`), parsed as a shell word list and placed BEFORE
+    # the real argv so an explicit command-line option overrides the env
+    # default (argparse keeps the last occurrence).  Options only — not
+    # positionals.  Distinct from the BSCP_FORCE_* test hooks, which select
+    # the remote path.
+    try:
+        env_opts = shlex.split(os.environ.get('BSCP_OPTIONS', ''))
+    except ValueError as exc:
+        parser.error('BSCP_OPTIONS: %s' % exc)
+
+    if len(sys.argv) == 1 and not env_opts:
         parser.print_usage(sys.stderr)
         sys.stderr.write('Use -h or --help for full option list.\n')
         sys.exit(2)
 
-    args = parser.parse_args()
+    args = parser.parse_args(env_opts + sys.argv[1:])
     quiet = args.quiet or args.batch
     batch = args.batch
 
@@ -1400,12 +1424,14 @@ if __name__ == '__main__':
     dry_run      = args.dry_run
     # parse_resume_from() returns a negative permille sentinel for the NN%
     # form; resolve against the local file size before section-boundary
-    # rounding.  If the file is missing, fall through with offset 0 — the
+    # rounding.  device_size() (seek-to-end, *not* os.path.getsize, which
+    # reports 0 for block devices and would silently collapse any NN% to
+    # offset 0).  If the file is missing, fall through with offset 0 — the
     # friendlier 'Cannot open local file ...' error fires inside do_sync.
     if args.resume_from < 0:
         try:
-            local_size_for_pct = os.path.getsize(local_file)
-        except OSError:
+            local_size_for_pct = device_size(local_file)
+        except (IOError, OSError):
             local_size_for_pct = 0
         resume_offset = (-args.resume_from) * local_size_for_pct // 1000
     else:

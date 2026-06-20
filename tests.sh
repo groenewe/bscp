@@ -15,13 +15,13 @@
 #   ./tests.sh --force-all          # run every test even under a python2 client
 #
 # When $BSCP runs under a Python 2 interpreter (e.g. bscp.python2 where
-# `python` resolves to Python 2.x), fourteen tests are skipped by default:
+# `python` resolves to Python 2.x), twelve tests are skipped by default:
 # the two --hash-threads tests (the option is python3-only by design), the
 # -a algorithm-rejection test (Py2's hashlib lacks the shake_* XOF functions
-# the test probes), the nine --verify tests (the convenience b3sum
-# cross-check is not implemented in the python2 client), and the two
-# BSCP_OPTIONS tests (that env var is not read by the python2 client).  Pass
-# --force-all to run them anyway.
+# the test probes), and the nine --verify tests (the convenience b3sum
+# cross-check is not implemented in the python2 client).  The BSCP_OPTIONS
+# tests now run under python2 (the env var is honoured there too).  Pass
+# --force-all to run the skipped tests anyway.
 #
 # Exit status: 0 if all tests pass, non-zero otherwise.
 
@@ -51,8 +51,7 @@ esac
 PY2_SKIP="test_hash_threads_push test_hash_threads_single_pull test_reject_bad_algorithm \
 test_verify_push_match test_verify_mismatch_exit4 test_verify_skips_when_b3sum_unusable \
 test_verify_size_mismatch_skips test_verify_dryrun_zero_diff_runs test_verify_dryrun_with_diff_skips \
-test_verify_batch_mismatch_exit4 test_verify_batch_size_mismatch_exit5 test_verify_batch_blockcount_rejected \
-test_bscp_options_applies test_bscp_options_cli_overrides"
+test_verify_batch_mismatch_exit4 test_verify_batch_size_mismatch_exit5 test_verify_batch_blockcount_rejected"
 
 WORK=$(mktemp -d)
 SRC="$WORK/src.img"

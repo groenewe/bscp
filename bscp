@@ -1613,11 +1613,14 @@ if __name__ == '__main__':
     verify_enabled = args.verify
     # parse_resume_from() returns a negative permille sentinel for the NN%
     # form; resolve against the local file size before section-boundary
-    # rounding.  If the file is missing, fall through with offset 0 — the
-    # friendlier 'Cannot open local file ...' error fires inside do_sync.
+    # rounding.  device_size() (seek-to-end), not os.path.getsize(), so a
+    # block device — bscp's main use case — reports its true size instead of
+    # the 0 that stat reports (which would silently resolve NN% to offset 0).
+    # If the file is missing, fall through with offset 0 — the friendlier
+    # 'Cannot open local file ...' error fires inside do_sync.
     if args.resume_from < 0:
         try:
-            local_size_for_pct = os.path.getsize(local_file)
+            local_size_for_pct = device_size(local_file)
         except OSError:
             local_size_for_pct = 0
         resume_offset = (-args.resume_from) * local_size_for_pct // 1000
@@ -1772,57 +1775,71 @@ if __name__ == '__main__':
         t_verify_start  = time()
         lp = spawn_hash(b3sum_local_cmd(local_file))
         rp = spawn_hash(b3sum_remote_cmd(remote_host, remote_file, ssh_args))
-        while (lp is not None and lp.poll() is None) or (rp is not None and rp.poll() is None):
-            # Local already finished and failed — its hash is unusable, so
-            # stop waiting on the remote rather than block for a discarded
-            # result.
-            if lp is not None and lp.poll() is not None and lp.returncode != 0:
-                if rp is not None and rp.poll() is None:
+        try:
+            while (lp is not None and lp.poll() is None) or (rp is not None and rp.poll() is None):
+                # Local already finished and failed — its hash is unusable, so
+                # stop waiting on the remote rather than block for a discarded
+                # result.
+                if lp is not None and lp.poll() is not None and lp.returncode != 0:
+                    if rp is not None and rp.poll() is None:
+                        rp.kill()
+                    break
+                if verify_progress:
+                    elapsed = time() - t_verify_start
+                    # Only show the countdown when the estimate clears the same
+                    # warmup threshold the scan/copy ETA uses — for shorter runs
+                    # the number is noise, so show elapsed alone.
+                    if eta > ETA_WARMUP_SECS:
+                        rem    = eta - elapsed
+                        rem_s  = format_time(rem, round_eta=True) if rem >= 0 else '-' + format_time(-rem, round_eta=True)
+                        report('\rverify: hashing both ends with b3sum - %s (%s) '
+                               % (format_time(elapsed), rem_s))
+                    else:
+                        report('\rverify: hashing both ends with b3sum - %s ' % format_time(elapsed))
+                sleep(REPORT_INTERVAL)
+
+            local_hash, lerr = collect_hash(lp) if lp else (None, 'not found')
+
+            if local_hash is None:
+                if rp is not None:          # local failed — stop waiting on remote
                     rp.kill()
-                break
-            if verify_progress:
-                elapsed = time() - t_verify_start
-                # Only show the countdown when the estimate clears the same
-                # warmup threshold the scan/copy ETA uses — for shorter runs
-                # the number is noise, so show elapsed alone.
-                if eta > ETA_WARMUP_SECS:
-                    rem    = eta - elapsed
-                    rem_s  = format_time(rem, round_eta=True) if rem >= 0 else '-%d' % int(-rem)
-                    report('\rverify: hashing both ends with b3sum - %s (%s) '
-                           % (format_time(elapsed), rem_s))
-                else:
-                    report('\rverify: hashing both ends with b3sum - %s ' % format_time(elapsed))
-            sleep(REPORT_INTERVAL)
-
-        local_hash, lerr = collect_hash(lp) if lp else (None, 'not found')
-
-        if local_hash is None:
-            if rp is not None:          # local failed — stop waiting on remote
-                rp.kill()
-                rp.communicate()
-            verify_unavailable('\rverify: skipped — b3sum failed on %s: %s\n' % (local_file, lerr))
-        else:
-            report('\rverify: local  b3sum %s = %s\n' % (local_file, local_hash))
-            remote_hash, _ = collect_hash(rp) if rp else (None, '')
-            if remote_hash is None:
-                verify_unavailable('verify: remote b3sum unavailable on %s — comparison skipped\n'
-                                   % remote_host)
+                    rp.communicate()
+                verify_unavailable('\rverify: skipped — b3sum failed on %s: %s\n' % (local_file, lerr))
             else:
-                report('verify: remote b3sum %s = %s\n' % (remote_file, remote_hash))
-                if args.block_count:
-                    # Non-batch only: the --batch + -B combination is rejected
-                    # at argparse, so this branch is never reached under batch.
-                    report('verify: comparison skipped (partial copy: -B in effect)\n')
-                elif local_size != remote_size:
-                    verify_unavailable(
-                        'verify: comparison skipped (sizes differ: local %s, remote %s)\n' % (
-                            format_size(local_size, floor=True) if local_size >= 0 else '?',
-                            format_size(remote_size, floor=True)))
-                elif remote_hash == local_hash:
-                    report('verify OK: local and remote b3sum match\n')
+                report('\rverify: local  b3sum %s = %s\n' % (local_file, local_hash))
+                remote_hash, _ = collect_hash(rp) if rp else (None, '')
+                if remote_hash is None:
+                    verify_unavailable('verify: remote b3sum unavailable on %s — comparison skipped\n'
+                                       % remote_host)
                 else:
-                    report('VERIFY FAILED: b3sum digests differ\n')
-                    sys.exit(4)
+                    report('verify: remote b3sum %s = %s\n' % (remote_file, remote_hash))
+                    if args.block_count:
+                        # Non-batch only: the --batch + -B combination is rejected
+                        # at argparse, so this branch is never reached under batch.
+                        report('verify: comparison skipped (partial copy: -B in effect)\n')
+                    elif local_size != remote_size:
+                        verify_unavailable(
+                            'verify: comparison skipped (sizes differ: local %s, remote %s)\n' % (
+                                format_size(local_size, floor=True) if local_size >= 0 else '?',
+                                format_size(remote_size, floor=True)))
+                    elif remote_hash == local_hash:
+                        report('verify OK: local and remote b3sum match\n')
+                    else:
+                        report('VERIFY FAILED: b3sum digests differ\n')
+                        sys.exit(4)
+        except KeyboardInterrupt:
+            # Ctrl+C while hashing: kill both b3sum children (the local process
+            # and the remote ssh) so neither is left running, then exit like
+            # the transfer's interrupt path.
+            for p in (lp, rp):
+                if p is not None:
+                    p.kill()
+                    try:
+                        p.communicate(timeout=5)
+                    except Exception:
+                        pass
+            report('\nInterrupted\n')
+            sys.exit(130)
 
 # The remote source literals (remote_script, remote_script_mt, remote_perl)
 # are tab-indented; ts=4 renders those embedded tabs at the same visual width

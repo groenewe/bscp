@@ -388,14 +388,14 @@ them on exit.  Exit status is `0` on success, `1` if any test failed (with
 the failing names listed at the end), or `2` on missing prerequisites.
 
 When `$BSCP` runs under a Python 2 interpreter (detected from its shebang
-plus `python -V`), fourteen tests are skipped by default and reported as
+plus `python -V`), twelve tests are skipped by default and reported as
 `skip`: the two `--hash-threads` tests (the option is python3-only), the
 `-a` algorithm-rejection test (Py2's `hashlib` lacks the `shake_*` XOF
-functions it probes), the nine `--verify` tests (the convenience b3sum
+functions it probes), and the nine `--verify` tests (the convenience b3sum
 cross-check is not implemented in the python2 client, so the flag is
-unrecognised), and the two `BSCP_OPTIONS` tests (that env var is not read by
-the python2 client).  Pass `--force-all` to run every test regardless of
-interpreter.
+unrecognised).  The two `BSCP_OPTIONS` tests run under the python2 client
+too (it now honours the env var).  Pass `--force-all` to run every test
+regardless of interpreter.
 
 When investigating a single failure interactively, the manual idiom is
 still useful:
@@ -451,9 +451,9 @@ verify: hashing both ends with b3sum - ELAPSED (REMAINING)
 ```
 - `ELAPSED` — wall-clock since the verify pass started (`m:ss`).
 - `REMAINING` — `eta − elapsed`, where `eta` is the scan-time estimate
-  (see docs/verify.md).  Formatted like the scan/copy ETA while positive;
-  once negative (the run outlasted the estimate) it is shown as a plain `-N`
-  second count.  The `(REMAINING)` field is shown only when the estimate
+  (see docs/verify.md).  Formatted like the scan/copy ETA (`m:ss`) whether
+  positive or negative; once negative (the run outlasted the estimate) it is
+  shown as `-m:ss`, signalling the estimate was low.  The `(REMAINING)` field is shown only when the estimate
   clears `ETA_WARMUP_SECS` (the same threshold the scan/copy ETA uses); for
   shorter runs only `ELAPSED` is shown.  Suppressed by `-q`/`--batch` like
   other progress.
@@ -498,7 +498,9 @@ line that goes to stderr.
 
 `-r` / `--resume-from` accepts either a byte offset (with optional K/M/G/T
 suffix) or a percentage (`NN%` / `NN.N%`, 0–100).  The percentage is
-resolved in `main()` against `os.path.getsize(local_file)` before
+resolved in `main()` against `device_size(local_file)` (seek-to-end, *not*
+`os.path.getsize`, which reports 0 for block devices and would silently
+collapse any `NN%` to offset 0) before
 section-boundary rounding, so it matches the displayed scan percentage in
 the common cases (push, or pull where local and remote are the same size).
 With `--allow-truncate` and a destination smaller than the source, the
