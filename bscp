@@ -27,7 +27,8 @@
 # Features: section-based processing to bound memory use, single-pass
 # scan+copy, optional multi-threaded block hashing on both ends
 # (--hash-threads; python3 only), windowed pull to avoid SSH pipe deadlock,
-# resume on failure (byte offset or percentage of source), automatic retry
+# optional post-copy b3sum cross-check of both ends (--verify), resume on
+# failure (byte offset or percentage of source), automatic retry
 # with exponential back-off, and dry-run mode.
 #
 # Changes in this fork were made with extensive help of Claude Code, Sonnet
@@ -757,6 +758,8 @@ def build_resume_cmd(argv0, args, src, dst, offset, block_count=None):
         parts.append('--allow-truncate')
     if args.buffer:
         parts.append('--buffer')
+    if args.verify:
+        parts.append('--verify')
     bc = args.block_count if block_count is None else block_count
     if bc:
         parts += ['-B', str(bc)]
@@ -771,16 +774,12 @@ def build_resume_cmd(argv0, args, src, dst, offset, block_count=None):
     return ' '.join(shlex.quote(p) for p in parts)
 
 
-def build_ssh_cmd(remote_host, args):
-    cmd = ['ssh']
-    if args.get('compress'):
-        cmd.append('-C')
-    if args.get('port', 22) != 22:
-        cmd += ['-p', str(args['port'])]
-    if args.get('identity'):
-        cmd += ['-i', args['identity']]
-    for opt in (args.get('ssh_opt') or []):
-        cmd += ['-o', opt]
+def ssh_base(args):
+    # The ssh flags shared by the bscp remote wrapper (build_ssh_cmd) and the
+    # --verify external-hash invocation (external_hash_remote): compression,
+    # port, identity, the user's -o options, and the keepalive failsafe.
+    # Returns the flag list only — no host, no remote command.
+    #
     # Keepalive failsafe: a silently-dropped TCP connection (router NAT
     # timeout, peer kernel stall, ISP blip) otherwise leaves both ends
     # blocked on read/write forever.  With these settings ssh declares the
@@ -789,7 +788,21 @@ def build_ssh_cmd(remote_host, args):
     # (and --retries, if set).  Appended after the user's -o options
     # because ssh applies the first matching -o, so a user-supplied
     # override still wins.
+    cmd = []
+    if args.get('compress'):
+        cmd.append('-C')
+    if args.get('port', 22) != 22:
+        cmd += ['-p', str(args['port'])]
+    if args.get('identity'):
+        cmd += ['-i', args['identity']]
+    for opt in (args.get('ssh_opt') or []):
+        cmd += ['-o', opt]
     cmd += ['-o', 'ServerAliveInterval=15', '-o', 'ServerAliveCountMax=4']
+    return cmd
+
+
+def build_ssh_cmd(remote_host, args):
+    cmd = ['ssh'] + ssh_base(args)
     # Each exec'd remote ends with a literal `bscp-remote` argument.  The
     # remote bodies never read argv, so it is inert — but it lands in the
     # process command line, so `ps aux | grep bscp-remote` (or htop search)
@@ -831,6 +844,48 @@ def build_ssh_cmd(remote_host, args):
     ) % hex_pl
     cmd += ['--', remote_host, wrapper]
     return cmd
+
+
+def verify_digest(output):
+    # External hashers (b3sum, sha256sum, md5sum, b2sum, ...) print
+    # "<hexdigest>  <path>".  The path differs between the local file and the
+    # remote one, so compare only the leading digest token.  Returns '' for
+    # empty output.
+    out = output.strip()
+    return out.split()[0] if out else ''
+
+
+def external_hash_local(tool, path):
+    # Hash `path` with the external `tool` on this host.  Returns the tool's
+    # raw stdout (native check-file format) so --verify-log can store it
+    # verbatim for a later `tool -c FILE`.  Raises FileNotFoundError if the
+    # tool is missing, CalledProcessError on a nonzero exit (e.g. unreadable
+    # block device).
+    res = subprocess.run([tool, path], stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, check=True)
+    return res.stdout.decode('utf-8', 'replace')
+
+
+def external_hash_remote(remote_host, remote_file, args, tool):
+    # Run `tool remote_file` on the remote over ssh, reusing the same
+    # connection options as the transfer.  The remote shell re-parses the
+    # command, so tool and path are shell-quoted.  Returns the tool's stdout,
+    # or None if ssh/the tool exits nonzero (tool missing, unreadable device).
+    remote_cmd = '%s %s' % (shlex.quote(tool), shlex.quote(remote_file))
+    cmd = ['ssh'] + ssh_base(args) + [remote_host, remote_cmd]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if res.returncode != 0:
+        return None
+    return res.stdout.decode('utf-8', 'replace')
+
+
+def device_size(path):
+    # os.path.getsize() reports 0 for block devices (stat st_size is 0); a
+    # seek-to-end gives the true size for both regular files and block
+    # devices — the same method do_sync and the remote use for their sizes.
+    with open(path, 'rb') as fh:
+        fh.seek(0, 2)
+        return fh.tell()
 
 
 def do_sync(local_file, remote_host, remote_file, mode,
@@ -963,7 +1018,7 @@ def do_sync(local_file, remote_host, remote_file, mode,
         if sync_size == 0:
             # Server has already exited (matching `if sync_size == 0: sys.exit(0)`).
             _shutdown_proc(proc)
-            return io.in_total, io.out_total, 0, 0, 0
+            return io.in_total, io.out_total, 0, 0, 0, remote_size
         eff_section    = section_size or sync_size
         total_blocks   = max(1, (sync_size + blocksize - 1) // blocksize)
         skipped_blocks = start_offset // blocksize
@@ -1377,7 +1432,7 @@ def do_sync(local_file, remote_host, remote_file, mode,
 
         _shutdown_proc(proc)
 
-    return io.in_total, io.out_total, sync_size, total_diffs, total_written
+    return io.in_total, io.out_total, sync_size, total_diffs, total_written, remote_size
 
 
 if __name__ == '__main__':
@@ -1450,6 +1505,16 @@ if __name__ == '__main__':
                              'syncs only the bytes that fit. '
                              'WARNING: data beyond destination size is not copied.')
 
+    verification = parser.add_argument_group('verification')
+    verification.add_argument('--verify',              action='store_true',
+                        help='after copying, run b3sum on the local file and (when available) on '
+                             'the remote file, and print both digests. If the whole device was '
+                             'copied and the local and remote sizes match, compare them and report '
+                             'OK / mismatch (exit 4 on mismatch). Independent of -a, so this '
+                             'external BLAKE3 check guards against block-hash weaknesses. A '
+                             'convenience check: needs b3sum on each side, and warns + skips '
+                             'gracefully where it is missing. Skipped under --dry-run.')
+
     output = parser.add_argument_group('output')
     output.add_argument('-q', '--quiet',              action='store_true',
                         help='suppress scan/copy progress lines; errors and warnings are still shown')
@@ -1489,6 +1554,7 @@ if __name__ == '__main__':
     section_size = args.section_size
     hashname     = args.algorithm
     dry_run      = args.dry_run
+    verify_enabled = args.verify
     # parse_resume_from() returns a negative permille sentinel for the NN%
     # form; resolve against the local file size before section-boundary
     # rounding.  If the file is missing, fall through with offset 0 — the
@@ -1538,7 +1604,7 @@ if __name__ == '__main__':
         while True:
             try:
                 (in_total, out_total, sync_size,
-                 total_diffs, total_written) = do_sync(
+                 total_diffs, total_written, remote_size) = do_sync(
                     local_file, remote_host, remote_file,
                     mode, blocksize, section_size, hashname,
                     start_offset=start_offset, dry_run=dry_run,
@@ -1589,6 +1655,51 @@ if __name__ == '__main__':
     if args.block_count:
         report('Continue with:\n  %s\n' % build_resume_cmd(
             sys.argv[0], args, src, dst, sync_size, block_count=0))
+
+    # ── Post-copy verification (convenience BLAKE3 cross-check) ───────────
+    # Run b3sum on the local file and, when present, on the remote file, and
+    # print both digests.  A verdict (OK / mismatch) is only issued when the
+    # whole device was copied to a same-size destination — otherwise a
+    # whole-device hash of source and destination legitimately differs, so the
+    # comparison is skipped with a warning.  Never fatal except a confirmed
+    # mismatch (exit 4): a missing or failing b3sum just warns and skips.
+    if verify_enabled and dry_run:
+        report('verify: skipped (--dry-run made no changes)\n')
+    elif verify_enabled:
+        local_hash = None
+        try:
+            local_hash = verify_digest(external_hash_local('b3sum', local_file))
+            report('verify: local  b3sum %s = %s\n' % (local_file, local_hash))
+        except FileNotFoundError:
+            report('verify: skipped — b3sum not found on local host '
+                   '(see https://github.com/BLAKE3-team/BLAKE3)\n')
+        except (subprocess.CalledProcessError, OSError) as exc:
+            err = (exc.stderr.decode('utf-8', 'replace').strip()
+                   if isinstance(exc, subprocess.CalledProcessError) else exc)
+            report('verify: skipped — b3sum failed on %s: %s\n' % (local_file, err))
+
+        if local_hash is not None:
+            remote_out  = external_hash_remote(remote_host, remote_file, ssh_args, 'b3sum')
+            if remote_out is None:
+                report('verify: remote b3sum unavailable on %s — comparison skipped\n' % remote_host)
+            else:
+                remote_hash = verify_digest(remote_out)
+                report('verify: remote b3sum %s = %s\n' % (remote_file, remote_hash))
+                try:
+                    local_size = device_size(local_file)
+                except OSError:
+                    local_size = -1
+                if args.block_count:
+                    report('verify: comparison skipped (partial copy: -B in effect)\n')
+                elif local_size != remote_size:
+                    report('verify: comparison skipped (sizes differ: local %s, remote %s)\n' % (
+                        format_size(local_size, floor=True) if local_size >= 0 else '?',
+                        format_size(remote_size, floor=True)))
+                elif remote_hash and remote_hash == local_hash:
+                    report('verify OK: local and remote b3sum match\n')
+                else:
+                    report('VERIFY FAILED: b3sum digests differ\n')
+                    sys.exit(4)
 
 # The remote source literals (remote_script, remote_script_mt, remote_perl)
 # are tab-indented; ts=4 renders those embedded tabs at the same visual width

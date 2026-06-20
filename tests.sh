@@ -331,6 +331,70 @@ test_block_count_overshoot_smaller_dst_no_hang() {
     (( rc != 0 && rc != 124 )) && grep -q -- '--allow-truncate' <<<"$out"
 }
 
+# --verify runs b3sum on both ends out-of-band (no protocol change) and
+# compares.  These tests need b3sum on PATH; where it is absent they
+# return 0 (reported ok), mirroring the perl-remote skip idiom above.
+test_verify_push_match() {
+    command -v b3sum >/dev/null || return 0
+    make_src 8
+    copy_src_to "$DST"
+    randomise_in "$DST" 8 100
+    local out
+    out=$("$BSCP" -s 2M --verify "$SRC" "localhost:$DST" 2>&1)
+    cmp -s "$SRC" "$DST" || return 1
+    grep -q 'verify OK: local and remote b3sum match' <<<"$out"
+}
+
+# A fake b3sum on the local PATH yields a digest unlike the remote's real
+# b3sum, forcing a mismatch on an otherwise-identical, equal-size pair.  ssh
+# does not forward PATH, so the remote still uses its real b3sum.
+test_verify_mismatch_exit4() {
+    command -v b3sum >/dev/null || return 0
+    make_src 4
+    copy_src_to "$DST"
+    local fake="$WORK/fakebin"
+    mkdir -p "$fake"
+    printf '#!/bin/sh\nprintf "%%s  %%s\\n" "$(basename "$1" | md5sum | cut -d" " -f1)" "$1"\n' > "$fake/b3sum"
+    chmod +x "$fake/b3sum"
+    local out rc
+    out=$(PATH="$fake:$PATH" "$BSCP" --verify "$SRC" "localhost:$DST" 2>&1)
+    rc=$?
+    rm -rf "$fake"
+    (( rc == 4 )) && grep -q 'VERIFY FAILED' <<<"$out"
+}
+
+# A present-but-failing b3sum (exit nonzero) must warn and skip without
+# changing the transfer's exit code.  Does not need a real b3sum.
+test_verify_skips_when_b3sum_unusable() {
+    make_src 4
+    copy_src_to "$DST"
+    randomise_in "$DST" 8 100
+    local bad="$WORK/badbin"
+    mkdir -p "$bad"
+    printf '#!/bin/sh\nexit 7\n' > "$bad/b3sum"
+    chmod +x "$bad/b3sum"
+    local out rc
+    out=$(PATH="$bad:$PATH" "$BSCP" --verify "$SRC" "localhost:$DST" 2>&1)
+    rc=$?
+    rm -rf "$bad"
+    cmp -s "$SRC" "$DST" || return 1
+    (( rc == 0 )) || return 1
+    grep -q 'verify: skipped' <<<"$out"
+}
+
+# Whole-device hashes legitimately differ when the destination is smaller, so
+# the comparison is skipped (warning) and the exit code stays 0.
+test_verify_size_mismatch_skips() {
+    command -v b3sum >/dev/null || return 0
+    make_src 8
+    make_blank "$DST2" 5
+    local out rc
+    out=$("$BSCP" --allow-truncate --verify "$SRC" "localhost:$DST2" 2>&1)
+    rc=$?
+    (( rc == 0 )) || return 1
+    grep -q 'comparison skipped (sizes differ' <<<"$out"
+}
+
 test_exit2_when_no_host() {
     "$BSCP" "$SRC" "$DST" >/dev/null 2>&1
     (( $? == 2 ))
@@ -442,6 +506,10 @@ run "-B pull within dst size needs no truncate flag" test_block_count_pull_no_tr
 run "-B beyond dst size still requires --truncate"   test_block_count_truncate_still_required
 run "-B overshoot prints warning, exits 0"           test_block_count_overshoot_warns
 run "-B overshoot + smaller dst exits without hang"  test_block_count_overshoot_smaller_dst_no_hang
+run "--verify push, matching b3sum digests"          test_verify_push_match
+run "--verify detects a mismatch, exits 4"           test_verify_mismatch_exit4
+run "--verify skips gracefully when b3sum unusable"  test_verify_skips_when_b3sum_unusable
+run "--verify skips compare on size mismatch"        test_verify_size_mismatch_skips
 run "exit 2 when neither side is HOST:path"          test_exit2_when_no_host
 run "friendly error when local file is missing"      test_friendly_error_for_missing_local
 run "reject unknown / zero-digest -a algorithm"      test_reject_bad_algorithm

@@ -16,7 +16,9 @@ with a Perl fallback for hosts that have no Python interpreter.
 ## Requirements
 
 Python 3 on the local host and Python 2/3 *or* Perl 5.10+ on the remote
-host.  SSH access to the remote host.
+host.  SSH access to the remote host.  The optional `--verify` cross-check
+additionally needs [`b3sum`](https://github.com/BLAKE3-team/BLAKE3) on each
+side it runs on (it warns and skips where missing).
 
 **Runs almost anywhere.**  The remote side needs no installation and speaks
 the same protocol whether it runs under `python3`, `python2`/`python`, or
@@ -82,6 +84,7 @@ prefix that fits.
 | `-q` / `--quiet`              |          | Suppress scan/copy progress lines. Errors and warnings are still shown.                                          |
 | `--batch`                     |          | Suppress all stderr output; use the exit status to detect errors (implies `-q`). | Cannot convey a resume offset — use `-q` instead if a caller needs to parse the "Resume with:" stderr line. |
 | `-p PORT` / `--port`          | `22`     | SSH port.                                                                                                        |
+| `--verify`                    |          | After copying, run `b3sum` on the local file and (when present) the remote file and print both digests. If the whole device was copied to a same-size destination, compare them and report OK / mismatch (**exit 4** on mismatch). A convenience BLAKE3 cross-check, independent of `-a`; warns and skips where `b3sum` is missing on either side, the copy was partial (`-B`), or the sizes differ. Skipped under `-N`. |
 
 ### Examples
 
@@ -115,6 +118,9 @@ bscp -B 1G /dev/sda myhost:/dev/sda
 
 # Sync only the prefix that fits when the destination is smaller than the source
 bscp --allow-truncate /var/backups/disk.img myhost:/data/disk-half.img
+
+# Copy, then cross-check both ends with an independent BLAKE3 (b3sum) hash
+bscp --verify /dev/sda myhost:/dev/sda
 ```
 
 ### Exit status
@@ -125,6 +131,7 @@ bscp --allow-truncate /var/backups/disk.img myhost:/data/disk-half.img
 | `1`   | Fatal error — remote file not accessible, size mismatch, or SSH failure. |
 | `2`   | Bad arguments or usage error.                                            |
 | `3`   | Connection lost — transfer incomplete; re-run with `--resume-from`.      |
+| `4`   | Verification mismatch — `--verify` found the local and remote b3sum digests differ. |
 | `130` | Interrupted by user (Ctrl+C).                                            |
 
 ## How it works

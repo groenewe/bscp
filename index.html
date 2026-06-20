@@ -97,6 +97,15 @@ pull:  bscp HOST:remote_file  local_file</pre>
         the bandwidth saved — so enable it for remote/WAN copies and leave it
         off on local-network transfers.
       </li>
+      <li>
+        After copying, an optional independent integrity cross-check
+        (<code>--verify</code>) runs
+        <a href="https://github.com/BLAKE3-team/BLAKE3">b3sum</a> (BLAKE3) on
+        both ends and compares the two whole-device digests — a fast,
+        externally re-checkable confirmation that the destination matches the
+        source, using an algorithm independent of the one used for block
+        comparison.
+      </li>
     </ul>
     <h2>Portability</h2>
     <ul>

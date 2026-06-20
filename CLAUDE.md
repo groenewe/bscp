@@ -68,6 +68,10 @@ subsystem:
   Py2.7 client fallback, its compatibility shims, and maintenance policy.
 - **[docs/nuitka.md](docs/nuitka.md)** — building a single-file Nuitka binary
   so the client host needs no Python (not shipped in the repo).
+- **[docs/verify.md](docs/verify.md)** — the `--verify` post-copy BLAKE3
+  cross-check: why it shells out to `b3sum` instead of extending the
+  protocol, the eligibility gate for the comparison, and the graceful-skip
+  rules.
 ## Architecture
 
 ```
@@ -153,24 +157,44 @@ bscp (single file)
 │                        K, M, G, T (1024-based).
 ├── build_resume_cmd() — assembles a copy-pasteable resume command line from
 │                        the current argv and the failed section offset.
-├── build_ssh_cmd()    — assembles the ssh argv list from ssh_args dict.
-│                        Dispatches three remote variants in order: python3 →
-│                        remote_script_mt (threaded, hex-encoded), python2/
-│                        python → remote_script (single-threaded), perl →
-│                        remote_perl.  First interpreter found wins.
-│                        Appends `-o ServerAliveInterval=15 -o ServerAliveCountMax=4`
+├── ssh_base()         — builds the shared ssh flag list (compress, port,
+│                        identity, user `-o`, keepalive).  Used by both
+│                        build_ssh_cmd() and external_hash_remote() so the
+│                        --verify cross-check reaches the remote over the same
+│                        connection options as the transfer.
+├── build_ssh_cmd()    — assembles the ssh argv list from ssh_args dict
+│                        (starting from ssh_base()).  Dispatches three remote
+│                        variants in order: python3 → remote_script_mt
+│                        (threaded, hex-encoded), python2/python →
+│                        remote_script (single-threaded), perl → remote_perl.
+│                        First interpreter found wins.  ssh_base() appends
+│                        `-o ServerAliveInterval=15 -o ServerAliveCountMax=4`
 │                        after the user's `-o` options so a dropped TCP
 │                        connection surfaces as a BrokenPipeError within
 │                        ~60s instead of hanging.  User `-o` wins because
 │                        ssh applies the first matching `-o`.
+├── external_hash_*    — the --verify BLAKE3 cross-check (out-of-band, NOT a
+│   / verify_digest()    protocol change).  external_hash_local() runs
+│   / device_size()      `b3sum LOCAL`; external_hash_remote() runs
+│                        `ssh HOST b3sum REMOTE` (shell-quoted) over a fresh
+│                        ssh; verify_digest() extracts the leading hex token
+│                        (paths differ between sides, so only the digest is
+│                        compared).  device_size() seek-to-end sizes a path
+│                        because os.path.getsize() reports 0 for block
+│                        devices.  Orchestrated in __main__ after a
+│                        successful copy; see docs/verify.md.
 ├── do_sync()          — all transfer logic for both push and pull.  Hosts
 │                        a `show_copy_progress` closure that all three
 │                        phase-B branches (push, push --buffer, pull) share.
 │                        Phase A hashes local blocks on a ThreadPoolExecutor
 │                        (`ex_hash`) via a bounded feed/drain window
 │                        (`hash_window` = 2× workers) that preserves wire
-│                        order; see docs/remote-execution.md.
-└── __main__           — argparse, push/pull auto-detection, retry loop.
+│                        order; see docs/remote-execution.md.  Returns
+│                        `remote_size` as well, which __main__ uses to gate
+│                        the --verify whole-device comparison (equal sizes).
+└── __main__           — argparse, push/pull auto-detection, retry loop, and
+                         the post-copy --verify orchestration (exit 4 on a
+                         confirmed mismatch).
 ```
 
 ## Module-level constants
@@ -322,6 +346,10 @@ to cover, plus a few that were easy to forget:
 | reject unknown / zero-digest `-a` algorithm      | `parse_algorithm` guard: exit 2, names the algo   |
 | connection failure engages retries, exits 3 | handshake-stage conn loss → `ConnectionLost`, not fatal exit 1 |
 | `format_size` + `parse_size` unit tests          | display 4-digit cap rule + lossless round-trip    |
+| `--verify` push, matching b3sum                  | local+remote b3sum run, compared, "verify OK"     |
+| `--verify` detects a mismatch, exits 4           | divergent digests → "VERIFY FAILED", exit 4       |
+| `--verify` skips gracefully when b3sum missing   | absent/failing b3sum warns, exit stays 0          |
+| `--verify` skips compare on size mismatch        | `--allow-truncate` smaller dst → "sizes differ"   |
 
 Prerequisites: `python3` on PATH, and passwordless `ssh localhost`.  Run:
 
@@ -406,7 +434,13 @@ rely solely on the exit status:
 | `1`       | Fatal error (I/O failure, remote error, etc.)  |
 | `2`       | Bad arguments                                  |
 | `3`       | Connection lost — resume with `--resume-from`  |
+| `4`       | `--verify` mismatch (local/remote b3sum differ)|
 | `130`     | Interrupted (Ctrl+C)                           |
+
+Exit `4` is the **only** thing `--verify` changes about the exit status: a
+missing or failing `b3sum`, a partial copy (`-B`), or differing sizes warn
+and skip the comparison without affecting the exit code.  Under `--batch`
+(all stderr suppressed) the mismatch is conveyed solely by exit `4`.
 
 Both flags are forwarded into the resume command printed by
 `build_resume_cmd()`, so a resumed invocation keeps the same verbosity level.
