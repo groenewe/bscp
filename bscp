@@ -651,7 +651,7 @@ def report(msg):
     # overwrite can pad them away.  A msg ending in '\n' leaves the cursor on a
     # fresh empty line, so reset to 0 — otherwise the next call would pad
     # against this line's length and prepend stray spaces.
-    last_report_len = 0 if msg.endswith('\n') else len(first)
+    last_report_len = 0 if msg.endswith('\n') else len(first.rstrip())
 
 
 def parse_size(s):
