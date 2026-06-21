@@ -586,7 +586,11 @@ def report(msg):
         lines[0] = first + ' ' * (last_report_len - len(first))
     sys.stderr.write('\n'.join(lines))
     sys.stderr.flush()
-    last_report_len = len(first)
+    # last_report_len tracks chars left on the cursor's line so the next '\r'
+    # overwrite can pad them away.  A msg ending in '\n' leaves the cursor on a
+    # fresh empty line, so reset to 0 — otherwise the next call would pad
+    # against this line's length and prepend stray spaces.
+    last_report_len = 0 if msg.endswith('\n') else len(first.rstrip())
 
 
 def parse_size(s):
@@ -1465,6 +1469,16 @@ if __name__ == '__main__':
 
     resume_cmd = lambda offset: build_resume_cmd(
         sys.argv[0], args, src, dst, offset)
+    # The offset this run actually started from (after NN% resolution and
+    # section-boundary rounding).  An abort whose resume offset still equals
+    # this means no section completed, so a "-r OFFSET" resume command would
+    # just reproduce the original invocation — we print the bare status line
+    # instead.  Conversely, a printed resume command signals that some work is
+    # banked and need not be repeated.  Compared against the *initial* offset,
+    # not the retry-mutated start_offset, so progress from an earlier attempt
+    # is still surfaced after later attempts stall.
+    initial_offset = start_offset
+    progressed     = lambda offset: offset != initial_offset
 
     t_start  = time()
     attempt  = 0
@@ -1483,23 +1497,33 @@ if __name__ == '__main__':
             except ConnectionLost as exc:
                 if attempt < args.retries and not exc.interrupted:
                     delay = min(2 ** attempt, 60)
-                    report('\rConnection lost — retrying (%d/%d) in %ds...\n'
-                            'Resume manually with:\n  %s\n' % (
-                            attempt + 1, args.retries, delay,
-                            resume_cmd(exc.offset)))
+                    if progressed(exc.offset):
+                        report('\rConnection lost — retrying (%d/%d) in %ds...\n'
+                                'Resume manually with:\n  %s\n' % (
+                                attempt + 1, args.retries, delay,
+                                resume_cmd(exc.offset)))
+                    else:
+                        report('\rConnection lost — retrying (%d/%d) in %ds...\n' % (
+                                attempt + 1, args.retries, delay))
                     start_offset = exc.offset
                     attempt += 1
                     sleep(delay)
                 else:
                     label = 'Interrupted' if exc.interrupted else 'Connection lost'
-                    report('\n%s - Resume with:\n  %s\n' % (
-                        label, resume_cmd(exc.offset)))
+                    if progressed(exc.offset):
+                        report('\n%s - Resume with:\n  %s\n' % (
+                            label, resume_cmd(exc.offset)))
+                    else:
+                        report('\n%s\n' % label)
                     sys.exit(130 if exc.interrupted else 3)
             except RuntimeError as exc:
                 report('\nError: %s\n' % exc)
                 sys.exit(1)
     except KeyboardInterrupt:
-        report('\nInterrupted - Resume with:\n  %s\n' % resume_cmd(start_offset))
+        if progressed(start_offset):
+            report('\nInterrupted - Resume with:\n  %s\n' % resume_cmd(start_offset))
+        else:
+            report('\nInterrupted\n')
         sys.exit(130)
 
     elapsed  = time() - t_start
