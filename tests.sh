@@ -522,7 +522,10 @@ test_conn_failure_retries_exit3() {
     local out rc
     out=$("$BSCP" -R 1 -o ConnectTimeout=1 -o BatchMode=yes \
                   "192.0.2.1:/dev/null" "$DST" 2>&1); rc=$?
-    (( rc == 3 )) && grep -q 'retrying (1/1)' <<<"$out"
+    # No section ever completed (handshake-stage failure at offset 0), so the
+    # resume offset equals the run's start — bscp must NOT print a redundant
+    # "-r 0" resume command (re-running the original invocation is equivalent).
+    (( rc == 3 )) && grep -q 'retrying (1/1)' <<<"$out" && ! grep -q -- '-r 0' <<<"$out"
 }
 
 test_format_size_unit_tests() {

@@ -156,7 +156,9 @@ bscp (single file)
 │                        forces the next unit up.  Supported suffixes are
 │                        K, M, G, T (1024-based).
 ├── build_resume_cmd() — assembles a copy-pasteable resume command line from
-│                        the current argv and the failed section offset.
+│                        the current argv and the failed section offset.  Always
+│                        appends `-r OFFSET`; __main__ decides whether to print
+│                        it at all (see the `progressed()` gate below).
 ├── ssh_base()         — builds the shared ssh flag list (compress, port,
 │                        identity, user `-o`, keepalive).  Used by both
 │                        build_ssh_cmd() and external_hash_remote() so the
@@ -210,7 +212,18 @@ bscp (single file)
 │                        --verify duration estimate).
 └── __main__           — argparse, push/pull auto-detection, retry loop, and
                          the post-copy --verify orchestration (exit 4 on a
-                         confirmed mismatch).  BSCP_OPTIONS (shell-split) is
+                         confirmed mismatch).  On abort (ConnectionLost or
+                         Ctrl+C) a resume command is printed only when
+                         `progressed(offset)` is true — i.e. the resume offset
+                         advanced past `initial_offset`, the section-rounded
+                         start of this run.  If no section completed, the
+                         resume offset still equals the start, so the command
+                         would merely reproduce the original invocation; bscp
+                         then prints the bare `Interrupted` / `Connection lost`
+                         line.  Compared against the initial offset, not the
+                         retry-mutated `start_offset`, so progress banked by an
+                         earlier attempt is still surfaced when a later one
+                         stalls without advancing.  BSCP_OPTIONS (shell-split) is
                          prepended to argv before parse_args() so it supplies
                          default options that an explicit flag still overrides
                          (per-host tuning, e.g. `-T 8 -b 192K`).
@@ -365,7 +378,7 @@ to cover, plus a few that were easy to forget:
 | exit 2 when neither side is HOST:path            | argparse path                                     |
 | friendly error when local file is missing        | OSError → `Error: Cannot open local file ...`     |
 | reject unknown / zero-digest `-a` algorithm      | `parse_algorithm` guard: exit 2, names the algo   |
-| connection failure engages retries, exits 3 | handshake-stage conn loss → `ConnectionLost`, not fatal exit 1 |
+| connection failure engages retries, exits 3 | handshake-stage conn loss → `ConnectionLost`, not fatal exit 1; no redundant `-r 0` printed when no section completed |
 | `format_size` + `parse_size` unit tests          | display 4-digit cap rule + lossless round-trip    |
 | `--verify` push, matching b3sum                  | local+remote b3sum run, compared, "verify OK"     |
 | `--verify` detects a mismatch, exits 4           | divergent digests → "VERIFY FAILED", exit 4       |
@@ -504,7 +517,10 @@ Both flags are forwarded into the resume command printed by
 `--batch` is exit-code-only by design: there is no sensible way to convey a
 resume offset through an 8-bit status, so callers that need to resume on
 connection loss should use `-q` instead and parse the `Resume with: ...`
-line that goes to stderr.
+line that goes to stderr.  That line is printed only when the run banked
+progress past its start offset (see `progressed()` above); an abort with no
+completed section prints a bare `Interrupted` / `Connection lost` instead,
+so a parser must treat the line's *absence* as "rerun the original command".
 
 `-r` / `--resume-from` accepts either a byte offset (with optional K/M/G/T
 suffix) or a percentage (`NN%` / `NN.N%`, 0–100).  The percentage is
