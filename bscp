@@ -647,7 +647,11 @@ def report(msg):
         lines[0] = first + ' ' * (last_report_len - len(first))
     sys.stderr.write('\n'.join(lines))
     sys.stderr.flush()
-    last_report_len = len(first)
+    # last_report_len tracks chars left on the cursor's line so the next '\r'
+    # overwrite can pad them away.  A msg ending in '\n' leaves the cursor on a
+    # fresh empty line, so reset to 0 — otherwise the next call would pad
+    # against this line's length and prepend stray spaces.
+    last_report_len = 0 if msg.endswith('\n') else len(first)
 
 
 def parse_size(s):
@@ -1823,7 +1827,8 @@ if __name__ == '__main__':
         remote_done = rp is None
         try:
             oldmsg = ''
-            last_report_len = 0 # no trailing spaces needed yet, we're on a new report() line
+            # The final summary line above ended in '\n', so report() already
+            # left last_report_len == 0 — the first countdown write lands clean.
             while not (local_done and remote_done):
                 if not local_done and lp.poll() is not None:
                     local_done = True
