@@ -1,9 +1,11 @@
 # `--verify` — post-copy BLAKE3 cross-check
 
 `--verify` is a **convenience** integrity check that runs *after* a copy
-finishes.  It hashes the local file with [`b3sum`](https://github.com/BLAKE3-team/BLAKE3)
-and, when the whole device was copied to a same-size destination, runs the
-same `b3sum` on the remote over SSH and compares the two digests.
+finishes.  It hashes the local file with [`b3sum`](https://github.com/BLAKE3-team/BLAKE3),
+runs the same `b3sum` on the remote over SSH, and compares the two digests.
+When the two devices are the same size the whole device is hashed on each
+side; when they differ in size only the **common prefix** bscp actually copied
+is compared (the larger side is dd-limited — see *Unequal device sizes* below).
 
 ## Why an external tool, not the protocol
 
@@ -146,30 +148,99 @@ give the desired "both ends die" outcome.  Two scenarios, both verified:
 Persistence across a dropped controlling terminal is intentionally *not*
 bscp's job: run it under `tmux`/`screen` if the session may disconnect.
 
-## Comparison eligibility gate
+## Unequal device sizes
 
 A whole-device `b3sum` of source and destination only matches when the
-destination is a byte-for-byte copy of the source over the entire device.
-The comparison is therefore **skipped** (with a warning; see *Exit code* for
-how `--batch` changes this) when:
+destination is a byte-for-byte copy of the source over the *entire* device.
+When the two differ in size (the `--allow-truncate` case), bscp only ever
+touched the first `min(local, remote)` bytes — the **common prefix** — so a
+meaningful check compares *that*, not the whole of each device.
 
-- `-B` / `--block-count` capped the copy (only a prefix was synced);
-- the local and remote sizes differ (e.g. `--allow-truncate` to a smaller
-  destination) — `device_size()` is used because `os.path.getsize()` reports
-  `0` for block devices; or
+### Why sizes legitimately differ
+
+A size mismatch is not necessarily an error — it is routine for some backup
+layouts.  The motivating case: a large disk managed by **LVM**, with each
+backed-up device stored as its own **logical volume**.  LVM rounds every LV up
+to a whole number of physical extents (4 MiB by default), so an LV provisioned
+to hold a given physical device is almost never *exactly* its size — it is the
+source rounded up to the next extent boundary.
+
+The two directions are asymmetric:
+
+- **Backup** (physical device → LV): the LV destination is *larger* than the
+  source, so it comfortably holds the whole device — **no `--allow-truncate`**
+  is needed.  bscp copies the device into the LV's prefix and leaves the extent
+  padding untouched.
+- **Restore** (LV → physical device): now the *larger* LV is the source and the
+  *smaller* device is the destination, so **`--allow-truncate` is required** (a
+  destination smaller than the source is otherwise refused).  bscp copies the
+  LV's prefix back onto the device.
+
+Either way the two ends differ in size, so a whole-device `b3sum` would differ
+on the trailing extent padding alone, even when every copied byte is identical
+— and the larger side (the LV in both directions) is the one dd-limits.
+
+The dd-limiting trick makes `--verify` Just Work in both: it compares exactly
+the bytes bscp copied and ignores the LV's rounding tail.  This is squarely in
+the spirit of `--verify` as a **convenience** — the same check can be run by
+hand with `dd … | b3sum` on each side, but having bscp size and issue the `dd`
+automatically means one command both runs the transfer and confirms it.
+
+The prefix is hashed on both sides by hashing the **smaller** side whole (its
+size *is* the prefix) and **dd-limiting the larger side** to the same byte
+count: `dd if=DEV bs=BS count=COUNT 2>/dev/null | b3sum`.  Because `dd`'s
+`count` counts whole `bs` blocks, `bs` must divide the prefix exactly;
+`dd_hash_params()` picks the largest such divisor `<= 1 MiB` (fewest reads /
+closest to the streaming sweet spot, but never below 4 KiB).  The dd snippet
+is guarded with `command -v dd >/dev/null || exit 127` — load-bearing, because
+a *missing* `dd` would otherwise let `b3sum` hash an empty pipe and emit the
+digest of zero bytes (exit 0), which would compare as a **false mismatch**.
+The early-exit makes that side look unavailable (a skip) instead.
+
+The size mismatch is announced **at handshake** — as soon as `do_sync` reads
+the remote size, before the (possibly long) copy — so the operator knows up
+front that the post-copy check will be prefix-only.  Each side's digest line
+in the report shows exactly how `b3sum` was invoked (`b3sum PATH`, or
+`dd bs=… count=… | b3sum PATH`), and the OK/mismatch verdict is annotated with
+`over the first …` so it is unambiguous that only the prefix was compared.
+
+dd runs **only on the larger side** ("if necessary"): the smaller side's whole
+device is the prefix, so it keeps `b3sum`'s fast direct (mmap, multi-threaded)
+read.
+
+## Comparison eligibility gate
+
+The comparison is **skipped** (with a warning; see *Exit code* for how
+`--batch` changes this) when:
+
+- `-B` / `--block-count` capped the copy (only a prefix was synced, and a
+  resumed `-B` prefix need not start at offset 0 — out of scope for the
+  size-mismatch dd path, which assumes a 0-based common prefix);
+- the sizes differ but no efficient `dd` block size divides the common prefix
+  (e.g. a prime-sized prefix, or one smaller than 4 KiB), or `dd` is missing
+  on the side that needs it — `device_size()` is used to size each end because
+  `os.path.getsize()` reports `0` for block devices; or
 - `b3sum` is missing or errors on either side.
 
+Equal sizes need no `dd` and are compared whole, exactly as before.
+
 Resume (`-r`) does **not** disable the comparison: the check is over the
-final whole-device state, which a resumed run completes.
+final whole-device (or whole-prefix) state, which a resumed run completes.
 
 ## Exit code
 
 | Outcome                                              | Exit |
 | ---------------------------------------------------- | ---- |
 | Digests match (or no comparison requested)           | `0`  |
-| Confirmed mismatch (sizes equal, full copy, hex differs) | `4`  |
+| Confirmed mismatch — whole device (equal sizes) or common prefix (sizes differ) | `4`  |
 | Verify could not be performed, **under `--batch`**   | `5`  |
 | `-B` together with `--batch --verify`                | `2` (argparse) |
+
+Note that a size mismatch is **no longer** a "could not verify" condition by
+itself: when `dd` can limit the larger side to the common prefix, the prefix
+is compared and a divergence there is a real **exit 4**.  Only a size mismatch
+with no usable `dd` block size — or a missing/failing `dd` — falls to the skip
+(exit `5` under `--batch`).
 
 Without `--batch`, the skip conditions above just print a warning and leave
 the exit code at `0` — the operator can see what happened.  Under `--batch`

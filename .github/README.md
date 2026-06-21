@@ -18,7 +18,8 @@ with a Perl fallback for hosts that have no Python interpreter.
 Python 3 on the local host and Python 2/3 *or* Perl 5.10+ on the remote
 host.  SSH access to the remote host.  The optional `--verify` cross-check
 additionally needs [`b3sum`](https://github.com/BLAKE3-team/BLAKE3) on each
-side it runs on (it warns and skips where missing).
+side it runs on (it warns and skips where missing), plus `dd` on the larger
+side when the two devices differ in size (used to hash only the common prefix).
 
 **Runs almost anywhere.**  The remote side needs no installation and speaks
 the same protocol whether it runs under `python3`, `python2`/`python`, or
@@ -84,7 +85,7 @@ prefix that fits.
 | `-q` / `--quiet`              |          | Suppress scan/copy progress lines. Errors and warnings are still shown.                                          |
 | `--batch`                     |          | Suppress all stderr output; use the exit status to detect errors (implies `-q`). | Cannot convey a resume offset — use `-q` instead if a caller needs to parse the "Resume with:" stderr line. |
 | `-p PORT` / `--port`          | `22`     | SSH port.                                                                                                        |
-| `--verify`                    |          | After copying, run `b3sum` on the local and (when present) remote file **concurrently**, printing each digest the moment its side finishes (so the first hash is recorded without waiting on the slower side), with a live countdown between them (estimated from the scan time). If the whole device was copied to a same-size destination, compare them and report OK / mismatch (**exit 4** on mismatch). A convenience BLAKE3 cross-check, independent of `-a`; warns and skips where `b3sum` is missing on either side, the copy was partial (`-B`), or the sizes differ. The remote `b3sum` runs under the same SSH keepalive as the transfer, so a long hash does not drop the connection. Under `-N` (dry-run) it runs only when the scan found zero diffs — an independent confirmation that source and destination already match. Under `--batch` a verify that cannot be performed exits `5` (so a suppressed-warning skip is not mistaken for success), and combining it with `-B` is rejected up front (exit `2`). |
+| `--verify`                    |          | After copying, run `b3sum` on the local and (when present) remote file **concurrently**, printing each digest the moment its side finishes (so the first hash is recorded without waiting on the slower side), with a live countdown between them (estimated from the scan time). Compare them and report OK / mismatch (**exit 4** on mismatch). When the two devices differ in size, only the common prefix bscp actually copied is compared: the larger side is piped through `dd bs=… count=…` (block size chosen near 1&nbsp;MiB) so both ends hash the same `min(local, remote)` bytes — the report shows the `dd … \| b3sum` form used. A convenience BLAKE3 cross-check, independent of `-a`; warns and skips where `b3sum` is missing on either side, the copy was partial (`-B`), or the size mismatch admits no efficient `dd` block size (or `dd` is absent on the side that needs it). The remote `b3sum` runs under the same SSH keepalive as the transfer, so a long hash does not drop the connection. Under `-N` (dry-run) it runs only when the scan found zero diffs — an independent confirmation that source and destination already match. Under `--batch` a verify that cannot be performed exits `5` (so a suppressed-warning skip is not mistaken for success), and combining it with `-B` is rejected up front (exit `2`). |
 
 ### Examples
 
@@ -121,6 +122,18 @@ bscp --allow-truncate /var/backups/disk.img myhost:/data/disk-half.img
 
 # Copy, then cross-check both ends with an independent BLAKE3 (b3sum) hash
 bscp --verify /dev/sda myhost:/dev/sda
+
+# Back a disk up into an LVM logical volume sized to hold it (LVM rounds the LV
+# up to a whole extent, so it ends up slightly larger than the source).  The
+# destination is big enough, so no --allow-truncate is needed; --verify still
+# cross-checks by dd-limiting the larger LV down to the source size, ignoring
+# the extent padding.
+bscp --verify /dev/sda myhost:/dev/vg0/sda-backup
+
+# Restore that backup: now the larger LV is the source and the smaller device
+# the destination, so --allow-truncate IS required.  --verify again dd-limits
+# the larger side (the LV being read) so only the restored prefix is compared.
+bscp --allow-truncate --verify myhost:/dev/vg0/sda-backup /dev/sda
 ```
 
 **`--verify` and SSH authentication.**  `--verify` opens a *second* SSH
@@ -163,7 +176,7 @@ tradeoff in mind.
 | `2`   | Bad arguments or usage error.                                            |
 | `3`   | Connection lost — transfer incomplete; re-run with `--resume-from`.      |
 | `4`   | Verification mismatch — `--verify` found the local and remote b3sum digests differ. |
-| `5`   | Verification not performed under `--batch` — `--verify` could not compare (differing sizes, or `b3sum` missing/failing on either side). |
+| `5`   | Verification not performed under `--batch` — `--verify` could not compare (`b3sum`/`dd` missing or failing on either side, or a size mismatch with no efficient `dd` block size). |
 | `130` | Interrupted by user (Ctrl+C).                                            |
 
 ## How it works

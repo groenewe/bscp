@@ -180,10 +180,20 @@ bscp (single file)
 │   / b3sum_*_cmd()      cmd() build the `b3sum LOCAL` and `ssh HOST b3sum
 │   / verify_digest()    REMOTE` (shell-quoted) commands; spawn_hash() starts
 │   / device_size()      each as a Popen so __main__ runs both CONCURRENTLY
-│                        (wall-clock = slower side, not the sum); collect_hash()
-│                        waits one and returns its digest.  verify_digest()
+│   / dd_hash_params()   (wall-clock = slower side, not the sum); collect_hash()
+│   / hash_desc()        waits one and returns its digest.  verify_digest()
 │                        extracts the leading hex token (paths differ between
-│                        sides, so only the digest is compared).  The remote
+│                        sides, so only the digest is compared).  When the two
+│                        devices differ in size, only the common prefix
+│                        min(local,remote) was copied, so the LARGER side is
+│                        dd-limited to it: b3sum_*_cmd() emit
+│                        `dd bs=BS count=COUNT 2>/dev/null | b3sum` (guarded by
+│                        `command -v dd || exit 127`, so a missing dd is a skip,
+│                        not a false zero-byte-hash mismatch).  dd_hash_params()
+│                        picks BS — the largest divisor of the prefix <= 1 MiB,
+│                        >= 4 KiB — or None (skip) when none divides evenly.
+│                        hash_desc() renders how each side was invoked (plain or
+│                        dd-prefixed) for the report.  The remote
 │                        ssh reuses ssh_base() — its ServerAliveInterval
 │                        keepalive holds the idle channel open while b3sum
 │                        runs for minutes — and adds `-tt` (force remote PTY)
@@ -206,10 +216,13 @@ bscp (single file)
 │                        (`ex_hash`) via a bounded feed/drain window
 │                        (`hash_window` = 2× workers) that preserves wire
 │                        order; see docs/remote-execution.md.  Also returns
-│                        `remote_size` (gates the --verify equal-size
-│                        comparison) and `total_scan_time` (phase-A read+hash
-│                        seconds, excluding copy — __main__ turns it into the
-│                        --verify duration estimate).
+│                        `remote_size` (drives the --verify size-mismatch
+│                        decision — whole-device vs dd-limited prefix) and
+│                        `total_scan_time` (phase-A read+hash seconds, excluding
+│                        copy — __main__ turns it into the --verify duration
+│                        estimate).  When --verify is set and the sizes differ,
+│                        do_sync prints the heads-up note at handshake (before
+│                        the copy) so the prefix-only check is announced early.
 └── __main__           — argparse, push/pull auto-detection, retry loop, and
                          the post-copy --verify orchestration (exit 4 on a
                          confirmed mismatch).  On abort (ConnectionLost or
@@ -383,11 +396,12 @@ to cover, plus a few that were easy to forget:
 | `--verify` push, matching b3sum                  | local+remote b3sum run, compared, "verify OK"     |
 | `--verify` detects a mismatch, exits 4           | divergent digests → "VERIFY FAILED", exit 4       |
 | `--verify` skips gracefully when b3sum missing   | absent/failing b3sum warns, exit stays 0          |
-| `--verify` skips compare on size mismatch        | `--allow-truncate` smaller dst → "sizes differ"   |
+| `--verify` compares common prefix on size mismatch | `--allow-truncate` smaller dst → dd-limit larger side, handshake note, "verify OK ... over the first N" |
 | `--verify` under `-N` runs when scan finds 0 diffs | dry-run + identical → b3sum confirms, "verify OK"  |
 | `--verify` under `-N` skips when diffs pending   | dry-run + diffs → skipped, destination untouched  |
 | `--batch --verify` mismatch is silent, exits 4   | exit code is the only mismatch signal under batch |
-| `--batch --verify` size mismatch silent, exits 5 | verify-not-performed signalled when stderr muted  |
+| `--batch --verify` size mismatch silent, exits 0 | dd-limited prefix compare succeeds silently under batch |
+| `--batch --verify` unavailable silent, exits 5   | failing b3sum under batch → verify-not-performed signalled |
 | `--batch --verify` + `-B` rejected, exits 2      | argparse pre-validation of the impossible combo   |
 | `BSCP_OPTIONS` default options take effect       | env options prepended to argv before parse_args   |
 | `BSCP_OPTIONS` overridden by explicit CLI option | explicit flag wins (env placed first, last wins)  |

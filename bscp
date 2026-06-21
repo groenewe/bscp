@@ -66,6 +66,16 @@ DEFAULT_RETRIES    = 3
 DEFAULT_IO_TIMEOUT = 0    # 0 = disabled; --io-timeout SECS aborts if no I/O progress for SECS seconds
 MIN_MEMORY_PUSH    = 64 * DEFAULT_BLOCK
 
+# --verify dd-limit (see dd_hash_params): when the two devices differ in size,
+# the larger one is hashed through `dd bs=BS count=COUNT | b3sum` so only the
+# common prefix bscp actually copied is compared.  dd's `count` counts whole
+# `bs` blocks, so BS must divide the prefix exactly; we pick the largest such
+# divisor <= 1 MiB (fewest reads / throughput sweet spot) but never below 4 KiB
+# (where dd's per-block overhead dominates).  Sizes with no divisor in that
+# range skip the comparison rather than stream byte-by-byte.
+DD_TARGET_IBS = 1 << 20   # 1 MiB
+DD_MIN_IBS    = 1 << 12   # 4 KiB
+
 # Hashing is single-core-bound on fast (NVMe) storage.  --hash-threads fans
 # the per-block hashing across a thread pool on both client and remote;
 # hashlib releases the GIL for blocks >= 2048 bytes, so threads give true
@@ -879,15 +889,56 @@ def verify_digest(output):
     return out.split()[0] if out else ''
 
 
-def b3sum_local_cmd(path):
-    return ['b3sum', path]
+def dd_hash_params(n):
+    # Pick a dd block size dividing n exactly, so `dd bs=BS count=COUNT` reads
+    # precisely n bytes (count counts whole BS blocks, so BS must divide n).
+    # Prefer the largest divisor <= DD_TARGET_IBS (~1 MiB) — that means the
+    # fewest reads and the closest to the streaming sweet spot — but never
+    # below DD_MIN_IBS (4 KiB), where dd's per-block overhead would dominate.
+    # Returns (bs, count) or None when n has no divisor in [DD_MIN_IBS,
+    # DD_TARGET_IBS]; the caller then skips the comparison rather than fall
+    # back to a pathologically slow byte-by-byte (ibs=1) read.
+    if n < DD_MIN_IBS:
+        return None
+    for bs in range(min(DD_TARGET_IBS, n), DD_MIN_IBS - 1, -1):
+        if n % bs == 0:
+            return bs, n // bs
+    return None
 
 
-def b3sum_remote_cmd(remote_host, remote_file, args):
+def hash_desc(path, ddp):
+    # How b3sum was invoked, for the final report: a plain `b3sum PATH`, or the
+    # dd-limited `dd bs=.. count=.. | b3sum PATH` form when the device sizes
+    # differ and only the common prefix was hashed.
+    if ddp is None:
+        return 'b3sum %s' % path
+    bs, count = ddp
+    return 'dd bs=%s count=%d | b3sum %s' % (format_size(bs), count, path)
+
+
+def _dd_guard(path, ddp):
+    # Shell snippet hashing `path` through dd, limited to ddp = (bs, count).
+    # The `command -v dd || exit 127` guard is load-bearing: without it a
+    # MISSING dd would let b3sum hash an empty pipe and emit the digest of zero
+    # bytes — exit 0 — which compares as a *false mismatch* against the other
+    # side.  Exiting 127 instead makes collect_hash() see a failure and skip.
+    bs, count = ddp
+    return ('command -v dd >/dev/null 2>&1 || exit 127; '
+            'dd if=%s bs=%d count=%d 2>/dev/null | b3sum' % (shlex.quote(path), bs, count))
+
+
+def b3sum_local_cmd(path, ddp=None):
+    if ddp is None:
+        return ['b3sum', path]
+    return ['sh', '-c', _dd_guard(path, ddp)]
+
+
+def b3sum_remote_cmd(remote_host, remote_file, args, ddp=None):
     # Run b3sum on the remote over ssh, reusing the transfer's connection
     # options (ssh_base, including the keepalive that holds the idle channel
     # open while b3sum runs).  The remote shell re-parses the command, so the
-    # path is shell-quoted.
+    # path is shell-quoted.  When ddp is set the remote file is the larger of
+    # the two and is dd-limited to the common prefix (see _dd_guard).
     #
     # `-tt` forces a remote PTY (double -t: even though our stdin is not a
     # tty).  Without it, Ctrl+C during verify can leave the remote b3sum
@@ -902,7 +953,8 @@ def b3sum_remote_cmd(remote_host, remote_file, args):
     # The PTY merges remote stderr into stdout and adds CRs; verify_digest
     # takes the leading hex token, so the digest parse is unaffected, and the
     # remote-failure branch discards remote stderr anyway.
-    return ['ssh', '-tt'] + ssh_base(args) + [remote_host, 'b3sum %s' % shlex.quote(remote_file)]
+    cmd = _dd_guard(remote_file, ddp) if ddp is not None else 'b3sum %s' % shlex.quote(remote_file)
+    return ['ssh', '-tt'] + ssh_base(args) + [remote_host, cmd]
 
 
 def spawn_hash(cmd, stdin=None):
@@ -1060,6 +1112,24 @@ def do_sync(local_file, remote_host, remote_file, mode,
                    'syncing only first %s\n' % (
                    dst_label, dst_h, src_label,
                    format_size(eff_src, floor=True), dst_h))
+
+        # --verify heads-up at handshake (not after the possibly-long copy):
+        # mismatched device sizes mean a whole-device b3sum of each would
+        # legitimately differ, so the post-copy check compares only the first
+        # min(local, remote) bytes (dd-limited; see dd_hash_params).  Announce
+        # the situation now so the operator knows up front.  -B has its own
+        # partial-copy skip, so it is excluded here.
+        if ssh_args.get('verify') and not block_count and local_size != remote_size:
+            # Report the delta explicitly: floor=True rounding can render two
+            # genuinely-different sizes identically (e.g. "local 238G, remote
+            # 238G"), so the always-nonzero "differ by ..." removes the
+            # apparent contradiction.
+            report('\nverify: note — local (%s) and remote (%s) differ in size by %s; '
+                   '--verify will compare only the first %s (dd-limited, if dd is available)\n' % (
+                   format_size(local_size, floor=True),
+                   format_size(remote_size, floor=True),
+                   format_size(abs(local_size - remote_size), floor=True),
+                   format_size(min(local_size, remote_size), floor=True)))
 
         sync_size = min(wire_size, remote_size)
         if sync_size == 0:
@@ -1558,11 +1628,14 @@ if __name__ == '__main__':
                         help='after copying, run b3sum on the local and (when available) remote '
                              'file concurrently, printing each digest as its side finishes, with a '
                              'live countdown between them (estimated from the scan '
-                             'time). If the whole device was copied and the local and remote sizes '
-                             'match, compare them and report OK / mismatch (exit 4 on mismatch). '
-                             'Independent of -a, so this external BLAKE3 check '
+                             'time), then compare and report OK / mismatch (exit 4 on mismatch). '
+                             'When the devices differ in size, only the common prefix bscp copied '
+                             'is compared: the larger side is dd-limited (dd ... | b3sum) so both '
+                             'ends hash the same min(local,remote) bytes; the report shows the dd '
+                             'form used. Independent of -a, so this external BLAKE3 check '
                              'guards against block-hash weaknesses. A convenience check: needs '
-                             'b3sum on each side, and warns + skips gracefully where it is missing. '
+                             'b3sum on each side (and dd on the larger side when sizes differ), '
+                             'and warns + skips gracefully where it is missing. '
                              'Under --dry-run it runs only if the scan found zero diffs (an '
                              'independent confirmation the two already match). Under --batch a '
                              'verify that cannot be performed exits 5, and combining it with -B '
@@ -1576,7 +1649,8 @@ if __name__ == '__main__':
                              'Exit 0=success, 1=fatal error, 2=bad arguments, 3=connection lost, '
                              '4=verify mismatch, 5=verify not performed, 130=interrupted. '
                              'With --verify, exit 4 (mismatch) and exit 5 (could not verify — '
-                             'differing sizes or b3sum missing/failing on either side) are the '
+                             'b3sum/dd missing or failing on either side, or a size mismatch with '
+                             'no usable dd block size) are the '
                              'only signals, since their stderr lines are suppressed; the -B + '
                              '--verify combination is rejected up front (exit 2). '
                              'Note: the exit code cannot convey the resume offset; '
@@ -1758,19 +1832,21 @@ if __name__ == '__main__':
     # ── Post-copy verification (convenience BLAKE3 cross-check) ───────────
     # Run b3sum on the local file and, when present, on the remote file, and
     # print both digests.  The two runs are launched concurrently (local
-    # process + remote ssh) so wall-clock is the slower side, not the sum.  A
-    # verdict (OK / mismatch) is only issued when the whole device was copied
-    # to a same-size destination — otherwise a whole-device hash of source and
-    # destination legitimately differs, so the comparison is skipped.
+    # process + remote ssh) so wall-clock is the slower side, not the sum.
+    # Equal sizes are compared whole; when the sizes differ only the common
+    # prefix min(local,remote) is compared — the larger side is dd-limited to
+    # it (see the dd-plan below) so a whole-device hash of two differently
+    # sized devices does not legitimately differ and defeat the check.
     #
     # Outcomes: match -> exit 0; mismatch -> exit 4.  A verify that was
-    # requested but could NOT be performed (missing/failing b3sum on either
-    # side, or differing sizes) normally just warns and exits 0 — but under
-    # --batch that warning is suppressed, so it would look like success.  To
-    # avoid that false positive, verify_unavailable() exits 5 ("verification
-    # not performed") under --batch.  The -B + --batch + --verify combination
-    # is rejected even earlier, at argparse (exit 2), since a partial copy can
-    # never be whole-device verified and that is knowable from the args alone.
+    # requested but could NOT be performed (missing/failing b3sum or dd on
+    # either side, or a size mismatch with no usable dd block size) normally
+    # just warns and exits 0 — but under --batch that warning is suppressed, so
+    # it would look like success.  To avoid that false positive,
+    # verify_unavailable() exits 5 ("verification not performed") under --batch.
+    # The -B + --batch + --verify combination is rejected even earlier, at
+    # argparse (exit 2), since a partial copy can never be whole-device
+    # verified and that is knowable from the args alone.
     #
     # Under --dry-run nothing was written, so verify runs ONLY when the scan
     # found zero diffs — i.e. it claims the two are already identical, and
@@ -1797,123 +1873,165 @@ if __name__ == '__main__':
         except OSError:
             local_size = -1
 
-        # b3sum reads the whole device once, just as phase A did — so the
-        # scan time (read+hash, excluding the copy) is a good duration
-        # estimate, scaled up if a resume (-r) made phase A skip the head.
-        scanned = max(1, sync_size - start_offset)
-        eta = scan_seconds * sync_size / scanned
-
-        # Launch local and remote concurrently, then poll both while showing a
-        # live countdown line (mirrors the scan/copy progress).  The countdown
-        # is a launch-style T-minus toward the scan-based estimate: "(-m:ss)"
-        # while time remains, flipping to "(+m:ss)" counting up once the run
-        # outlasts it (signalling the estimate was low).  Progress is gated on
-        # the user's original -q/--batch: the summary above reset `quiet=False`,
-        # so report() would otherwise un-silence it.  All progress/outcome lines
-        # are \r-prefixed so each overwrites the live countdown line cleanly.
-        verify_progress = not args.quiet and not args.batch
-        t_verify_start  = time()
-        lp = spawn_hash(b3sum_local_cmd(local_file))
-        rp = spawn_hash(b3sum_remote_cmd(remote_host, remote_file, ssh_args),
-                        stdin=subprocess.DEVNULL)
-        # Collect and print each side's digest the moment its b3sum exits,
-        # rather than waiting for both: the first hash is on screen (and can be
-        # recorded/stored/mailed) straight away when pressed for time, while
-        # the loop still ends only once both are in — or once local fails,
-        # which makes the comparison impossible (then stop waiting on remote).
-        local_hash = remote_hash = None
-        lerr = 'not found' if lp is None else ''
-        local_done  = lp is None
-        remote_done = rp is None
-        try:
-            oldmsg = ''
-            # The final summary line above ended in '\n', so report() already
-            # left last_report_len == 0 — the first countdown write lands clean.
-            while not (local_done and remote_done):
-                if not local_done and lp.poll() is not None:
-                    local_done = True
-                    local_hash, lerr = collect_hash(lp)
-                    if local_hash is None:
-                        # Local hash unusable → comparison impossible.  Stop
-                        # waiting on the remote rather than block minutes for a
-                        # result we would only discard.
-                        if not remote_done and rp.poll() is None:
-                            rp.kill()
-                            rp.communicate()
-                        remote_done = True
-                        break
-                    report('\rverify: local  b3sum %s = %s\n' % (local_file, local_hash))
-                if not remote_done and rp.poll() is not None:
-                    remote_done = True
-                    remote_hash, _ = collect_hash(rp)
-                    if remote_hash is not None:
-                        report('\rverify: remote b3sum %s = %s\n' % (remote_file, remote_hash))
-                if local_done and remote_done:
-                    break
-                if verify_progress:
-                    elapsed = time() - t_verify_start
-                    # Name only the side(s) still hashing so the line stays
-                    # truthful once the first finishes.
-                    what = ('both ends'      if not local_done and not remote_done else
-                            'the local file' if not local_done else
-                            'the remote file')
-                    # Only show the countdown once elapsed clears the same warmup
-                    # threshold the scan/copy ETA uses — below that the number is
-                    # noise, so show a bare "...".  The sign is a launch-style
-                    # T-minus: "(-m:ss)" counts down to the scan-based estimate,
-                    # then flips to "(+m:ss)" counting up once the run outlasts it.
-                    if elapsed > ETA_WARMUP_SECS:
-                        rem = eta - elapsed
-                        if rem >= 0:
-                            rem_s = '-'
-                        else:
-                            rem = -rem
-                            rem_s = '+'
-                        rem_s = "(%c%s) " % (rem_s, format_time(rem, round_eta=True))
-                    else:
-                        rem_s = '... '
-                    vermsg = '\rverify: hashing %s with b3sum %s' % (what, rem_s)
-                    if vermsg != oldmsg:
-                        oldmsg = vermsg
-                        report(vermsg) # only update verify "progress" if first or changed status
-                sleep(REPORT_INTERVAL)
-
-            # Digests (when produced) were already printed as each side
-            # finished; below only decides the outcome.  Every message is
-            # \r-prefixed because the loop may have ended on a dangling
-            # countdown line (local done, remote still hashing when it failed).
-            if local_hash is None:
-                verify_unavailable('\rverify: skipped — b3sum failed on %s: %s\n' % (local_file, lerr))
-            elif remote_hash is None:
-                verify_unavailable('\rverify: remote b3sum unavailable on %s — comparison skipped\n'
-                                   % remote_host)
-            elif args.block_count:
-                # Non-batch only: the --batch + -B combination is rejected
-                # at argparse, so this branch is never reached under batch.
-                report('\rverify: comparison skipped (partial copy: -B in effect)\n')
-            elif local_size != remote_size:
-                verify_unavailable(
-                    '\rverify: comparison skipped (sizes differ: local %s, remote %s)\n' % (
-                        format_size(local_size, floor=True) if local_size >= 0 else '?',
-                        format_size(remote_size, floor=True)))
-            elif remote_hash == local_hash:
-                report('\rverify OK: local and remote b3sum match\n')
+        # When the two devices differ in size, a whole-device b3sum of each
+        # legitimately differs — but bscp only ever touched the first
+        # min(local, remote) bytes (the common prefix it scanned and copied),
+        # so that prefix is what a meaningful check compares.  Hash the
+        # *smaller* side whole (its size IS the prefix) and dd-limit the
+        # *larger* side to the same byte count (dd_hash_params picks a block
+        # size dividing the prefix near 1 MiB; b3sum_*_cmd build the
+        # `dd .. | b3sum` form).  If no efficient dd block size divides the
+        # prefix, or dd is absent on the side that needs it, the comparison is
+        # skipped (exactly as the old equal-size-only gate did).  -B keeps its
+        # own partial-copy skip below, so it is excluded from the dd path.
+        sizes_differ = local_size >= 0 and local_size != remote_size
+        verify_size  = min(local_size, remote_size) if local_size >= 0 else remote_size
+        local_ddp = remote_ddp = None
+        dd_skip = None
+        if sizes_differ and not args.block_count:
+            ddp = dd_hash_params(verify_size)
+            # "differ by ..." is always nonzero — floor=True rounding can print
+            # two unequal sizes identically (e.g. "local 238G, remote 238G"),
+            # so the delta resolves the apparent contradiction.
+            size_delta = format_size(abs(local_size - remote_size), floor=True)
+            if ddp is None:
+                dd_skip = ('verify: comparison skipped (sizes differ by %s: local %s, remote %s; '
+                           'no efficient dd block size divides the common %s)\n' % (
+                           size_delta,
+                           format_size(local_size, floor=True),
+                           format_size(remote_size, floor=True),
+                           format_size(verify_size, floor=True)))
+            elif local_size > remote_size and shutil.which('dd') is None:
+                dd_skip = ('verify: comparison skipped (sizes differ by %s: local %s, remote %s; '
+                           'dd not found locally to limit the larger file)\n' % (
+                           size_delta,
+                           format_size(local_size, floor=True),
+                           format_size(remote_size, floor=True)))
+            elif local_size > remote_size:
+                local_ddp = ddp     # local is larger → dd-limit it
             else:
-                report('\rVERIFY FAILED: b3sum digests differ\n')
-                sys.exit(4)
-        except KeyboardInterrupt:
-            # Ctrl+C while hashing: kill both b3sum children (the local process
-            # and the remote ssh) so neither is left running, then exit like
-            # the transfer's interrupt path.
-            for p in (lp, rp):
-                if p is not None:
-                    p.kill()
-                    try:
-                        p.communicate(timeout=5)
-                    except Exception:
-                        pass
-            report('\nInterrupted\n')
-            sys.exit(130)
+                remote_ddp = ddp    # remote is larger → dd-limit it
+
+        if dd_skip is not None:
+            verify_unavailable('\r' + dd_skip)
+        else:
+            # b3sum reads the prefix once, just as phase A did — so the scan
+            # time (read+hash, excluding the copy) is a good duration estimate,
+            # scaled up if a resume (-r) made phase A skip the head.
+            scanned = max(1, sync_size - start_offset)
+            eta = scan_seconds * sync_size / scanned
+
+            # Launch local and remote concurrently, then poll both while showing
+            # a live countdown line (mirrors the scan/copy progress).  The
+            # countdown is a launch-style T-minus toward the scan-based estimate:
+            # "(-m:ss)" while time remains, flipping to "(+m:ss)" counting up once
+            # the run outlasts it (signalling the estimate was low).  Progress is
+            # gated on the user's original -q/--batch: the summary above reset
+            # `quiet=False`, so report() would otherwise un-silence it.  All
+            # progress/outcome lines are \r-prefixed so each overwrites the live
+            # countdown line cleanly.
+            verify_progress = not args.quiet and not args.batch
+            t_verify_start  = time()
+            lp = spawn_hash(b3sum_local_cmd(local_file, local_ddp))
+            rp = spawn_hash(b3sum_remote_cmd(remote_host, remote_file, ssh_args, remote_ddp),
+                            stdin=subprocess.DEVNULL)
+            # Collect and print each side's digest the moment its b3sum exits,
+            # rather than waiting for both: the first hash is on screen (and can
+            # be recorded/stored/mailed) straight away when pressed for time,
+            # while the loop still ends only once both are in — or once local
+            # fails, which makes the comparison impossible (then stop waiting on
+            # remote).  The printed line names dd when dd-limiting was used, so
+            # the report shows how each side's b3sum was actually invoked.
+            local_hash = remote_hash = None
+            lerr = 'not found' if lp is None else ''
+            local_done  = lp is None
+            remote_done = rp is None
+            try:
+                oldmsg = ''
+                # The final summary line above ended in '\n', so report() already
+                # left last_report_len == 0 — the first countdown write lands clean.
+                while not (local_done and remote_done):
+                    if not local_done and lp.poll() is not None:
+                        local_done = True
+                        local_hash, lerr = collect_hash(lp)
+                        if local_hash is None:
+                            # Local hash unusable → comparison impossible.  Stop
+                            # waiting on the remote rather than block minutes for a
+                            # result we would only discard.
+                            if not remote_done and rp.poll() is None:
+                                rp.kill()
+                                rp.communicate()
+                            remote_done = True
+                            break
+                        report('\rverify: local  %s = %s\n' % (hash_desc(local_file, local_ddp), local_hash))
+                    if not remote_done and rp.poll() is not None:
+                        remote_done = True
+                        remote_hash, _ = collect_hash(rp)
+                        if remote_hash is not None:
+                            report('\rverify: remote %s = %s\n' % (hash_desc(remote_file, remote_ddp), remote_hash))
+                    if local_done and remote_done:
+                        break
+                    if verify_progress:
+                        elapsed = time() - t_verify_start
+                        # Name only the side(s) still hashing so the line stays
+                        # truthful once the first finishes.
+                        what = ('both ends'      if not local_done and not remote_done else
+                                'the local file' if not local_done else
+                                'the remote file')
+                        # Only show the countdown once elapsed clears the same warmup
+                        # threshold the scan/copy ETA uses — below that the number is
+                        # noise, so show a bare "...".  The sign is a launch-style
+                        # T-minus: "(-m:ss)" counts down to the scan-based estimate,
+                        # then flips to "(+m:ss)" counting up once the run outlasts it.
+                        if elapsed > ETA_WARMUP_SECS:
+                            rem = eta - elapsed
+                            if rem >= 0:
+                                rem_s = '-'
+                            else:
+                                rem = -rem
+                                rem_s = '+'
+                            rem_s = "(%c%s) " % (rem_s, format_time(rem, round_eta=True))
+                        else:
+                            rem_s = '... '
+                        vermsg = '\rverify: hashing %s with b3sum %s' % (what, rem_s)
+                        if vermsg != oldmsg:
+                            oldmsg = vermsg
+                            report(vermsg) # only update verify "progress" if first or changed status
+                    sleep(REPORT_INTERVAL)
+
+                # Digests (when produced) were already printed as each side
+                # finished; below only decides the outcome.  Every message is
+                # \r-prefixed because the loop may have ended on a dangling
+                # countdown line (local done, remote still hashing when it failed).
+                pfx = ' over the first %s' % format_size(verify_size, floor=True) if sizes_differ else ''
+                if local_hash is None:
+                    verify_unavailable('\rverify: skipped — b3sum failed on %s: %s\n' % (local_file, lerr))
+                elif remote_hash is None:
+                    verify_unavailable('\rverify: remote b3sum unavailable on %s — comparison skipped\n'
+                                       % remote_host)
+                elif args.block_count:
+                    # Non-batch only: the --batch + -B combination is rejected
+                    # at argparse, so this branch is never reached under batch.
+                    report('\rverify: comparison skipped (partial copy: -B in effect)\n')
+                elif remote_hash == local_hash:
+                    report('\rverify OK: local and remote b3sum match%s%s\n'
+                           % (pfx, ' (device sizes differ)' if sizes_differ else ''))
+                else:
+                    report('\rVERIFY FAILED: b3sum digests differ%s\n' % pfx)
+                    sys.exit(4)
+            except KeyboardInterrupt:
+                # Ctrl+C while hashing: kill both b3sum children (the local
+                # process and the remote ssh) so neither is left running, then
+                # exit like the transfer's interrupt path.
+                for p in (lp, rp):
+                    if p is not None:
+                        p.kill()
+                        try:
+                            p.communicate(timeout=5)
+                        except Exception:
+                            pass
+                report('\nInterrupted\n')
+                sys.exit(130)
 
 # The remote source literals (remote_script, remote_script_mt, remote_perl)
 # are tab-indented; ts=4 renders those embedded tabs at the same visual width
