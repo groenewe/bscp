@@ -15,10 +15,10 @@
 #   ./tests.sh --force-all          # run every test even under a python2 client
 #
 # When $BSCP runs under a Python 2 interpreter (e.g. bscp.python2 where
-# `python` resolves to Python 2.x), thirteen tests are skipped by default:
+# `python` resolves to Python 2.x), fourteen tests are skipped by default:
 # the two --hash-threads tests (the option is python3-only by design), the
 # -a algorithm-rejection test (Py2's hashlib lacks the shake_* XOF functions
-# the test probes), and the ten --verify tests (the convenience b3sum
+# the test probes), and the eleven --verify tests (the convenience b3sum
 # cross-check is not implemented in the python2 client).  The BSCP_OPTIONS
 # tests now run under python2 (the env var is honoured there too).  Pass
 # --force-all to run the skipped tests anyway.
@@ -52,7 +52,7 @@ PY2_SKIP="test_hash_threads_push test_hash_threads_single_pull test_reject_bad_a
 test_verify_push_match test_verify_mismatch_exit4 test_verify_skips_when_b3sum_unusable \
 test_verify_size_mismatch_compares test_verify_dryrun_zero_diff_runs test_verify_dryrun_with_diff_skips \
 test_verify_batch_mismatch_exit4 test_verify_batch_size_mismatch_ok test_verify_batch_unavailable_exit5 \
-test_verify_batch_blockcount_rejected"
+test_verify_blockcount_compares test_verify_batch_blockcount_ok"
 
 WORK=$(mktemp -d)
 SRC="$WORK/src.img"
@@ -484,14 +484,37 @@ test_verify_batch_unavailable_exit5() {
     (( rc == 5 )) && [[ -z $out ]]
 }
 
-# -B can never be whole-device verified; combined with --batch --verify it is
-# rejected at argparse (exit 2) rather than running a full copy first.  Needs
-# no b3sum (the rejection happens before any work).
-test_verify_batch_blockcount_rejected() {
-    make_src 4
+# -B caps the copy to a prefix; --verify now dd-limits BOTH sides to that
+# prefix and compares it (instead of skipping the whole device), and warns the
+# backup is incomplete because the source tail was not copied.  Clean prefix
+# -> exit 0, "verify OK ... over the first N (partial copy: -B)", dd both ends.
+test_verify_blockcount_compares() {
+    command -v b3sum >/dev/null || return 0
+    make_src 8
     copy_src_to "$DST"
-    "$BSCP" --batch --verify -B 1M "$SRC" "localhost:$DST" >/dev/null 2>&1
-    (( $? == 2 ))
+    randomise_in "$DST" 1 100          # diff inside the first 4 MiB (gets copied)
+    local out rc
+    out=$("$BSCP" -B 4M --verify "$SRC" "localhost:$DST" 2>&1)
+    rc=$?
+    (( rc == 0 )) || return 1
+    grep -q 'dd bs=' <<<"$out" &&
+    grep -q 'incomplete backup' <<<"$out" &&
+    grep -q 'verify OK: local and remote b3sum match over the first' <<<"$out" &&
+    grep -q 'partial copy: -B' <<<"$out"
+}
+
+# -B + --batch + --verify is no longer rejected: the copied prefix IS
+# verifiable via dd, so a clean prefix exits 0 silently (the incomplete-backup
+# warning is suppressed under --batch, but the caller asked for -B knowingly).
+test_verify_batch_blockcount_ok() {
+    command -v b3sum >/dev/null || return 0
+    make_src 8
+    copy_src_to "$DST"
+    randomise_in "$DST" 1 100
+    local out rc
+    out=$("$BSCP" -B 4M --batch --verify "$SRC" "localhost:$DST" 2>&1)
+    rc=$?
+    (( rc == 0 )) && [[ -z $out ]]
 }
 
 # BSCP_OPTIONS supplies default options before the real argv.  -B 1M from the
@@ -672,7 +695,8 @@ run "--verify under -N skips when diffs are pending"  test_verify_dryrun_with_di
 run "--batch --verify mismatch: silent, exits 4"     test_verify_batch_mismatch_exit4
 run "--batch --verify size mismatch: silent, exits 0" test_verify_batch_size_mismatch_ok
 run "--batch --verify unavailable: silent, exits 5"  test_verify_batch_unavailable_exit5
-run "--batch --verify + -B rejected at argparse (2)" test_verify_batch_blockcount_rejected
+run "--verify -B compares prefix, warns incomplete"  test_verify_blockcount_compares
+run "--batch --verify -B verifies prefix, exits 0"   test_verify_batch_blockcount_ok
 run "BSCP_OPTIONS default options take effect"       test_bscp_options_applies
 run "BSCP_OPTIONS overridden by explicit CLI option" test_bscp_options_cli_overrides
 run "exit 2 when neither side is HOST:path"          test_exit2_when_no_host

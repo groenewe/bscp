@@ -183,17 +183,20 @@ bscp (single file)
 │   / dd_hash_params()   (wall-clock = slower side, not the sum); collect_hash()
 │   / hash_desc()        waits one and returns its digest.  verify_digest()
 │                        extracts the leading hex token (paths differ between
-│                        sides, so only the digest is compared).  When the two
-│                        devices differ in size, only the common prefix
-│                        min(local,remote) was copied, so the LARGER side is
-│                        dd-limited to it: b3sum_*_cmd() emit
+│                        sides, so only the digest is compared).  --verify only
+│                        compares the bytes bscp copied — the prefix
+│                        [0, sync_size) — so EVERY side larger than that prefix
+│                        is dd-limited down to it (a size mismatch → the one
+│                        larger side; a -B cap → BOTH).  b3sum_*_cmd() emit
 │                        `dd bs=BS count=COUNT 2>/dev/null | b3sum` (guarded by
 │                        `command -v dd || exit 127`, so a missing dd is a skip,
 │                        not a false zero-byte-hash mismatch).  dd_hash_params()
 │                        picks BS — the largest divisor of the prefix <= 1 MiB,
 │                        >= 4 KiB — or None (skip) when none divides evenly.
 │                        hash_desc() renders how each side was invoked (plain or
-│                        dd-prefixed) for the report.  The remote
+│                        dd-prefixed) for the report; a -B copy that leaves the
+│                        source tail uncopied also prints an incomplete-backup
+│                        warning.  The remote
 │                        ssh reuses ssh_base() — its ServerAliveInterval
 │                        keepalive holds the idle channel open while b3sum
 │                        runs for minutes — and adds `-tt` (force remote PTY)
@@ -402,7 +405,8 @@ to cover, plus a few that were easy to forget:
 | `--batch --verify` mismatch is silent, exits 4   | exit code is the only mismatch signal under batch |
 | `--batch --verify` size mismatch silent, exits 0 | dd-limited prefix compare succeeds silently under batch |
 | `--batch --verify` unavailable silent, exits 5   | failing b3sum under batch → verify-not-performed signalled |
-| `--batch --verify` + `-B` rejected, exits 2      | argparse pre-validation of the impossible combo   |
+| `--verify` `-B` compares prefix, warns incomplete | -B → dd-limit BOTH sides to copied prefix, "verify OK ... over the first N (partial copy: -B)", incomplete-backup warning |
+| `--batch --verify` `-B` verifies prefix, exits 0 | -B+batch+verify no longer rejected — clean prefix exits 0 silently |
 | `BSCP_OPTIONS` default options take effect       | env options prepended to argv before parse_args   |
 | `BSCP_OPTIONS` overridden by explicit CLI option | explicit flag wins (env placed first, last wins)  |
 
@@ -514,16 +518,19 @@ rely solely on the exit status:
 | `130`     | Interrupted (Ctrl+C)                           |
 
 `--verify` adds exit `4` (mismatch) and exit `5`.  Exit `5` exists only
-because `--batch` suppresses stderr: a verify that *could not run* (differing
-sizes, or `b3sum` missing/failing on either side) would otherwise warn and
-exit `0`, which under `--batch` is indistinguishable from a clean success.
-So under `--batch` those skip conditions exit `5` instead (see
-`verify_unavailable()` in `__main__`); **without** `--batch` they stay
-visible warnings with exit `0`.  The one statically-knowable impossible case
-— `-B` (partial copy) together with `--batch --verify` — is rejected at
-argparse with exit `2` rather than running a full copy first.  `--resume-from`
-is *not* blocked: verify hashes the final whole-device state, so an
-incomplete resume surfaces as a normal exit `4` mismatch.
+because `--batch` suppresses stderr: a verify that *could not run* (`b3sum`/`dd`
+missing or failing on either side, or a copied prefix with no usable `dd` block
+size) would otherwise warn and exit `0`, which under `--batch` is
+indistinguishable from a clean success.  So under `--batch` those skip
+conditions exit `5` instead (see `verify_unavailable()` in `__main__`);
+**without** `--batch` they stay visible warnings with exit `0`.  A size
+mismatch and a `-B` partial copy are **not** skip conditions — they are prefix
+comparisons (every side larger than the copied prefix is dd-limited to it), so
+they yield a real exit `0`/`4`.  (`-B` together with `--batch --verify` used to
+be rejected at argparse with exit `2`; that pre-validation was removed once the
+copied prefix became verifiable.)  `--resume-from` likewise verifies the
+cumulative copied prefix, so an incomplete resume surfaces as a normal exit `4`
+mismatch.
 
 Both flags are forwarded into the resume command printed by
 `build_resume_cmd()`, so a resumed invocation keeps the same verbosity level.

@@ -148,15 +148,25 @@ give the desired "both ends die" outcome.  Two scenarios, both verified:
 Persistence across a dropped controlling terminal is intentionally *not*
 bscp's job: run it under `tmux`/`screen` if the session may disconnect.
 
-## Unequal device sizes
+## What `--verify` compares — the copied prefix
 
 A whole-device `b3sum` of source and destination only matches when the
 destination is a byte-for-byte copy of the source over the *entire* device.
-When the two differ in size (the `--allow-truncate` case), bscp only ever
-touched the first `min(local, remote)` bytes — the **common prefix** — so a
-meaningful check compares *that*, not the whole of each device.
+bscp does not always copy the whole device, so a meaningful check compares only
+the bytes it **did** copy: the prefix `[0, sync_size)`, where `sync_size` is
 
-### Why sizes legitimately differ
+- `min(local, remote)` for a full copy to a same-or-larger destination, and
+- *smaller still* when `-B` / `--block-count` caps the copy to the first N
+  blocks (and smaller again if the destination is also smaller).
+
+Any side **larger** than that prefix is dd-limited down to it before hashing:
+`dd if=DEV bs=BS count=COUNT 2>/dev/null | b3sum`.  So a size mismatch dd-limits
+the one larger side (the smaller side's whole device *is* the prefix), while a
+`-B` cap — where *both* ends exceed the prefix — dd-limits **both**.  An
+equal-size full copy dd-limits neither and hashes each side directly, keeping
+`b3sum`'s fast mmap, multi-threaded read.
+
+### Why device sizes legitimately differ
 
 A size mismatch is not necessarily an error — it is routine for some backup
 layouts.  The motivating case: a large disk managed by **LVM**, with each
@@ -180,79 +190,101 @@ Either way the two ends differ in size, so a whole-device `b3sum` would differ
 on the trailing extent padding alone, even when every copied byte is identical
 — and the larger side (the LV in both directions) is the one dd-limits.
 
-The dd-limiting trick makes `--verify` Just Work in both: it compares exactly
-the bytes bscp copied and ignores the LV's rounding tail.  This is squarely in
-the spirit of `--verify` as a **convenience** — the same check can be run by
-hand with `dd … | b3sum` on each side, but having bscp size and issue the `dd`
-automatically means one command both runs the transfer and confirms it.
+The dd-limiting trick makes `--verify` Just Work in both directions: it
+compares exactly the bytes bscp copied and ignores the LV's rounding tail.
+This is squarely in the spirit of `--verify` as a **convenience** — the same
+check can be run by hand with `dd … | b3sum` on each side, but having bscp size
+and issue the `dd` automatically means one command both runs the transfer and
+confirms it.
 
-The prefix is hashed on both sides by hashing the **smaller** side whole (its
-size *is* the prefix) and **dd-limiting the larger side** to the same byte
-count: `dd if=DEV bs=BS count=COUNT 2>/dev/null | b3sum`.  Because `dd`'s
-`count` counts whole `bs` blocks, `bs` must divide the prefix exactly;
-`dd_hash_params()` picks the largest such divisor `<= 1 MiB` (fewest reads /
-closest to the streaming sweet spot, but never below 4 KiB).  The dd snippet
-is guarded with `command -v dd >/dev/null || exit 127` — load-bearing, because
-a *missing* `dd` would otherwise let `b3sum` hash an empty pipe and emit the
-digest of zero bytes (exit 0), which would compare as a **false mismatch**.
+### `-B` / `--block-count` partial copies
+
+`-B` deliberately copies only a prefix (the chunked-transfer workflow, where
+each run prints a `Continue with: … -r OFFSET` hint to resume).  `--verify` then
+confirms exactly that prefix — dd-limiting **both** ends to it — and, because
+the source's tail was *not* copied, prints an **incomplete-backup warning**:
+
+```
+verify: WARNING — -B copied only the first 4096K of the 8192K local source;
+the remaining 4096K is NOT in the destination — incomplete backup
+(see the "Continue with" line above to copy the rest)
+```
+
+The operator ran a verification expecting "all good", so this says plainly that
+only the copied prefix is confirmed and the destination is not yet a complete
+backup.  (Earlier versions instead *skipped* the comparison with a "partial
+copy: -B" message after hashing each whole device and discarding the result,
+and rejected `-B` together with `--batch --verify` at argparse.  Both are gone:
+the copied prefix is verifiable, so it now yields a real exit `0` / `4`.)
+
+### dd block size, and the missing-dd guard
+
+Because `dd`'s `count` counts whole `bs` blocks, `bs` must divide the prefix
+exactly; `dd_hash_params()` picks the largest such divisor `<= 1 MiB` (fewest
+reads / closest to the streaming sweet spot, but never below 4 KiB).  The dd
+snippet is guarded with `command -v dd >/dev/null || exit 127` — load-bearing,
+because a *missing* `dd` would otherwise let `b3sum` hash an empty pipe and emit
+the digest of zero bytes (exit 0), which would compare as a **false mismatch**.
 The early-exit makes that side look unavailable (a skip) instead.
 
-The size mismatch is announced **at handshake** — as soon as `do_sync` reads
-the remote size, before the (possibly long) copy — so the operator knows up
-front that the post-copy check will be prefix-only.  Each side's digest line
-in the report shows exactly how `b3sum` was invoked (`b3sum PATH`, or
-`dd bs=… count=… | b3sum PATH`), and the OK/mismatch verdict is annotated with
-`over the first …` so it is unambiguous that only the prefix was compared.
+### Reporting
 
-dd runs **only on the larger side** ("if necessary"): the smaller side's whole
-device is the prefix, so it keeps `b3sum`'s fast direct (mmap, multi-threaded)
-read.
+A size mismatch is announced **at handshake** — as soon as `do_sync` reads the
+remote size, before the (possibly long) copy — so the operator knows up front
+that the post-copy check will be prefix-only.  (A `-B` cap is signalled instead
+by the post-copy incomplete-backup warning above plus the `Continue with`
+hint.)  Each side's digest line in the report shows exactly how `b3sum` was
+invoked (`b3sum PATH`, or `dd bs=… count=… | b3sum PATH`), and the OK/mismatch
+verdict is annotated with `over the first …` and the reason(s) — `device sizes
+differ` and/or `partial copy: -B` — so it is unambiguous that only the prefix
+was compared and why.
 
 ## Comparison eligibility gate
 
 The comparison is **skipped** (with a warning; see *Exit code* for how
-`--batch` changes this) when:
+`--batch` changes this) only when it genuinely cannot be carried out:
 
-- `-B` / `--block-count` capped the copy (only a prefix was synced, and a
-  resumed `-B` prefix need not start at offset 0 — out of scope for the
-  size-mismatch dd path, which assumes a 0-based common prefix);
-- the sizes differ but no efficient `dd` block size divides the common prefix
-  (e.g. a prime-sized prefix, or one smaller than 4 KiB), or `dd` is missing
-  on the side that needs it — `device_size()` is used to size each end because
+- the copied prefix has no efficient `dd` block size dividing it (a prime-sized
+  prefix, or one smaller than 4 KiB), or `dd` is missing on a side that needs it
+  (i.e. a side larger than the prefix) — `device_size()` sizes each end because
   `os.path.getsize()` reports `0` for block devices; or
 - `b3sum` is missing or errors on either side.
 
-Equal sizes need no `dd` and are compared whole, exactly as before.
+A size mismatch or a `-B` cap is **no longer** a skip condition — those are
+prefix comparisons, handled by dd-limiting (above).  An equal-size full copy
+needs no `dd` and is compared whole.
 
-Resume (`-r`) does **not** disable the comparison: the check is over the
-final whole-device (or whole-prefix) state, which a resumed run completes.
+Resume (`-r`) does **not** disable the comparison: the check is over the final
+state, which a resumed run completes.  A resumed `-B` chunk verifies the
+cumulative prefix `[0, sync_size)` — `sync_size` being the *end* of the chunk
+just copied — so the dd limit covers everything copied so far (correct as long
+as earlier chunks were copied correctly, the same assumption resume already
+makes elsewhere).
 
 ## Exit code
 
 | Outcome                                              | Exit |
 | ---------------------------------------------------- | ---- |
 | Digests match (or no comparison requested)           | `0`  |
-| Confirmed mismatch — whole device (equal sizes) or common prefix (sizes differ) | `4`  |
+| Confirmed mismatch — whole device (full copy) or copied prefix (size mismatch / `-B`) | `4`  |
 | Verify could not be performed, **under `--batch`**   | `5`  |
-| `-B` together with `--batch --verify`                | `2` (argparse) |
 
-Note that a size mismatch is **no longer** a "could not verify" condition by
-itself: when `dd` can limit the larger side to the common prefix, the prefix
-is compared and a divergence there is a real **exit 4**.  Only a size mismatch
-with no usable `dd` block size — or a missing/failing `dd` — falls to the skip
-(exit `5` under `--batch`).
+A size mismatch or a `-B` partial copy is **not** a "could not verify"
+condition: `dd` limits each oversized side to the copied prefix, the prefix is
+compared, and a divergence there is a real **exit 4**.  Only a prefix with no
+usable `dd` block size — or a missing/failing `b3sum`/`dd` — falls to the skip
+(exit `5` under `--batch`).  (Earlier versions rejected `-B` together with
+`--batch --verify` at argparse with exit `2`; that pre-validation is gone, since
+the copied prefix is now verifiable.)
 
 Without `--batch`, the skip conditions above just print a warning and leave
 the exit code at `0` — the operator can see what happened.  Under `--batch`
 all stderr is suppressed, so a silent exit `0` would be indistinguishable
 from a verified success.  `verify_unavailable()` therefore exits `5` for any
-verify that was requested but could not run (differing sizes, or `b3sum`
-missing/failing on either side).  The one case knowable from the command line
-alone — a `-B` partial copy under `--batch --verify` — is rejected at
-argparse (exit `2`) so a full copy is not run just to end in a guaranteed
-skip.  (The dry-run "diffs pending, destination not updated" skip is an
-expected `-N` outcome, not a verify-impossible condition, so it does not trip
-exit `5`.)
+verify that was requested but could not run (`b3sum`/`dd` missing or failing on
+either side, or a copied prefix with no usable `dd` block size).  (The dry-run
+"diffs pending, destination not updated" skip is an expected `-N` outcome, not
+a verify-impossible condition, so it does not trip exit `5`.)
 
 ## Limitations
 

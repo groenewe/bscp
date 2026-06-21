@@ -1629,17 +1629,19 @@ if __name__ == '__main__':
                              'file concurrently, printing each digest as its side finishes, with a '
                              'live countdown between them (estimated from the scan '
                              'time), then compare and report OK / mismatch (exit 4 on mismatch). '
-                             'When the devices differ in size, only the common prefix bscp copied '
-                             'is compared: the larger side is dd-limited (dd ... | b3sum) so both '
-                             'ends hash the same min(local,remote) bytes; the report shows the dd '
-                             'form used. Independent of -a, so this external BLAKE3 check '
-                             'guards against block-hash weaknesses. A convenience check: needs '
-                             'b3sum on each side (and dd on the larger side when sizes differ), '
-                             'and warns + skips gracefully where it is missing. '
+                             'Only the bytes bscp copied — the prefix [0, sync_size) — are '
+                             'compared: when the devices differ in size, or -B/--block-count '
+                             'capped the copy, every side larger than that prefix is dd-limited '
+                             '(dd ... | b3sum) so both ends hash the same bytes; the report shows '
+                             'the dd form used, and a -B copy that leaves source data uncopied '
+                             'warns that the backup is incomplete. Independent of -a, so this '
+                             'external BLAKE3 check guards against block-hash weaknesses. A '
+                             'convenience check: needs b3sum on each side (and dd on any side '
+                             'larger than the copied prefix), and warns + skips gracefully where '
+                             'it is missing. '
                              'Under --dry-run it runs only if the scan found zero diffs (an '
                              'independent confirmation the two already match). Under --batch a '
-                             'verify that cannot be performed exits 5, and combining it with -B '
-                             'is rejected (exit 2).')
+                             'verify that cannot be performed exits 5.')
 
     output = parser.add_argument_group('output')
     output.add_argument('-q', '--quiet',              action='store_true',
@@ -1649,10 +1651,9 @@ if __name__ == '__main__':
                              'Exit 0=success, 1=fatal error, 2=bad arguments, 3=connection lost, '
                              '4=verify mismatch, 5=verify not performed, 130=interrupted. '
                              'With --verify, exit 4 (mismatch) and exit 5 (could not verify — '
-                             'b3sum/dd missing or failing on either side, or a size mismatch with '
+                             'b3sum/dd missing or failing on either side, or a copied prefix with '
                              'no usable dd block size) are the '
-                             'only signals, since their stderr lines are suppressed; the -B + '
-                             '--verify combination is rejected up front (exit 2). '
+                             'only signals, since their stderr lines are suppressed. '
                              'Note: the exit code cannot convey the resume offset; '
                              'callers that need to resume should use -q instead and '
                              'parse the "Resume with:" line from stderr.')
@@ -1678,15 +1679,6 @@ if __name__ == '__main__':
     args = parser.parse_args(env_opts + sys.argv[1:])
     quiet = args.quiet or args.batch
     batch = args.batch
-
-    # Pre-validation: a -B partial copy can never be whole-device verified,
-    # and --batch suppresses the "comparison skipped" warning — so refuse the
-    # combination up front (exit 2) rather than run a full copy that ends in a
-    # guaranteed-useless, silently-skipped verify.  (-B with --verify but
-    # without --batch is fine: the skip warning is visible.)
-    if args.batch and args.verify and args.block_count:
-        parser.error('--batch --verify is incompatible with -B/--block-count '
-                     '(a partial copy cannot be whole-device verified)')
 
     src, dst = args.src, args.dst
     if ':' in src and ':' not in dst:
@@ -1833,20 +1825,21 @@ if __name__ == '__main__':
     # Run b3sum on the local file and, when present, on the remote file, and
     # print both digests.  The two runs are launched concurrently (local
     # process + remote ssh) so wall-clock is the slower side, not the sum.
-    # Equal sizes are compared whole; when the sizes differ only the common
-    # prefix min(local,remote) is compared — the larger side is dd-limited to
-    # it (see the dd-plan below) so a whole-device hash of two differently
-    # sized devices does not legitimately differ and defeat the check.
+    # Only the bytes bscp actually copied — the prefix [0, sync_size) — are
+    # compared: a full equal-size copy hashes each side whole, while a size
+    # mismatch or a -B-capped copy dd-limits every side larger than that prefix
+    # down to it (see the dd-plan below), so an uncopied tail does not
+    # legitimately differ and defeat the check.  A -B copy that leaves source
+    # data uncopied additionally prints an incomplete-backup warning.
     #
     # Outcomes: match -> exit 0; mismatch -> exit 4.  A verify that was
     # requested but could NOT be performed (missing/failing b3sum or dd on
-    # either side, or a size mismatch with no usable dd block size) normally
-    # just warns and exits 0 — but under --batch that warning is suppressed, so
-    # it would look like success.  To avoid that false positive,
+    # either side, or a prefix with no usable dd block size) normally just
+    # warns and exits 0 — but under --batch that warning is suppressed, so it
+    # would look like success.  To avoid that false positive,
     # verify_unavailable() exits 5 ("verification not performed") under --batch.
-    # The -B + --batch + --verify combination is rejected even earlier, at
-    # argparse (exit 2), since a partial copy can never be whole-device
-    # verified and that is knowable from the args alone.
+    # (-B is no longer rejected with --batch --verify: the copied prefix IS
+    # verifiable via dd, so it yields a real exit 0/4 instead of a forced skip.)
     #
     # Under --dry-run nothing was written, so verify runs ONLY when the scan
     # found zero diffs — i.e. it claims the two are already identical, and
@@ -1873,44 +1866,60 @@ if __name__ == '__main__':
         except OSError:
             local_size = -1
 
-        # When the two devices differ in size, a whole-device b3sum of each
-        # legitimately differs — but bscp only ever touched the first
-        # min(local, remote) bytes (the common prefix it scanned and copied),
-        # so that prefix is what a meaningful check compares.  Hash the
-        # *smaller* side whole (its size IS the prefix) and dd-limit the
-        # *larger* side to the same byte count (dd_hash_params picks a block
-        # size dividing the prefix near 1 MiB; b3sum_*_cmd build the
-        # `dd .. | b3sum` form).  If no efficient dd block size divides the
-        # prefix, or dd is absent on the side that needs it, the comparison is
-        # skipped (exactly as the old equal-size-only gate did).  -B keeps its
-        # own partial-copy skip below, so it is excluded from the dd path.
-        sizes_differ = local_size >= 0 and local_size != remote_size
-        verify_size  = min(local_size, remote_size) if local_size >= 0 else remote_size
+        # bscp validated exactly the bytes it scanned and copied: the prefix
+        # [0, sync_size).  sync_size = min(local, remote) for a full copy, but
+        # is SMALLER when -B/--block-count capped the copy (and smaller still
+        # if the destination is smaller too).  A whole-device b3sum of any side
+        # LARGER than that prefix would legitimately differ on the uncopied
+        # tail, so every side bigger than the prefix is dd-limited down to it:
+        # `dd bs=BS count=COUNT | b3sum`, BS = dd_hash_params(prefix).  Hence a
+        # size mismatch dd-limits the one larger side, while -B (both sides
+        # bigger than the cap) dd-limits BOTH.  Equal-size full copies need no
+        # dd (neither side exceeds the prefix) and hash directly, keeping
+        # b3sum's fast mmap path.  Skip (warn; exit 5 under --batch) when no
+        # efficient BS divides the prefix, or dd is missing on a side needing it.
+        validated      = sync_size
+        min_dev        = min(local_size, remote_size) if local_size >= 0 else remote_size
+        need_local_dd  = local_size  > validated
+        need_remote_dd = remote_size > validated
+        prefix_only    = need_local_dd or need_remote_dd
+        b_capped       = bool(args.block_count) and validated < min_dev
         local_ddp = remote_ddp = None
         dd_skip = None
-        if sizes_differ and not args.block_count:
-            ddp = dd_hash_params(verify_size)
-            # "differ by ..." is always nonzero — floor=True rounding can print
-            # two unequal sizes identically (e.g. "local 238G, remote 238G"),
-            # so the delta resolves the apparent contradiction.
-            size_delta = format_size(abs(local_size - remote_size), floor=True)
+        if prefix_only:
+            ddp = dd_hash_params(validated)
+            # Device sizes for the skip message; "differ by ..." is always
+            # nonzero so floor=True rounding cannot make two unequal sizes read
+            # as identical (e.g. "local 238G, remote 238G").
+            sz = 'local %s, remote %s' % (
+                 format_size(local_size, floor=True) if local_size >= 0 else '?',
+                 format_size(remote_size, floor=True))
+            if local_size >= 0 and local_size != remote_size:
+                sz += ', differ by %s' % format_size(abs(local_size - remote_size), floor=True)
             if ddp is None:
-                dd_skip = ('verify: comparison skipped (sizes differ by %s: local %s, remote %s; '
-                           'no efficient dd block size divides the common %s)\n' % (
-                           size_delta,
-                           format_size(local_size, floor=True),
-                           format_size(remote_size, floor=True),
-                           format_size(verify_size, floor=True)))
-            elif local_size > remote_size and shutil.which('dd') is None:
-                dd_skip = ('verify: comparison skipped (sizes differ by %s: local %s, remote %s; '
-                           'dd not found locally to limit the larger file)\n' % (
-                           size_delta,
-                           format_size(local_size, floor=True),
-                           format_size(remote_size, floor=True)))
-            elif local_size > remote_size:
-                local_ddp = ddp     # local is larger → dd-limit it
+                dd_skip = ('verify: comparison skipped (would compare the first %s [%s], '
+                           'but no efficient dd block size divides it)\n' % (
+                           format_size(validated, floor=True), sz))
+            elif need_local_dd and shutil.which('dd') is None:
+                dd_skip = ('verify: comparison skipped (would compare the first %s [%s], '
+                           'but dd is not on the local host to limit the larger local file)\n' % (
+                           format_size(validated, floor=True), sz))
             else:
-                remote_ddp = ddp    # remote is larger → dd-limit it
+                if need_local_dd:  local_ddp  = ddp
+                if need_remote_dd: remote_ddp = ddp
+
+        # Incomplete-backup warning: -B left the source's tail uncopied, so
+        # --verify only confirms the prefix.  The operator ran a verification
+        # expecting "all good", so say plainly that the rest is not backed up.
+        src_label   = 'local' if mode == MODE_PUSH else 'remote'
+        source_size = local_size if mode == MODE_PUSH else remote_size
+        if b_capped and source_size > validated:
+            report('\nverify: WARNING — -B copied only the first %s of the %s %s source; '
+                   'the remaining %s is NOT in the destination — incomplete backup '
+                   '(see the "Continue with" line above to copy the rest)\n' % (
+                   format_size(validated, floor=True),
+                   format_size(source_size, floor=True), src_label,
+                   format_size(source_size - validated, floor=True)))
 
         if dd_skip is not None:
             verify_unavailable('\r' + dd_skip)
@@ -2003,21 +2012,22 @@ if __name__ == '__main__':
                 # finished; below only decides the outcome.  Every message is
                 # \r-prefixed because the loop may have ended on a dangling
                 # countdown line (local done, remote still hashing when it failed).
-                pfx = ' over the first %s' % format_size(verify_size, floor=True) if sizes_differ else ''
+                pfx = ' over the first %s' % format_size(validated, floor=True) if prefix_only else ''
+                reasons = []
+                if local_size >= 0 and local_size != remote_size:
+                    reasons.append('device sizes differ')
+                if b_capped:
+                    reasons.append('partial copy: -B')
+                rsfx = ' (%s)' % '; '.join(reasons) if reasons else ''
                 if local_hash is None:
                     verify_unavailable('\rverify: skipped — b3sum failed on %s: %s\n' % (local_file, lerr))
                 elif remote_hash is None:
                     verify_unavailable('\rverify: remote b3sum unavailable on %s — comparison skipped\n'
                                        % remote_host)
-                elif args.block_count:
-                    # Non-batch only: the --batch + -B combination is rejected
-                    # at argparse, so this branch is never reached under batch.
-                    report('\rverify: comparison skipped (partial copy: -B in effect)\n')
                 elif remote_hash == local_hash:
-                    report('\rverify OK: local and remote b3sum match%s%s\n'
-                           % (pfx, ' (device sizes differ)' if sizes_differ else ''))
+                    report('\rverify OK: local and remote b3sum match%s%s\n' % (pfx, rsfx))
                 else:
-                    report('\rVERIFY FAILED: b3sum digests differ%s\n' % pfx)
+                    report('\rVERIFY FAILED: b3sum digests differ%s%s\n' % (pfx, rsfx))
                     sys.exit(4)
             except KeyboardInterrupt:
                 # Ctrl+C while hashing: kill both b3sum children (the local
