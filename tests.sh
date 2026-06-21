@@ -15,10 +15,10 @@
 #   ./tests.sh --force-all          # run every test even under a python2 client
 #
 # When $BSCP runs under a Python 2 interpreter (e.g. bscp.python2 where
-# `python` resolves to Python 2.x), fourteen tests are skipped by default:
+# `python` resolves to Python 2.x), fifteen tests are skipped by default:
 # the two --hash-threads tests (the option is python3-only by design), the
 # -a algorithm-rejection test (Py2's hashlib lacks the shake_* XOF functions
-# the test probes), and the eleven --verify tests (the convenience b3sum
+# the test probes), and the twelve --verify tests (the convenience b3sum
 # cross-check is not implemented in the python2 client).  The BSCP_OPTIONS
 # tests now run under python2 (the env var is honoured there too).  Pass
 # --force-all to run the skipped tests anyway.
@@ -52,7 +52,8 @@ PY2_SKIP="test_hash_threads_push test_hash_threads_single_pull test_reject_bad_a
 test_verify_push_match test_verify_mismatch_exit4 test_verify_skips_when_b3sum_unusable \
 test_verify_size_mismatch_compares test_verify_dryrun_zero_diff_runs test_verify_dryrun_with_diff_skips \
 test_verify_batch_mismatch_exit4 test_verify_batch_size_mismatch_ok test_verify_batch_unavailable_exit5 \
-test_verify_blockcount_compares test_verify_batch_blockcount_ok"
+test_verify_blockcount_compares test_verify_batch_blockcount_ok \
+test_verify_dryrun_blockcount_no_warning"
 
 WORK=$(mktemp -d)
 SRC="$WORK/src.img"
@@ -517,6 +518,21 @@ test_verify_batch_blockcount_ok() {
     (( rc == 0 )) && [[ -z $out ]]
 }
 
+# Under --dry-run nothing is copied, so the -B incomplete-backup warning must
+# NOT print — the run is only a pre-flight check and the destination is left
+# untouched.  Verify still confirms the (identical) prefix and exits 0.
+test_verify_dryrun_blockcount_no_warning() {
+    command -v b3sum >/dev/null || return 0
+    make_src 8
+    copy_src_to "$DST"                 # identical -> scan finds 0 diffs in prefix
+    local out rc
+    out=$("$BSCP" -B 4M -N --verify "$SRC" "localhost:$DST" 2>&1)
+    rc=$?
+    (( rc == 0 )) || return 1
+    grep -q 'verify OK: local and remote b3sum match over the first' <<<"$out" &&
+    ! grep -q 'incomplete backup' <<<"$out"
+}
+
 # BSCP_OPTIONS supplies default options before the real argv.  -B 1M from the
 # env caps the sync to the first 1 MiB, which prints a "Continue with" hint —
 # observable proof the env option took effect.
@@ -697,6 +713,7 @@ run "--batch --verify size mismatch: silent, exits 0" test_verify_batch_size_mis
 run "--batch --verify unavailable: silent, exits 5"  test_verify_batch_unavailable_exit5
 run "--verify -B compares prefix, warns incomplete"  test_verify_blockcount_compares
 run "--batch --verify -B verifies prefix, exits 0"   test_verify_batch_blockcount_ok
+run "--verify -B -N suppresses incomplete warning"   test_verify_dryrun_blockcount_no_warning
 run "BSCP_OPTIONS default options take effect"       test_bscp_options_applies
 run "BSCP_OPTIONS overridden by explicit CLI option" test_bscp_options_cli_overrides
 run "exit 2 when neither side is HOST:path"          test_exit2_when_no_host

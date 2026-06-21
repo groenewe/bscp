@@ -1911,9 +1911,12 @@ if __name__ == '__main__':
         # Incomplete-backup warning: -B left the source's tail uncopied, so
         # --verify only confirms the prefix.  The operator ran a verification
         # expecting "all good", so say plainly that the rest is not backed up.
+        # Suppressed under --dry-run: nothing was written, so there is no
+        # "incomplete backup" — the run is only a pre-flight check (ssh, device
+        # presence, access rights), and the destination is deliberately untouched.
         src_label   = 'local' if mode == MODE_PUSH else 'remote'
         source_size = local_size if mode == MODE_PUSH else remote_size
-        if b_capped and source_size > validated:
+        if b_capped and source_size > validated and not dry_run:
             report('\nverify: WARNING — -B copied only the first %s of the %s %s source; '
                    'the remaining %s is NOT in the destination — incomplete backup '
                    '(see the "Continue with" line above to copy the rest)\n' % (

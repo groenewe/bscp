@@ -217,6 +217,14 @@ copy: -B" message after hashing each whole device and discarding the result,
 and rejected `-B` together with `--batch --verify` at argparse.  Both are gone:
 the copied prefix is verifiable, so it now yields a real exit `0` / `4`.)
 
+The warning is **suppressed under `--dry-run`**: a dry run copies nothing, so
+there is no incomplete backup to warn about — it is a pre-flight check (ssh
+reachability, device presence, access rights), and the destination is
+deliberately left untouched.  The prefix is still verified (when the scan found
+zero diffs), and the verdict still notes `(partial copy: -B)` — i.e. only the
+prefix was checked — but the alarming "NOT in the destination" line does not
+fire.
+
 ### dd block size, and the missing-dd guard
 
 Because `dd`'s `count` counts whole `bs` blocks, `bs` must divide the prefix

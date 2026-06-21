@@ -407,6 +407,7 @@ to cover, plus a few that were easy to forget:
 | `--batch --verify` unavailable silent, exits 5   | failing b3sum under batch → verify-not-performed signalled |
 | `--verify` `-B` compares prefix, warns incomplete | -B → dd-limit BOTH sides to copied prefix, "verify OK ... over the first N (partial copy: -B)", incomplete-backup warning |
 | `--batch --verify` `-B` verifies prefix, exits 0 | -B+batch+verify no longer rejected — clean prefix exits 0 silently |
+| `--verify` `-B` `-N` suppresses incomplete warning | dry-run copies nothing → no incomplete-backup warning, prefix still verified |
 | `BSCP_OPTIONS` default options take effect       | env options prepended to argv before parse_args   |
 | `BSCP_OPTIONS` overridden by explicit CLI option | explicit flag wins (env placed first, last wins)  |
 
