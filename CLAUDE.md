@@ -190,10 +190,13 @@ bscp (single file)
 │                        master (see docs/verify.md).  device_size() seek-to-end sizes a
 │                        path because os.path.getsize() reports 0 for block
 │                        devices.  Orchestrated in __main__ after a successful
-│                        copy: both processes are polled in a loop that renders
-│                        a live elapsed/remaining progress line (remaining from
-│                        do_sync's returned scan time; goes negative if the run
-│                        outlasts it); see docs/verify.md.
+│                        copy: both processes are polled in a loop that prints
+│                        each side's digest the moment its b3sum exits (so the
+│                        first hash is recorded straight away, not held up by
+│                        the slower side) and renders a live countdown between
+│                        them — a T-minus to do_sync's returned scan-time
+│                        estimate that flips to a +m:ss count-up once the run
+│                        outlasts it; see docs/verify.md.
 ├── do_sync()          — all transfer logic for both push and pull.  Hosts
 │                        a `show_copy_progress` closure that all three
 │                        phase-B branches (push, push --buffer, pull) share.
@@ -448,18 +451,22 @@ copy WPOS/TOTAL (PCT%) block C/N (SEC_PCT%) (SPEED KiB/s) ELAPSED (ETA)
 - `ELAPSED` / `(ETA)` — same convention as scan; same unified model
   (see [docs/eta-model.md](docs/eta-model.md)).
 
-Progress format during `--verify` (while the two `b3sum` processes run):
+Progress format during `--verify` (while the `b3sum` processes run):
 ```
-verify: hashing both ends with b3sum - ELAPSED (REMAINING)
+verify: hashing WHAT with b3sum (COUNTDOWN)
 ```
-- `ELAPSED` — wall-clock since the verify pass started (`m:ss`).
-- `REMAINING` — `eta − elapsed`, where `eta` is the scan-time estimate
-  (see docs/verify.md).  Formatted like the scan/copy ETA (`m:ss`) whether
-  positive or negative; once negative (the run outlasted the estimate) it is
-  shown as `-m:ss`, signalling the estimate was low.  The `(REMAINING)` field is shown only when the estimate
-  clears `ETA_WARMUP_SECS` (the same threshold the scan/copy ETA uses); for
-  shorter runs only `ELAPSED` is shown.  Suppressed by `-q`/`--batch` like
-  other progress.
+- `WHAT` — the side(s) still hashing: `both ends`, then `the remote file` /
+  `the local file` once the first side finishes.  Each side's digest is
+  printed on its own line the moment its `b3sum` exits (`verify: local b3sum
+  PATH = …` / `verify: remote b3sum PATH = …`), so the first hash is recorded
+  without waiting on the slower side.
+- `COUNTDOWN` — a launch-style T-minus toward `eta`, the scan-time estimate
+  (see docs/verify.md).  Shown as `(-m:ss)` while time remains, flipping to
+  `(+m:ss)` and counting up once the run outlasts the estimate (signalling it
+  was low).  The field appears only once *elapsed* clears `ETA_WARMUP_SECS`
+  (the same threshold the scan/copy ETA uses); below that it is a bare `...`,
+  since a sub-warmup number is noise.  There is no separate wall-clock field.
+  Suppressed by `-q`/`--batch` like other progress.
 
 ## Quiet and batch modes
 

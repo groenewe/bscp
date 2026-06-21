@@ -47,21 +47,25 @@ In `__main__`, after a successful copy:
 2. The local `b3sum LOCAL` process and the remote `ssh … HOST 'b3sum REMOTE'`
    are launched **concurrently** (`spawn_hash()`), so wall-clock is the
    slower of the two, not their sum.  Both are then polled in a loop that
-   renders a **live `elapsed (remaining)` progress line** every
-   `REPORT_INTERVAL`, mirroring the scan/copy display.  The *remaining* counts
-   down from a duration estimate: `b3sum` reads the whole device once, exactly
-   as phase A did, so the scan time (`do_sync` returns `total_scan_time` —
-   read+hash, *excluding* the copy) is a good predictor, scaled by
-   `sync_size / (sync_size − start_offset)` so a resumed run still estimates
-   the full-device hash.  The `(remaining)` countdown is shown only when the
-   estimate exceeds `ETA_WARMUP_SECS` (the same threshold the scan/copy ETA
-   uses); below that only the elapsed time is shown, since a sub-warmup
-   estimate is noise.  Once the run outlasts the estimate the remaining goes
-   negative (shown as `-m:ss`, same format as the positive countdown,
-   signalling the estimate was low).
-   The line is gated on the *original* `-q`/`--batch` (the final summary
-   resets `quiet=False`, which must not un-silence it); the first line printed
-   after the loop is `\r`-prefixed to overwrite it.
+   **collects and prints each side's digest the moment its `b3sum` exits** —
+   the first hash is on screen straight away (handy to record/store/mail when
+   pressed for time) instead of waiting on the slower side — while the loop
+   itself ends only once *both* are in (or local failed; see step 3).  Between
+   digests it renders a **live countdown line** every `REPORT_INTERVAL`,
+   mirroring the scan/copy display and naming only the side(s) still hashing
+   (`both ends` → `the remote file` once local is done).  The countdown is a
+   launch-style T-minus toward a duration estimate: `b3sum` reads the whole
+   device once, exactly as phase A did, so the scan time (`do_sync` returns
+   `total_scan_time` — read+hash, *excluding* the copy) is a good predictor,
+   scaled by `sync_size / (sync_size − start_offset)` so a resumed run still
+   estimates the full-device hash.  It shows `(-m:ss)` while time remains and
+   flips to `(+m:ss)`, counting up, once the run outlasts the estimate
+   (signalling the estimate was low).  The countdown appears only once
+   *elapsed* clears `ETA_WARMUP_SECS` (the same threshold the scan/copy ETA
+   uses); below that the field is a bare `...`, since a sub-warmup number is
+   noise.  The line is gated on the *original* `-q`/`--batch` (the final
+   summary resets `quiet=False`, which must not un-silence it); all
+   progress/outcome lines are `\r`-prefixed so each overwrites the live line.
 3. If the local hash fails, the remote process is killed rather than waited
    on.  `verify_digest()` takes the leading hex token of each result (the
    path field differs between the two sides, so only the digest is compared).
@@ -80,9 +84,9 @@ In `__main__`, after a successful copy:
    when the channel's PTY is hung up, even over a persistent master.  (The
    PTY merges remote stderr into stdout and adds CRs; `verify_digest()` reads
    the leading hex token, so the digest parse is unaffected.)
-5. Both digests are printed, then compared **only when the comparison is
-   meaningful** (see the gate below), and the verdict (`verify OK` /
-   `VERIFY FAILED`) is printed.
+5. Each digest is printed as soon as its side finishes (step 2); once both
+   are in they are compared **only when the comparison is meaningful** (see
+   the gate below), and the verdict (`verify OK` / `VERIFY FAILED`) is printed.
 
 ## SSH connections and authentication
 

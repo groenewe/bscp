@@ -1552,8 +1552,8 @@ if __name__ == '__main__':
     verification = parser.add_argument_group('verification')
     verification.add_argument('--verify',              action='store_true',
                         help='after copying, run b3sum on the local and (when available) remote '
-                             'file concurrently and print both digests, with a live '
-                             'elapsed/remaining progress line (remaining estimated from the scan '
+                             'file concurrently, printing each digest as its side finishes, with a '
+                             'live countdown between them (estimated from the scan '
                              'time). If the whole device was copied and the local and remote sizes '
                              'match, compare them and report OK / mismatch (exit 4 on mismatch). '
                              'Independent of -a, so this external BLAKE3 check '
@@ -1780,80 +1780,102 @@ if __name__ == '__main__':
         eta = scan_seconds * sync_size / scanned
 
         # Launch local and remote concurrently, then poll both while showing a
-        # live "elapsed (remaining)" line (mirrors the scan/copy progress).
-        # The remaining counts down from the scan-based estimate and may go
-        # negative once the run outlasts it — shown as a negative second
-        # count, signalling the estimate was low.  Progress is gated on the
-        # user's original -q/--batch: the summary above reset `quiet=False`,
-        # so report() would otherwise un-silence it.  The first line printed
-        # after the loop is \r-prefixed to overwrite the live line.
+        # live countdown line (mirrors the scan/copy progress).  The countdown
+        # is a launch-style T-minus toward the scan-based estimate: "(-m:ss)"
+        # while time remains, flipping to "(+m:ss)" counting up once the run
+        # outlasts it (signalling the estimate was low).  Progress is gated on
+        # the user's original -q/--batch: the summary above reset `quiet=False`,
+        # so report() would otherwise un-silence it.  All progress/outcome lines
+        # are \r-prefixed so each overwrites the live countdown line cleanly.
         verify_progress = not args.quiet and not args.batch
         t_verify_start  = time()
         lp = spawn_hash(b3sum_local_cmd(local_file))
         rp = spawn_hash(b3sum_remote_cmd(remote_host, remote_file, ssh_args),
                         stdin=subprocess.DEVNULL)
+        # Collect and print each side's digest the moment its b3sum exits,
+        # rather than waiting for both: the first hash is on screen (and can be
+        # recorded/stored/mailed) straight away when pressed for time, while
+        # the loop still ends only once both are in — or once local fails,
+        # which makes the comparison impossible (then stop waiting on remote).
+        local_hash = remote_hash = None
+        lerr = 'not found' if lp is None else ''
+        local_done  = lp is None
+        remote_done = rp is None
         try:
             oldmsg = ''
             last_report_len = 0 # no trailing spaces needed yet, we're on a new report() line
-            while (lp is not None and lp.poll() is None) or (rp is not None and rp.poll() is None):
-                # Local already finished and failed — its hash is unusable, so
-                # stop waiting on the remote rather than block for a discarded
-                # result.
-                if lp is not None and lp.poll() is not None and lp.returncode != 0:
-                    if rp is not None and rp.poll() is None:
-                        rp.kill()
+            while not (local_done and remote_done):
+                if not local_done and lp.poll() is not None:
+                    local_done = True
+                    local_hash, lerr = collect_hash(lp)
+                    if local_hash is None:
+                        # Local hash unusable → comparison impossible.  Stop
+                        # waiting on the remote rather than block minutes for a
+                        # result we would only discard.
+                        if not remote_done and rp.poll() is None:
+                            rp.kill()
+                            rp.communicate()
+                        remote_done = True
+                        break
+                    report('\rverify: local  b3sum %s = %s\n' % (local_file, local_hash))
+                if not remote_done and rp.poll() is not None:
+                    remote_done = True
+                    remote_hash, _ = collect_hash(rp)
+                    if remote_hash is not None:
+                        report('\rverify: remote b3sum %s = %s\n' % (remote_file, remote_hash))
+                if local_done and remote_done:
                     break
                 if verify_progress:
                     elapsed = time() - t_verify_start
-                    # Only show the countdown when the estimate clears the same
-                    # warmup threshold the scan/copy ETA uses — for shorter runs
-                    # the number is noise, so show elapsed alone.
+                    # Name only the side(s) still hashing so the line stays
+                    # truthful once the first finishes.
+                    what = ('both ends'      if not local_done and not remote_done else
+                            'the local file' if not local_done else
+                            'the remote file')
+                    # Only show the countdown once elapsed clears the same warmup
+                    # threshold the scan/copy ETA uses — below that the number is
+                    # noise, so show a bare "...".  The sign is a launch-style
+                    # T-minus: "(-m:ss)" counts down to the scan-based estimate,
+                    # then flips to "(+m:ss)" counting up once the run outlasts it.
                     if elapsed > ETA_WARMUP_SECS:
-                        rem_s = ''
                         rem = eta - elapsed
                         if rem >= 0:
-                           rem_s = '-'
-                        elif rem < 0:
-                           rem = -rem
-                           rem_s = '+'
+                            rem_s = '-'
+                        else:
+                            rem = -rem
+                            rem_s = '+'
                         rem_s = "(%c%s) " % (rem_s, format_time(rem, round_eta=True))
                     else:
                         rem_s = '... '
-                    vermsg = '\rverify: hashing both ends with b3sum %s' % rem_s
+                    vermsg = '\rverify: hashing %s with b3sum %s' % (what, rem_s)
                     if vermsg != oldmsg:
                         oldmsg = vermsg
                         report(vermsg) # only update verify "progress" if first or changed status
                 sleep(REPORT_INTERVAL)
 
-            local_hash, lerr = collect_hash(lp) if lp else (None, 'not found')
-
+            # Digests (when produced) were already printed as each side
+            # finished; below only decides the outcome.  Every message is
+            # \r-prefixed because the loop may have ended on a dangling
+            # countdown line (local done, remote still hashing when it failed).
             if local_hash is None:
-                if rp is not None:          # local failed — stop waiting on remote
-                    rp.kill()
-                    rp.communicate()
                 verify_unavailable('\rverify: skipped — b3sum failed on %s: %s\n' % (local_file, lerr))
+            elif remote_hash is None:
+                verify_unavailable('\rverify: remote b3sum unavailable on %s — comparison skipped\n'
+                                   % remote_host)
+            elif args.block_count:
+                # Non-batch only: the --batch + -B combination is rejected
+                # at argparse, so this branch is never reached under batch.
+                report('\rverify: comparison skipped (partial copy: -B in effect)\n')
+            elif local_size != remote_size:
+                verify_unavailable(
+                    '\rverify: comparison skipped (sizes differ: local %s, remote %s)\n' % (
+                        format_size(local_size, floor=True) if local_size >= 0 else '?',
+                        format_size(remote_size, floor=True)))
+            elif remote_hash == local_hash:
+                report('\rverify OK: local and remote b3sum match\n')
             else:
-                report('\rverify: local  b3sum %s = %s\n' % (local_file, local_hash))
-                remote_hash, _ = collect_hash(rp) if rp else (None, '')
-                if remote_hash is None:
-                    verify_unavailable('verify: remote b3sum unavailable on %s — comparison skipped\n'
-                                       % remote_host)
-                else:
-                    report('verify: remote b3sum %s = %s\n' % (remote_file, remote_hash))
-                    if args.block_count:
-                        # Non-batch only: the --batch + -B combination is rejected
-                        # at argparse, so this branch is never reached under batch.
-                        report('verify: comparison skipped (partial copy: -B in effect)\n')
-                    elif local_size != remote_size:
-                        verify_unavailable(
-                            'verify: comparison skipped (sizes differ: local %s, remote %s)\n' % (
-                                format_size(local_size, floor=True) if local_size >= 0 else '?',
-                                format_size(remote_size, floor=True)))
-                    elif remote_hash == local_hash:
-                        report('verify OK: local and remote b3sum match\n')
-                    else:
-                        report('VERIFY FAILED: b3sum digests differ\n')
-                        sys.exit(4)
+                report('\rVERIFY FAILED: b3sum digests differ\n')
+                sys.exit(4)
         except KeyboardInterrupt:
             # Ctrl+C while hashing: kill both b3sum children (the local process
             # and the remote ssh) so neither is left running, then exit like
