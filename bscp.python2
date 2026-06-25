@@ -581,16 +581,23 @@ def report(msg):
         return
     stt = 1 if (last_report_len == 0 and msg[:1] in ('\r', '\n')) else 0
     lines = msg[stt:].split('\n')
-    first = lines[0]
-    if last_report_len > len(lines[0]):
-        lines[0] = first + ' ' * (last_report_len - len(first))
+    # A leading '\r' repositions the cursor but occupies no column, so exclude
+    # it from all length math.  Otherwise the pad and stored length disagree by
+    # one between a first line that consumed its '\r' (stt=1) and a later one
+    # that kept it (stt=0) — leaving one stale char (e.g. a trailing "0") when a
+    # short final summary overwrites a single, longer scan/progress line.
+    cr = '\r' if lines[0][:1] == '\r' else ''
+    visible = lines[0][len(cr):]
+    if last_report_len > len(visible):
+        visible = visible + ' ' * (last_report_len - len(visible))
+    lines[0] = cr + visible
     sys.stderr.write('\n'.join(lines))
     sys.stderr.flush()
     # last_report_len tracks chars left on the cursor's line so the next '\r'
     # overwrite can pad them away.  A msg ending in '\n' leaves the cursor on a
     # fresh empty line, so reset to 0 — otherwise the next call would pad
     # against this line's length and prepend stray spaces.
-    last_report_len = 0 if msg.endswith('\n') else len(first.rstrip())
+    last_report_len = 0 if msg.endswith('\n') else len(visible.rstrip())
 
 
 def parse_size(s):
