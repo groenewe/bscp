@@ -72,6 +72,10 @@ subsystem:
   cross-check: why it shells out to `b3sum` instead of extending the
   protocol, the eligibility gate for the comparison, and the graceful-skip
   rules.
+- **[docs/ignore-read-errors.md](docs/ignore-read-errors.md)** — the
+  experimental `--ignore-read-errors` recovery mode: why it is client-only,
+  pull-only, scan-phase-only, and read-only, the `read_block()` sentinel that
+  forces an overwrite, and the `LD_PRELOAD` test harness.
 ## Architecture
 
 ```
@@ -223,9 +227,23 @@ bscp (single file)
 │                        decision — whole-device vs dd-limited prefix) and
 │                        `total_scan_time` (phase-A read+hash seconds, excluding
 │                        copy — __main__ turns it into the --verify duration
-│                        estimate).  When --verify is set and the sizes differ,
+│                        estimate) and `read_errors` (count of local blocks
+│                        force-overwritten under --ignore-read-errors; see the
+│                        spawn_hash block below and docs/ignore-read-errors.md).
+│                        When --verify is set and the sizes differ,
 │                        do_sync prints the heads-up note at handshake (before
 │                        the copy) so the prefix-only check is announced early.
+│                        A `read_block()` helper wraps the phase-A local read:
+│                        with `ignore_read_errors` set AND mode == PULL, a local
+│                        OSError is non-fatal — the read position is recovered
+│                        (`f.seek(p+bl)`), a per-block warning is printed, and a
+│                        no-future sentinel forces the block into `diff_positions`
+│                        so phase B overwrites it from the remote source.  The
+│                        remote digest is still consumed for every block to keep
+│                        the wire in lock-step.  Returns `read_errors` (8th tuple
+│                        element) for the closing note.  Push (local is source)
+│                        and write errors stay fatal; no protocol change — see
+│                        docs/ignore-read-errors.md.
 └── __main__           — argparse, push/pull auto-detection, retry loop, and
                          the post-copy --verify orchestration (exit 4 on a
                          confirmed mismatch).  On abort (ConnectionLost or
@@ -383,6 +401,7 @@ to cover, plus a few that were easy to forget:
 | `--bwlimit` push throttles to rate               | token-bucket rate limit engages (timing floor)    |
 | `--hash-threads 4` push (multi-section)          | threaded phase-A feed/drain, digest wire order    |
 | `--hash-threads 1` pull (serial pool path)       | threaded path correct when degenerate to 1 worker |
+| `--ignore-read-errors` pull repairs bad block    | LD_PRELOAD EIO shim: fatal without flag; with flag pull overwrites the unreadable local block, warns, exits 0, dst == src |
 | `--allow-truncate` push (smaller dst)            | both refusal-without-flag and warning-with-flag   |
 | `--allow-truncate` pull (smaller dst)            | symmetric pull behaviour                          |
 | `--batch` is silent on success and exits 0       | no stderr leakage; exit-code-only contract        |
@@ -426,12 +445,13 @@ them on exit.  Exit status is `0` on success, `1` if any test failed (with
 the failing names listed at the end), or `2` on missing prerequisites.
 
 When `$BSCP` runs under a Python 2 interpreter (detected from its shebang
-plus `python -V`), twelve tests are skipped by default and reported as
+plus `python -V`), sixteen tests are skipped by default and reported as
 `skip`: the two `--hash-threads` tests (the option is python3-only), the
 `-a` algorithm-rejection test (Py2's `hashlib` lacks the `shake_*` XOF
-functions it probes), and the nine `--verify` tests (the convenience b3sum
+functions it probes), the twelve `--verify` tests (the convenience b3sum
 cross-check is not implemented in the python2 client, so the flag is
-unrecognised).  The two `BSCP_OPTIONS` tests run under the python2 client
+unrecognised), and the `--ignore-read-errors` test (the flag is python3-only
+for now).  The two `BSCP_OPTIONS` tests run under the python2 client
 too (it now honours the env var).  Pass `--force-all` to run every test
 regardless of interpreter.
 

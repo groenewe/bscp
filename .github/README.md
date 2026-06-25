@@ -80,6 +80,7 @@ prefix that fits.
 | `-N` / `--dry-run`            |          | Count differing blocks and their total size in bytes only; do not update destination.                            |
 | `-B N` / `--block-count`      | `0`      | Limit sync to the first N blocks (0 = no limit). A `K`/`M`/`G`/`T` suffix interprets the value as bytes, rounded up to whole blocks (e.g. `-B 4M`). A warning is printed if the limit exceeds the source size. |
 | `--allow-truncate`            |          | Allow the destination to be smaller than the source (or, with `-B`, smaller than the requested limit); only the bytes that fit are copied. |
+| `--ignore-read-errors`        |          | **Experimental, experts only. Pull only.** Do not abort when a block of the **local destination** cannot be read during the scan (`EIO`). The unreadable block is treated as a difference and overwritten from the readable remote source — on a copy-on-write filesystem (e.g. bcachefs) this rewrites a CRC-bad extent and makes the region readable again. One warning naming the block offset is printed per affected block. Scope is deliberately narrow: only **local reads**, only the **scan phase**, only **pull** (where the local file is the destination). Write errors stay fatal, and push (local is the source, with no good data to substitute) is unaffected. Meant to recover a handful of bad blocks; many errors mean a failing device, not a job for this flag. Re-run or add `--verify` afterwards to confirm the repair. |
 | `--buffer`                    |          | Push: buffer differing blocks in memory during phase B instead of re-reading them from disk. | Higher memory use, fewer disk reads. Experimental. Auto-disabled if available memory is too low. |
 | `-T N` / `--hash-threads`     | `0`      | Threads used to hash blocks during the scan phase, on both client and remote (`0` = auto: `min(cores, 4)`). An explicit `N` is clamped to each side's own core count, so `-T 8` to a 4-core remote runs 4 threads there. | Speeds up scanning when hashing is CPU-bound (fast NVMe/local). python2 and Perl remotes stay single-threaded. |
 | `-q` / `--quiet`              |          | Suppress scan/copy progress lines. Errors and warnings are still shown.                                          |
@@ -288,6 +289,26 @@ losetup -fP /tank/backups/server-sda.img           # /dev/loopN, partitions as l
 mount -o ro /dev/loopNp2 /mnt/restore
 # copy out what you need, then: umount /mnt/restore && losetup -d /dev/loopN
 ```
+
+**Repairing a corrupt block in such an image (`--ignore-read-errors`).**  If
+the backing filesystem develops a bad block — e.g. bcachefs reports a CRC
+error and one extent of the image returns `EIO` on read — a normal re-image
+aborts at that block.  Pull a fresh copy from the source with
+`--ignore-read-errors`: each unreadable local block is treated as a difference
+and overwritten from the (readable) remote source, which rewrites the bad
+extent and makes the region readable again.
+
+```bash
+# image went read-bad at one block; overwrite just the damaged blocks from
+# the live source.  Each bad block prints a one-line warning with its offset.
+bscp --ignore-read-errors root@server:/dev/sda /tank/backups/server-sda.img
+# then confirm the repair held:
+bscp --verify root@server:/dev/sda /tank/backups/server-sda.img
+```
+
+It is a recovery tool for a handful of bad blocks, not a substitute for
+replacing failing hardware — many read errors mean the device is dying.  See
+[docs/ignore-read-errors.md](../docs/ignore-read-errors.md).
 
 ## Comparison with similar tools
 

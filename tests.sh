@@ -15,13 +15,14 @@
 #   ./tests.sh --force-all          # run every test even under a python2 client
 #
 # When $BSCP runs under a Python 2 interpreter (e.g. bscp.python2 where
-# `python` resolves to Python 2.x), fifteen tests are skipped by default:
+# `python` resolves to Python 2.x), sixteen tests are skipped by default:
 # the two --hash-threads tests (the option is python3-only by design), the
 # -a algorithm-rejection test (Py2's hashlib lacks the shake_* XOF functions
-# the test probes), and the twelve --verify tests (the convenience b3sum
-# cross-check is not implemented in the python2 client).  The BSCP_OPTIONS
-# tests now run under python2 (the env var is honoured there too).  Pass
-# --force-all to run the skipped tests anyway.
+# the test probes), the twelve --verify tests (the convenience b3sum
+# cross-check is not implemented in the python2 client), and the
+# --ignore-read-errors test (the flag is python3-only for now).  The
+# BSCP_OPTIONS tests now run under python2 (the env var is honoured there
+# too).  Pass --force-all to run the skipped tests anyway.
 #
 # Exit status: 0 if all tests pass, non-zero otherwise.
 
@@ -53,7 +54,7 @@ test_verify_push_match test_verify_mismatch_exit4 test_verify_skips_when_b3sum_u
 test_verify_size_mismatch_compares test_verify_dryrun_zero_diff_runs test_verify_dryrun_with_diff_skips \
 test_verify_batch_mismatch_exit4 test_verify_batch_size_mismatch_ok test_verify_batch_unavailable_exit5 \
 test_verify_blockcount_compares test_verify_batch_blockcount_ok \
-test_verify_dryrun_blockcount_no_warning"
+test_verify_dryrun_blockcount_no_warning test_ignore_read_errors_pull"
 
 WORK=$(mktemp -d)
 SRC="$WORK/src.img"
@@ -678,6 +679,65 @@ if errs:
 PY
 }
 
+# --ignore-read-errors (experimental, pull only): a read error on the LOCAL
+# destination during the scan must NOT abort the pull — the unreadable block is
+# treated as a diff and overwritten from the (readable) remote source.  We
+# inject a genuine EIO on one 64K block of the destination with a tiny
+# LD_PRELOAD shim: read() within a byte range returns EIO while writes pass
+# through, mirroring a filesystem (e.g. bcachefs) that can still rewrite a
+# CRC-bad extent.  Needs a C compiler; self-skips (reported ok) where cc is
+# absent, where the shim fails to build, or where the libc open/read path the
+# shim hooks does not surface the error.  Skipped under the python2 client
+# (the flag is python3-only for now).
+test_ignore_read_errors_pull() {
+    command -v cc >/dev/null || return 0
+    local shim="$WORK/eio.so"
+    cat > "$WORK/eio.c" <<'EOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdarg.h>
+static int bad_fd=-1; static char*bp; static long long bs,bl;
+static void ini(void){static int d;if(d)return;d=1;bp=getenv("EIO_PATH");bs=atoll(getenv("EIO_START")?:"0");bl=atoll(getenv("EIO_LEN")?:"0");}
+static int cap(const char*p,int fd){ini();if(fd>=0&&bp&&p&&!strcmp(p,bp))bad_fd=fd;return fd;}
+int open64(const char*p,int fl,...){static int(*r)(const char*,int,...);if(!r)r=dlsym(RTLD_NEXT,"open64");mode_t m=0;if(fl&O_CREAT){va_list a;va_start(a,fl);m=va_arg(a,int);va_end(a);}return cap(p,r(p,fl,m));}
+int open(const char*p,int fl,...){static int(*r)(const char*,int,...);if(!r)r=dlsym(RTLD_NEXT,"open");mode_t m=0;if(fl&O_CREAT){va_list a;va_start(a,fl);m=va_arg(a,int);va_end(a);}return cap(p,r(p,fl,m));}
+int openat(int d,const char*p,int fl,...){static int(*r)(int,const char*,int,...);if(!r)r=dlsym(RTLD_NEXT,"openat");mode_t m=0;if(fl&O_CREAT){va_list a;va_start(a,fl);m=va_arg(a,int);va_end(a);}return cap(p,r(d,p,fl,m));}
+int openat64(int d,const char*p,int fl,...){static int(*r)(int,const char*,int,...);if(!r)r=dlsym(RTLD_NEXT,"openat64");mode_t m=0;if(fl&O_CREAT){va_list a;va_start(a,fl);m=va_arg(a,int);va_end(a);}return cap(p,r(d,p,fl,m));}
+ssize_t read(int fd,void*b,size_t n){static ssize_t(*r)(int,void*,size_t);if(!r)r=dlsym(RTLD_NEXT,"read");if(fd==bad_fd&&fd>=0){off_t o=lseek(fd,0,SEEK_CUR);if(o>=0&&o<bs+bl&&o+(off_t)n>bs){errno=EIO;return -1;}}return r(fd,b,n);}
+ssize_t pread64(int fd,void*b,size_t n,off_t o){static ssize_t(*r)(int,void*,size_t,off_t);if(!r)r=dlsym(RTLD_NEXT,"pread64");if(fd==bad_fd&&fd>=0&&o<bs+bl&&o+(off_t)n>bs){errno=EIO;return -1;}return r(fd,b,n,o);}
+EOF
+    cc -shared -fPIC -o "$shim" "$WORK/eio.c" -ldl 2>/dev/null || return 0
+
+    # one unreadable block at 1 MiB (block 16 @ 64K) plus a normal diff at 2 MiB.
+    _ire_prep() { cp "$SRC" "$DST"
+        dd if=/dev/urandom of="$DST" bs=64K count=1 seek=16 conv=notrunc status=none
+        dd if=/dev/urandom of="$DST" bs=64K count=1 seek=32 conv=notrunc status=none; }
+
+    make_src 4
+    _ire_prep
+    # First confirm the shim really injects EIO here: without the flag the
+    # read error must be fatal.  If the run instead succeeds, the shim did not
+    # take effect on this libc — skip rather than report a false failure.
+    if LD_PRELOAD="$shim" EIO_PATH="$DST" EIO_START=1048576 EIO_LEN=65536 \
+         "$BSCP" -s 1M "localhost:$SRC" "$DST" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    _ire_prep   # the aborted run may have written part of the destination
+    local out rc
+    out=$(LD_PRELOAD="$shim" EIO_PATH="$DST" EIO_START=1048576 EIO_LEN=65536 \
+            "$BSCP" -s 1M --ignore-read-errors "localhost:$SRC" "$DST" 2>&1)
+    rc=$?
+    [[ $rc == 0 ]]                          || { echo "exit $rc (expected 0): $out"; return 1; }
+    grep -q "read error at block 16" <<<"$out" || { echo "no per-block warning: $out"; return 1; }
+    cmp -s "$SRC" "$DST"                     || { echo "destination not repaired"; return 1; }
+}
+
 # ---------- run ----------
 echo "Running bscp regression tests against localhost..."
 run "push: random 4K diffs in mid-file"              test_push
@@ -695,6 +755,7 @@ run "--hash-threads 4 push (multi-section)"          test_hash_threads_push
 run "--hash-threads 1 pull (serial pool path)"       test_hash_threads_single_pull
 run "--allow-truncate push (smaller dst)"            test_allow_truncate_push
 run "--allow-truncate pull (smaller dst)"            test_allow_truncate_pull
+run "--ignore-read-errors pull repairs bad block"    test_ignore_read_errors_pull
 run "--batch is silent on success and exits 0"       test_batch_silent_success
 run "--block-count prints next-offset resume hint"   test_block_count_continue
 run "-B accepts K/M/G byte-size suffix"              test_block_count_size_suffix

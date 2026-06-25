@@ -29,7 +29,9 @@
 # (--hash-threads; python3 only), windowed pull to avoid SSH pipe deadlock,
 # optional post-copy b3sum cross-check of both ends (--verify), resume on
 # failure (byte offset or percentage of source), automatic retry
-# with exponential back-off, and dry-run mode.
+# with exponential back-off, dry-run mode, and an experimental
+# --ignore-read-errors recovery mode (pull only) that overwrites unreadable
+# local blocks from the remote source.
 #
 # Changes in this fork were made with extensive help of Claude Code, Sonnet
 # and Opus models (Anthropic).
@@ -787,6 +789,8 @@ def build_resume_cmd(argv0, args, src, dst, offset, block_count=None):
         parts.append('-N')
     if args.allow_truncate:
         parts.append('--allow-truncate')
+    if args.ignore_read_errors:
+        parts.append('--ignore-read-errors')
     if args.buffer:
         parts.append('--buffer')
     if args.verify:
@@ -990,7 +994,7 @@ def device_size(path):
 def do_sync(local_file, remote_host, remote_file, mode,
             blocksize, section_size, hashname,
             start_offset=0, dry_run=False, block_count=0, allow_truncate=False, buffer=False,
-            io_timeout=0, bwlimit=0, hash_threads=0, ssh_args=None):
+            io_timeout=0, bwlimit=0, hash_threads=0, ignore_read_errors=False, ssh_args=None):
 
     ssh_args = ssh_args or {}
     fn_bytes = remote_file.encode('utf-8')
@@ -1135,7 +1139,7 @@ def do_sync(local_file, remote_host, remote_file, mode,
         if sync_size == 0:
             # Server has already exited (matching `if sync_size == 0: sys.exit(0)`).
             _shutdown_proc(proc)
-            return io.in_total, io.out_total, 0, 0, 0, remote_size, 0.0
+            return io.in_total, io.out_total, 0, 0, 0, remote_size, 0.0, 0
         eff_section    = section_size or sync_size
         total_blocks   = max(1, (sync_size + blocksize - 1) // blocksize)
         skipped_blocks = start_offset // blocksize
@@ -1348,6 +1352,34 @@ def do_sync(local_file, remote_host, remote_file, mode,
         hash_window = max(2, nthreads * 2)
         ex_hash     = ThreadPoolExecutor(max_workers=nthreads)
 
+        # --ignore-read-errors (experimental, pull only): a read error on the
+        # LOCAL file during the scan is non-fatal.  The unreadable block is
+        # recorded as a diff so phase B overwrites it from the (readable) remote
+        # source — which, on a filesystem like bcachefs, makes the corrupt
+        # region readable again by forcing a fresh write.  Scoped deliberately
+        # tight: only the local side, only reads, only the scan phase, only
+        # pull (where local is the destination).  Write errors stay fatal on
+        # both sides, and push — where the local file is the source — is left
+        # fatal too, since a bad source block has no good data to substitute.
+        # See docs/ignore-read-errors.md.
+        ignore_local_read_err = ignore_read_errors and mode == MODE_PULL
+        read_errors = 0
+
+        def read_block(p, bl):
+            nonlocal read_errors
+            try:
+                return f.read(bl), True
+            except OSError as e:
+                if not ignore_local_read_err:
+                    raise
+                f.seek(p + bl)            # recover position past the bad block
+                read_errors += 1
+                report('\nWarning: read error at block %d in %s (offset %d) — '
+                       'treating as a diff; the remote block will overwrite it '
+                       '(--ignore-read-errors): %s\n' % (
+                       p // blocksize, local_file, p, e))
+                return None, False
+
         try:
             pos = start_offset
             while pos < sync_size:
@@ -1370,27 +1402,34 @@ def do_sync(local_file, remote_host, remote_file, mode,
                 inflight = deque()
                 while p < sec_end and len(inflight) < hash_window:
                     bl  = min(blocksize, sec_end - p)
-                    blk = f.read(bl)
-                    inflight.append((p, blk, ex_hash.submit(hashfn, blk)))
+                    blk, ok = read_block(p, bl)
+                    fut = ex_hash.submit(hashfn, blk) if ok else None
+                    inflight.append((p, blk, bl, fut))
                     p += bl
                 while inflight:
-                    blk_pos, block, fut = inflight.popleft()
-                    local_dig  = fut.result()
+                    blk_pos, block, blk_len, fut = inflight.popleft()
                     remote_dig = io.read(dig_size)
                     if len(remote_dig) < dig_size:
                         raise EOFError('SSH pipe closed during phase-A hash read '
                                        '(got %d of %d bytes)' % (len(remote_dig), dig_size))
-                    if local_dig != remote_dig:
+                    if fut is None:
+                        # Local block unreadable (--ignore-read-errors, pull):
+                        # force it into the diff list so the remote block
+                        # overwrites it in phase B.  The remote digest was
+                        # consumed above to keep the wire in sync.
+                        diff_positions.append(blk_pos)
+                    elif fut.result() != remote_dig:
                         if mode == MODE_PUSH and buffer:
                             diff_blocks.append((blk_pos, block))
                         else:
                             diff_positions.append(blk_pos)
                     if p < sec_end:
                         bl  = min(blocksize, sec_end - p)
-                        blk = f.read(bl)
-                        inflight.append((p, blk, ex_hash.submit(hashfn, blk)))
+                        blk, ok = read_block(p, bl)
+                        fut = ex_hash.submit(hashfn, blk) if ok else None
+                        inflight.append((p, blk, bl, fut))
                         p += bl
-                    done_pos       = blk_pos + len(block)
+                    done_pos       = blk_pos + blk_len
                     total_scanned += 1
                     now = time()
                     if now - t_last_progress >= REPORT_INTERVAL:
@@ -1548,7 +1587,7 @@ def do_sync(local_file, remote_host, remote_file, mode,
 
         _shutdown_proc(proc)
 
-    return io.in_total, io.out_total, sync_size, total_diffs, total_written, remote_size, total_scan_time
+    return io.in_total, io.out_total, sync_size, total_diffs, total_written, remote_size, total_scan_time, read_errors
 
 
 if __name__ == '__main__':
@@ -1622,6 +1661,18 @@ if __name__ == '__main__':
                         help='allow destination to be smaller than source; '
                              'syncs only the bytes that fit. '
                              'WARNING: data beyond destination size is not copied.')
+    safety.add_argument('--ignore-read-errors',       action='store_true',
+                        help='EXPERIMENTAL, EXPERTS ONLY. pull only: do not abort when a '
+                             'block of the LOCAL destination file/device cannot be read '
+                             'during the scan. Such a block is treated as a difference and '
+                             'overwritten from the (readable) remote source, which on a '
+                             'filesystem like bcachefs can make a corrupt region readable '
+                             'again. A warning naming the block offset is printed for each. '
+                             'Scoped tight: only local reads, only the scan phase, only pull. '
+                             'Write errors stay fatal, and push (local is the source) is '
+                             'unaffected. Intended to recover a handful of bad blocks; many '
+                             'errors mean a failing device, not a job for this flag. Re-run '
+                             'or add --verify afterwards to confirm the repair.')
 
     verification = parser.add_argument_group('verification')
     verification.add_argument('--verify',              action='store_true',
@@ -1697,6 +1748,14 @@ if __name__ == '__main__':
     hashname     = args.algorithm
     dry_run      = args.dry_run
     verify_enabled = args.verify
+    ignore_read_errors = args.ignore_read_errors
+    # --ignore-read-errors only acts on the local destination, which exists
+    # only in pull.  In push the local file is the source: a bad source block
+    # has no good data to substitute, so the flag is a no-op there — say so
+    # rather than letting the user believe it is protecting the transfer.
+    if ignore_read_errors and mode == MODE_PUSH:
+        report('\nNote: --ignore-read-errors has no effect on push '
+               '(local is the source; local read errors stay fatal)\n')
     # parse_resume_from() returns a negative permille sentinel for the NN%
     # form; resolve against the local file size before section-boundary
     # rounding.  device_size() (seek-to-end), not os.path.getsize(), so a
@@ -1759,14 +1818,16 @@ if __name__ == '__main__':
         while True:
             try:
                 (in_total, out_total, sync_size,
-                 total_diffs, total_written, remote_size, scan_seconds) = do_sync(
+                 total_diffs, total_written, remote_size, scan_seconds,
+                 read_errors) = do_sync(
                     local_file, remote_host, remote_file,
                     mode, blocksize, section_size, hashname,
                     start_offset=start_offset, dry_run=dry_run,
                     block_count=args.block_count, allow_truncate=args.allow_truncate,
                     buffer=buffer, io_timeout=args.io_timeout,
                     bwlimit=args.bwlimit,
-                    hash_threads=args.hash_threads, ssh_args=ssh_args)
+                    hash_threads=args.hash_threads,
+                    ignore_read_errors=ignore_read_errors, ssh_args=ssh_args)
                 break
             except ConnectionLost as exc:
                 if attempt < args.retries and not exc.interrupted:
@@ -1816,6 +1877,16 @@ if __name__ == '__main__':
             format_size(out_total, floor=True),
             format_size(sync_size, floor=True),
             total_diffs, speedup, format_time(elapsed)))
+
+    if read_errors:
+        if dry_run:
+            report('Note: --ignore-read-errors: %d local block(s) were unreadable '
+                   'and counted as diffs; a real run (without -N) would overwrite '
+                   'them from the remote source.\n' % read_errors)
+        else:
+            report('Note: --ignore-read-errors overwrote %d unreadable local block(s) '
+                   'from the remote source. Re-run bscp (or add --verify) to confirm '
+                   'the blocks are now readable and match.\n' % read_errors)
 
     if args.block_count:
         report('Continue with:\n  %s\n' % build_resume_cmd(
