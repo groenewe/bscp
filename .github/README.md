@@ -7,7 +7,9 @@
 
 Bscp copies a single file or block device over SSH, transferring only the
 blocks that have changed.  It fills the gap where `rsync` fails — most
-notably when the source or destination is a raw block device.
+notably when the source or destination is a raw block device.  When both
+paths are local (neither is a `HOST:path`) it does the same block-diff copy
+directly between them, no SSH involved.
 
 No server-side installation is required: the remote-side script is embedded
 in the client and executed via `python(/2/3) -c` over the SSH connection,
@@ -16,7 +18,10 @@ with a Perl fallback for hosts that have no Python interpreter.
 ## Requirements
 
 Python 3 on the local host and Python 2/3 *or* Perl 5.10+ on the remote
-host.  SSH access to the remote host.  The optional `--verify` cross-check
+host.  SSH access to the remote host.  (For a **local-to-local** copy there
+is no remote host — the same block-diff engine runs as a local subprocess —
+but the local host must then itself have Python 2/3 or Perl 5.10+, since it
+plays both roles.)  The optional `--verify` cross-check
 additionally needs [`b3sum`](https://github.com/BLAKE3-team/BLAKE3) on each
 side it runs on (it warns and skips where missing), plus `dd` on the larger
 side when the two devices differ in size (used to hash only the common prefix).
@@ -50,13 +55,26 @@ user-supplied `-o` takes precedence.
 ```
 bscp [options] SRC DST
 
-push:  bscp [options] local_file   HOST:remote_file
-pull:  bscp [options] HOST:remote_file   local_file
+push:   bscp [options] local_file        HOST:remote_file
+pull:   bscp [options] HOST:remote_file  local_file
+local:  bscp [options] local_src         local_dst          (no ssh)
 ```
 
-`SRC` and `DST` can be a regular file or a block device (`/dev/sdX`).
-Exactly one of them must be a `HOST:path` argument; which side carries the
-`HOST:` prefix determines the direction.
+`SRC` and `DST` can be a regular file or a block device (`/dev/sdX`).  At
+most one of them may be a `HOST:path` argument; which side carries the
+`HOST:` prefix determines the direction.  With **no** `HOST:` on either side
+the copy is local-to-local: bscp block-diffs one local path into the other
+with no SSH, no network, and no interactive login to `localhost`.  Giving a
+`HOST:` prefix to *both* sides (remote-to-remote) is not supported and exits
+with status 2.
+
+> **Same-disk caution.**  A local-to-local copy reads the source and writes
+> the destination at the same time.  When both live on **one physical
+> device** — two partitions of the same disk, or two files on the same
+> filesystem — the two streams contend for it, and on a rotational disk
+> (HDD) the head seeks constantly between the read and write regions,
+> running far slower than a copy between separate disks.  Bscp detects this
+> (best-effort, Linux) and prints a warning, but does not refuse.
 
 The destination file or device **must already exist**.  By default it must
 also be at least as large as the source (or, when `-B` is used, at least as
@@ -96,6 +114,10 @@ bscp /var/backups/disk.img backup-server:/data/disk.img
 
 # Pull a remote block device to a local image file
 bscp root@storage:/dev/sdb /mnt/images/sdb.img
+
+# Local-to-local: refresh a backup image on another disk, no SSH.
+# Only the changed blocks are written — cheap re-runs, kind to the SSD.
+bscp /dev/sda /mnt/backup-disk/sda.img
 
 # Dry-run: see how many blocks differ without copying
 bscp -N /dev/sda myhost:/dev/sda

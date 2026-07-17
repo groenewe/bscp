@@ -49,11 +49,14 @@
     <h2>Usage</h2>
     <pre>bscp [options] SRC DST</pre>
     <p>
-      Exactly one of SRC and DST is a remote <code>HOST:path</code>;
-      which side carries the <code>HOST:</code> prefix decides the direction:
+      At most one of SRC and DST is a remote <code>HOST:path</code>;
+      which side carries the <code>HOST:</code> prefix decides the direction.
+      With no <code>HOST:</code> on either side the copy is local-to-local
+      (no SSH):
     </p>
-    <pre>push:  bscp local_file        HOST:remote_file
-pull:  bscp HOST:remote_file  local_file</pre>
+    <pre>push:   bscp local_file        HOST:remote_file
+pull:   bscp HOST:remote_file  local_file
+local:  bscp local_src         local_dst</pre>
     <p>
       SRC and DST may each be a regular file or a block device, and the
       destination must already exist.

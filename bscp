@@ -20,8 +20,9 @@
 # OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 # Bscp copies a file or block device over SSH, transferring only changed
-# blocks.  Both push (local → remote) and pull (remote → local) are
-# supported.  The remote-side script is embedded and executed via
+# blocks.  Push (local → remote), pull (remote → local), and local → local
+# (neither side HOST:path — the "remote" body runs as a local subprocess,
+# no ssh) are supported.  The remote-side script is embedded and executed via
 # "python(/2/3) -c", with a Perl fallback for hosts without Python, so
 # no installation on the remote host is required.
 # Features: section-based processing to bound memory use, single-pass
@@ -45,6 +46,7 @@ import os
 import select
 import shlex
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -727,6 +729,53 @@ def available_memory():
     return 0
 
 
+def backing_disk(path):
+    """Best-effort physical disk backing `path`, for the same-disk warning.
+
+    Returns (disk_name, rotational) where rotational is True/False/None, or
+    (None, None) when it cannot be told: non-Linux, sysfs absent, or a
+    virtual / network / device-mapper backing with no single parent disk.
+    A block device is resolved by its own major:minor (st_rdev); a regular
+    file by the filesystem it lives on (st_dev).  A sysfs node carrying a
+    `partition` attribute is a partition, so its parent directory is the
+    whole disk (e.g. sda1 -> sda).  Read-only, never raises."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return (None, None)
+    dev = st.st_rdev if stat.S_ISBLK(st.st_mode) else st.st_dev
+    if not dev:
+        return (None, None)
+    node = '/sys/dev/block/%d:%d' % (os.major(dev), os.minor(dev))
+    real = os.path.realpath(node)
+    if not os.path.isdir(real):
+        return (None, None)
+    disk_dir = os.path.dirname(real) if os.path.exists(os.path.join(real, 'partition')) else real
+    rot = None
+    try:
+        with open(os.path.join(disk_dir, 'queue', 'rotational')) as fh:
+            rot = fh.read().strip() == '1'
+    except OSError:
+        pass
+    return (os.path.basename(disk_dir), rot)
+
+
+def warn_same_disk(src, dst):
+    # Local -> local only.  Reading the source and writing the destination on
+    # ONE physical device makes the two operations contend for it; on a
+    # rotational disk that means constant head seeking between the read and
+    # write regions, far slower than a copy between separate disks.  Warn (but
+    # do not refuse) when both paths resolve to the same backing disk.
+    da, rota = backing_disk(src)
+    db, rotb = backing_disk(dst)
+    if da and db and da == db:
+        rot = (' — a rotational disk, so the heads will seek constantly between '
+               'the read and write regions' if (rota or rotb) else '')
+        report('\nWarning: source and destination are on the same physical disk (%s)%s.\n'
+               '         A local-to-local copy contends for that one device and will run\n'
+               '         slower than a copy between separate disks.\n' % (da, rot))
+
+
 def format_time(seconds, round_eta=False):
     s = int(seconds)
     h, s = divmod(s, 3600)
@@ -847,7 +896,6 @@ def ssh_base(args):
 
 
 def build_ssh_cmd(remote_host, args):
-    cmd = ['ssh'] + ssh_base(args)
     # Each exec'd remote ends with a literal `bscp-remote` argument.  The
     # remote bodies never read argv, so it is inert — but it lands in the
     # process command line, so `ps aux | grep bscp-remote` (or htop search)
@@ -887,8 +935,16 @@ def build_ssh_cmd(remote_host, args):
         "exec perl -e 'eval pack(qq{H*}, q{%s})' bscp-remote; "
         'echo "bscp: no python or perl found on remote" >&2; exit 127'
     ) % hex_pl
-    cmd += ['--', remote_host, wrapper]
-    return cmd
+    # Local → local (remote_host is None): run the very same interpreter-probe
+    # wrapper under a local shell instead of ssh, so the remote body operates
+    # on `remote_file` as an ordinary local path.  The whole wire protocol is
+    # reused unchanged over the subprocess pipe — no ssh, no host, no network.
+    # The `bscp-local` positional lands as $0 (the wrapper never reads it; it
+    # only marks the process in `ps`).  ssh_base()'s compression/keepalive
+    # flags are irrelevant to a local pipe, so they are skipped entirely.
+    if remote_host is None:
+        return ['sh', '-c', wrapper, 'bscp-local']
+    return ['ssh'] + ssh_base(args) + ['--', remote_host, wrapper]
 
 
 def verify_digest(output):
@@ -964,6 +1020,11 @@ def b3sum_remote_cmd(remote_host, remote_file, args, ddp=None):
     # The PTY merges remote stderr into stdout and adds CRs; verify_digest
     # takes the leading hex token, so the digest parse is unaffected, and the
     # remote-failure branch discards remote stderr anyway.
+    #
+    # Local → local (remote_host is None): the "remote" file is a local path,
+    # so hash it directly with the local b3sum command — no ssh, no PTY.
+    if remote_host is None:
+        return b3sum_local_cmd(remote_file, ddp)
     cmd = _dd_guard(remote_file, ddp) if ddp is not None else 'b3sum %s' % shlex.quote(remote_file)
     return ['ssh', '-tt'] + ssh_base(args) + [remote_host, cmd]
 
@@ -1599,11 +1660,13 @@ def do_sync(local_file, remote_host, remote_file, mode,
 
 if __name__ == '__main__':
     parser = ArgumentParser(
-        description='Binary Secure Copy — push or pull a local/remote file or block device, '
-                    'transferring only changed blocks over SSH.',
+        description='Binary Secure Copy — push, pull, or locally copy a file or block device, '
+                    'transferring only changed blocks (over SSH, or a local subprocess when '
+                    'both paths are local).',
         usage='%(prog)s [options] SRC DST\n'
-              '  push:  bscp [options] local_file   HOST:remote_file\n'
-              '  pull:  bscp [options] HOST:remote_file   local_file')
+              '  push:   bscp [options] local_file   HOST:remote_file\n'
+              '  pull:   bscp [options] HOST:remote_file   local_file\n'
+              '  local:  bscp [options] local_src   local_dst   (no ssh)')
     transfer = parser.add_argument_group('transfer tuning')
     transfer.add_argument('-b', '--block-size',   default=DEFAULT_BLOCK,
                         type=parse_size, metavar='SIZE',
@@ -1717,7 +1780,8 @@ if __name__ == '__main__':
                              'parse the "Resume with:" line from stderr.')
 
     parser.add_argument('src', help='source — local path or HOST:path')
-    parser.add_argument('dst', help='destination — HOST:path or local path')
+    parser.add_argument('dst', help='destination — HOST:path or local path '
+                                     '(both local = local-to-local copy, no ssh)')
 
     # BSCP_OPTIONS supplies default command-line options for per-host tuning
     # (e.g. `-T 8 -b 192k`), parsed as a shell word list and placed BEFORE the
@@ -1747,8 +1811,19 @@ if __name__ == '__main__':
         mode = MODE_PUSH
         local_file = src
         remote_host, remote_file = dst.split(':', 1)
+    elif ':' not in src and ':' not in dst:
+        # Local -> local: neither side is HOST:path.  remote_host = None makes
+        # build_ssh_cmd spawn the remote body as a local subprocess (no ssh);
+        # the rest of the protocol is unchanged.  Push semantics — the client
+        # reads the source (local_file) and the subprocess writes the
+        # destination (remote_file).
+        mode = MODE_PUSH
+        local_file = src
+        remote_host, remote_file = None, dst
+        warn_same_disk(local_file, remote_file)
     else:
-        parser.error('exactly one of SRC or DST must be HOST:path')
+        parser.error('remote-to-remote is not supported; at most one of SRC or DST '
+                     'may be HOST:path (omit both for a local-to-local copy)')
 
     blocksize    = args.block_size
     section_size = args.section_size
@@ -2104,7 +2179,7 @@ if __name__ == '__main__':
                     verify_unavailable('\rverify: skipped — b3sum failed on %s: %s\n' % (local_file, lerr))
                 elif remote_hash is None:
                     verify_unavailable('\rverify: remote b3sum unavailable on %s — comparison skipped\n'
-                                       % remote_host)
+                                       % (remote_host or remote_file))
                 elif remote_hash == local_hash:
                     report('\rverify OK: local and remote b3sum match%s%s\n' % (pfx, rsfx))
                 else:

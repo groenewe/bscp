@@ -49,12 +49,15 @@ esac
 # Tests skipped under a python2 client unless --force-all is given.  The
 # --verify tests are skipped because the python2 client does not implement
 # the (convenience-only) b3sum cross-check, so the flag is unrecognised.
+# The local-to-local tests are skipped because that feature is python3-client
+# only (the python2 fallback client still rejects a no-HOST invocation).
 PY2_SKIP="test_hash_threads_push test_hash_threads_single_pull test_reject_bad_algorithm \
 test_verify_push_match test_verify_mismatch_exit4 test_verify_skips_when_b3sum_unusable \
 test_verify_size_mismatch_compares test_verify_dryrun_zero_diff_runs test_verify_dryrun_with_diff_skips \
 test_verify_batch_mismatch_exit4 test_verify_batch_size_mismatch_ok test_verify_batch_unavailable_exit5 \
 test_verify_blockcount_compares test_verify_batch_blockcount_ok \
-test_verify_dryrun_blockcount_no_warning test_ignore_read_errors_pull"
+test_verify_dryrun_blockcount_no_warning test_ignore_read_errors_pull \
+test_local_to_local test_local_to_local_verify"
 
 WORK=$(mktemp -d)
 SRC="$WORK/src.img"
@@ -557,9 +560,33 @@ test_bscp_options_cli_overrides() {
     ! grep -q "Continue with" <<<"$out"
 }
 
-test_exit2_when_no_host() {
-    "$BSCP" "$SRC" "$DST" >/dev/null 2>&1
+test_exit2_remote_to_remote() {
+    # Both sides HOST:path — remote-to-remote is unsupported, exit 2.
+    # (Neither side HOST:path is now a valid local-to-local copy, tested below.)
+    "$BSCP" "a:$SRC" "b:$DST" >/dev/null 2>&1
     (( $? == 2 ))
+}
+
+test_local_to_local() {
+    # No HOST:path on either side: the remote body runs as a local subprocess
+    # (no ssh) and syncs one local file into another.
+    make_src 10
+    copy_src_to "$DST"
+    randomise_in "$DST" 8 500
+    "$BSCP" -s 2M "$SRC" "$DST" >/dev/null 2>&1 \
+        && cmp -s "$SRC" "$DST"
+}
+
+test_local_to_local_verify() {
+    # Local-to-local + --verify: both b3sum invocations run locally (no ssh),
+    # digests compared, "verify OK" printed, exit 0.
+    command -v b3sum >/dev/null || return 0   # skip on hosts without b3sum
+    make_src 6
+    copy_src_to "$DST"
+    randomise_in "$DST" 8 300
+    local out
+    out=$("$BSCP" -s 2M --verify "$SRC" "$DST" 2>&1) || return 1
+    cmp -s "$SRC" "$DST" && grep -q 'verify OK' <<<"$out"
 }
 
 test_friendly_error_for_missing_local() {
@@ -777,7 +804,9 @@ run "--batch --verify -B verifies prefix, exits 0"   test_verify_batch_blockcoun
 run "--verify -B -N suppresses incomplete warning"   test_verify_dryrun_blockcount_no_warning
 run "BSCP_OPTIONS default options take effect"       test_bscp_options_applies
 run "BSCP_OPTIONS overridden by explicit CLI option" test_bscp_options_cli_overrides
-run "exit 2 when neither side is HOST:path"          test_exit2_when_no_host
+run "exit 2 for remote-to-remote (both HOST:path)"   test_exit2_remote_to_remote
+run "local-to-local copy (no ssh)"                   test_local_to_local
+run "local-to-local --verify (both b3sum local)"     test_local_to_local_verify
 run "friendly error when local file is missing"      test_friendly_error_for_missing_local
 run "reject unknown / zero-digest -a algorithm"      test_reject_bad_algorithm
 run "connection failure engages retries, exits 3"    test_conn_failure_retries_exit3

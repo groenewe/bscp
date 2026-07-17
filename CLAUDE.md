@@ -144,6 +144,20 @@ bscp (single file)
 ├── parse_size()       — converts "64K" / "10G" strings to integer bytes.
 ├── available_memory() — queries OS for available physical RAM via sysconf;
 │                        used to cap section size when --buffer is active.
+├── backing_disk()     — best-effort physical disk backing a path, for the
+│   / warn_same_disk()   local-to-local same-disk warning.  backing_disk()
+│                        resolves a block device by its own major:minor
+│                        (st_rdev) and a regular file by the filesystem it
+│                        lives on (st_dev), maps that through /sys/dev/block
+│                        to the parent disk (a node with a `partition` attr is
+│                        a partition, so its parent dir is the whole disk), and
+│                        reads queue/rotational.  Returns (None, None) when it
+│                        cannot tell (non-Linux, virtual/network/dm backing,
+│                        tmpfs major 0).  warn_same_disk() prints a note when
+│                        source and destination resolve to the same disk (read
+│                        and write contend for one device; a rotational disk
+│                        seeks constantly) — a warning only, never refusal.
+│                        Called from __main__ on the local-to-local branch.
 ├── format_time()      — formats seconds as "m:ss" / "h:mm:ss" for progress
 │                        display.
 ├── format_size()      — converts a byte count to a human-readable string.
@@ -168,21 +182,32 @@ bscp (single file)
 │                        build_ssh_cmd() and external_hash_remote() so the
 │                        --verify cross-check reaches the remote over the same
 │                        connection options as the transfer.
-├── build_ssh_cmd()    — assembles the ssh argv list from ssh_args dict
-│                        (starting from ssh_base()).  Dispatches three remote
-│                        variants in order: python3 → remote_script_mt
-│                        (threaded, hex-encoded), python2/python →
-│                        remote_script (single-threaded), perl → remote_perl.
-│                        First interpreter found wins.  ssh_base() appends
-│                        `-o ServerAliveInterval=15 -o ServerAliveCountMax=4`
-│                        after the user's `-o` options so a dropped TCP
-│                        connection surfaces as a BrokenPipeError within
-│                        ~60s instead of hanging.  User `-o` wins because
-│                        ssh applies the first matching `-o`.
+├── build_ssh_cmd()    — assembles the ssh argv list from ssh_args dict.
+│                        Builds the interpreter-probe wrapper shell string
+│                        that dispatches three remote variants in order:
+│                        python3 → remote_script_mt (threaded, hex-encoded),
+│                        python2/python → remote_script (single-threaded),
+│                        perl → remote_perl.  First interpreter found wins.
+│                        When remote_host is None (local-to-local: neither
+│                        side is HOST:path) the SAME wrapper is run under a
+│                        local `sh -c` (`['sh', '-c', wrapper, 'bscp-local']`)
+│                        instead of ssh — the remote body operates on the
+│                        destination as an ordinary local path and the whole
+│                        wire protocol is reused over the subprocess pipe (no
+│                        ssh, no host, no network; ssh_base()'s compress/
+│                        keepalive flags are skipped as irrelevant).  For a
+│                        real remote it prepends `ssh` + ssh_base(), which
+│                        appends `-o ServerAliveInterval=15 -o
+│                        ServerAliveCountMax=4` after the user's `-o` options
+│                        so a dropped TCP connection surfaces as a
+│                        BrokenPipeError within ~60s instead of hanging.  User
+│                        `-o` wins because ssh applies the first matching `-o`.
 ├── spawn_hash()       — the --verify BLAKE3 cross-check (out-of-band, NOT a
 │   / collect_hash()     protocol change).  b3sum_local_cmd() / b3sum_remote_
 │   / b3sum_*_cmd()      cmd() build the `b3sum LOCAL` and `ssh HOST b3sum
-│   / verify_digest()    REMOTE` (shell-quoted) commands; spawn_hash() starts
+│   / verify_digest()    REMOTE` (shell-quoted) commands (on a local-to-local
+│                        copy b3sum_remote_cmd() returns the local b3sum
+│                        command — no ssh); spawn_hash() starts
 │   / device_size()      each as a Popen so __main__ runs both CONCURRENTLY
 │   / dd_hash_params()   (wall-clock = slower side, not the sum); collect_hash()
 │   / hash_desc()        waits one and returns its digest.  verify_digest()
@@ -244,9 +269,15 @@ bscp (single file)
 │                        element) for the closing note.  Push (local is source)
 │                        and write errors stay fatal; no protocol change — see
 │                        docs/ignore-read-errors.md.
-└── __main__           — argparse, push/pull auto-detection, retry loop, and
-                         the post-copy --verify orchestration (exit 4 on a
-                         confirmed mismatch).  On abort (ConnectionLost or
+└── __main__           — argparse, push/pull/local auto-detection, retry loop,
+                         and the post-copy --verify orchestration (exit 4 on a
+                         confirmed mismatch).  Direction is inferred from which
+                         side carries a `HOST:` prefix: SRC only → pull, DST
+                         only → push, NEITHER → local-to-local (mode = PUSH,
+                         remote_host = None, so build_ssh_cmd spawns a local
+                         subprocess; warn_same_disk() then warns if both paths
+                         are on one physical disk), BOTH → exit 2 (remote-to-
+                         remote unsupported).  On abort (ConnectionLost or
                          Ctrl+C) a resume command is printed only when
                          `progressed(offset)` is true — i.e. the resume offset
                          advanced past `initial_offset`, the section-rounded
@@ -410,7 +441,9 @@ to cover, plus a few that were easy to forget:
 | `-B` pull within dst size needs no truncate flag | -B does not spuriously trip the truncate check    |
 | `-B` beyond dst size still requires `--truncate` | -B and --allow-truncate stay independent          |
 | `-B` overshoot prints warning, exits 0           | calculated size > actual source warns, syncs rest |
-| exit 2 when neither side is HOST:path            | argparse path                                     |
+| exit 2 for remote-to-remote (both HOST:path)     | argparse path: only one side may carry `HOST:`    |
+| local-to-local copy (no ssh)                     | neither side HOST:path → remote body as local subprocess; dst == src |
+| local-to-local `--verify` (both b3sum local)     | b3sum_remote_cmd → local b3sum; digests match, exit 0 |
 | friendly error when local file is missing        | OSError → `Error: Cannot open local file ...`     |
 | reject unknown / zero-digest `-a` algorithm      | `parse_algorithm` guard: exit 2, names the algo   |
 | connection failure engages retries, exits 3 | handshake-stage conn loss → `ConnectionLost`, not fatal exit 1; no redundant `-r 0` printed when no section completed |
@@ -445,15 +478,17 @@ them on exit.  Exit status is `0` on success, `1` if any test failed (with
 the failing names listed at the end), or `2` on missing prerequisites.
 
 When `$BSCP` runs under a Python 2 interpreter (detected from its shebang
-plus `python -V`), sixteen tests are skipped by default and reported as
+plus `python -V`), eighteen tests are skipped by default and reported as
 `skip`: the two `--hash-threads` tests (the option is python3-only), the
 `-a` algorithm-rejection test (Py2's `hashlib` lacks the `shake_*` XOF
 functions it probes), the twelve `--verify` tests (the convenience b3sum
 cross-check is not implemented in the python2 client, so the flag is
-unrecognised), and the `--ignore-read-errors` test (the flag is python3-only
-for now).  The two `BSCP_OPTIONS` tests run under the python2 client
-too (it now honours the env var).  Pass `--force-all` to run every test
-regardless of interpreter.
+unrecognised), the `--ignore-read-errors` test (the flag is python3-only
+for now), and the two local-to-local tests (that mode is python3-client only;
+the python2 fallback client still rejects a no-HOST invocation).  The
+`exit 2 for remote-to-remote` test runs under both clients.  The two
+`BSCP_OPTIONS` tests run under the python2 client too (it now honours the
+env var).  Pass `--force-all` to run every test regardless of interpreter.
 
 When investigating a single failure interactively, the manual idiom is
 still useful:

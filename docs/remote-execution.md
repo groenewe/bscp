@@ -168,6 +168,43 @@ otherwise never run:
 
 `BSCP_FORCE_PERL` takes precedence over `BSCP_FORCE_PYTHON2` if both are set.
 
+## Local-to-local (no ssh)
+
+When neither `SRC` nor `DST` carries a `HOST:` prefix, `__main__` sets
+`remote_host = None` and runs a **local-to-local** copy in push mode (client
+reads `SRC`, the "remote" body writes `DST`).  `build_ssh_cmd()` builds the
+*exact same* interpreter-probe wrapper string, but instead of handing it to
+`ssh HOST` it runs it under a local shell:
+
+```
+['sh', '-c', wrapper, 'bscp-local']
+```
+
+So the same python3 → python2/python → perl dispatch, hex-encoding, and
+`command -v` probing apply — the only difference is that the wrapper executes
+on the local host and operates on `DST` as an ordinary local path.  The whole
+wire protocol (handshake, phase A hash exchange, phase B) runs unchanged over
+the subprocess pipe; there is no SSH, no network, and no protocol change.
+`ssh_base()`'s compression and keepalive flags are irrelevant to a local pipe
+and are skipped (the local branch returns before they are added).  The process
+marker is `bscp-local` here rather than `bscp-remote`, so `ps aux | grep
+bscp-local` finds the subprocess — but note it lands as `$0`, not as an
+`exec … argv`, because the wrapper's own `exec "$py" … bscp-remote` still tags
+the interpreter with `bscp-remote`.  Both markers may therefore be visible.
+
+Because the local host now plays the remote's role too, it must itself have a
+Python 2/3 or Perl interpreter available — even a Nuitka-built client (which
+otherwise needs no local Python) needs one on `PATH` for local-to-local.
+
+`BSCP_FORCE_PERL` / `BSCP_FORCE_PYTHON2` work in local mode as well, since the
+wrapper string is shared.  The `--verify` cross-check adapts too:
+`b3sum_remote_cmd()` returns the local `b3sum` command (no ssh, no PTY) when
+`remote_host is None`, so both digests are computed locally.
+
+A same-physical-disk guard (`warn_same_disk()` / `backing_disk()`) warns —
+best-effort, Linux only — when `SRC` and `DST` resolve to one backing disk, so
+the operator is aware of the read/write head contention before a slow copy.
+
 When editing `remote_perl`, remember the file is read by Python first:
 backslashes that need to reach Perl (e.g. `\n`, `\&`, `\z` in regex)
 must be doubled (`\\n`, `\\&`, `\\z`) in the Python triple-quoted string
