@@ -1989,7 +1989,11 @@ if __name__ == '__main__':
                 break
             except ConnectionLost as exc:
                 if attempt < args.retries and not exc.interrupted:
-                    delay = min(2 ** attempt, 60)
+                    # Start at 10s and double (10/20/40/60...), capped at 60s.
+                    # A short first delay usually fails anyway: firewall rate
+                    # limits (e.g. `ufw limit 22/tcp`) reject fast reconnects,
+                    # and VLAN/ZeroTier blips typically last 10-20s.
+                    delay = min(10 * 2 ** attempt, 60)
                     if progressed(exc.offset):
                         report('\rConnection lost — retrying (%d/%d) in %ds...\n'
                                 'Resume manually with:\n  %s\n' % (
