@@ -137,7 +137,7 @@ bscp --check-tools /dev/sda myhost:/dev/sda
 #   bscp-remote: interpreter=python3 (multi-threaded, hash_threads=auto)
 
 # Or report the same up front, then run the copy anyway
-bscp -v --verify /dev/sda myhost:/dev/sda
+bscp -v /dev/sda myhost:/dev/sda
 
 # Use a smaller section size to limit memory on a constrained host
 bscp -s 1G /dev/sda myhost:/dev/sda
