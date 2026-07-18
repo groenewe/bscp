@@ -102,7 +102,7 @@ and the Perl remote fallback — is identical to `bscp`.
 | `#!/usr/bin/env python`                                   | Resolves to whichever `python` is on `PATH` (2 or 3).                  |
 | `# -*- coding: utf-8 -*-`                                 | Source contains em-dashes / box-drawing chars in strings and comments. |
 | `from __future__ import division`                         | `/` returns float on Py2 (matches Py3 semantics throughout the file).  |
-| `import binascii` + `hexlify(...).decode('ascii')`        | `bytes.hex()` is Py3.5+; used for both the |  Perl and `remote_script_mt` hex payloads. |
+| `import binascii` + `hexlify(...).decode('ascii')`        | `bytes.hex()` is Py3.5+; used for both the Perl and `remote_script_mt` hex payloads. |
 | `try: from shlex import quote ... except ImportError: from pipes import quote as _shquote` | `shlex.quote` is Py3.3+; Py2's `pipes.quote` is the same function. |
 | `_PIPE_ERRORS` tuple defined via try/except `NameError`   | `BrokenPipeError` / `ConnectionResetError` are Py3.3+.                 |
 | `super(ConnectionLost, self).__init__(...)`               | Py2 requires the explicit class+instance form.                         |
