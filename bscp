@@ -34,8 +34,8 @@
 # --ignore-read-errors recovery mode (pull only) that overwrites unreadable
 # local blocks from the remote source.
 #
-# Changes in this fork were made with extensive help of Claude Code, Sonnet
-# and Opus models (Anthropic).
+# Changes in this fork were made with extensive help of Claude Code,
+# using Sonnet, Opus, and Fable models (Anthropic).
 
 from argparse import ArgumentParser, ArgumentTypeError
 from collections import deque
@@ -1005,6 +1005,17 @@ def dd_hash_params(n):
     # Returns (bs, count) or None when n has no divisor in [DD_MIN_IBS,
     # DD_TARGET_IBS]; the caller then skips the comparison rather than fall
     # back to a pathologically slow byte-by-byte (ibs=1) read.
+    #
+    # This is a flat descent over candidate block sizes, not a divisor-pair
+    # search (enumerate factors up to isqrt(n) and keep the best one in range).
+    # Kept naive on purpose: the loop is bounded by DD_TARGET_IBS - DD_MIN_IBS
+    # (~1M cheap modulos) regardless of device size, returns on the first hit
+    # (immediate for the power-of-two sizes that are the norm), and runs once
+    # per --verify, off the transfer path.  The divisor-pair alternative is
+    # only asymptotically cheaper for small n -- for a device past ~1 TiB
+    # isqrt(n) already exceeds that fixed ~1M bound -- and it would pull in
+    # math.isqrt (or a float sqrt with rounding care) for a saving that never
+    # lands on the hot path.  Not worth the dependency; kept flat.
     if n < DD_MIN_IBS:
         return None
     for bs in range(min(DD_TARGET_IBS, n), DD_MIN_IBS - 1, -1):
