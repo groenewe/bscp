@@ -25,6 +25,9 @@ plays both roles.)  The optional `--verify` cross-check
 additionally needs [`b3sum`](https://github.com/BLAKE3-team/BLAKE3) on each
 side it runs on (it warns and skips where missing), plus `dd` on the larger
 side when the two devices differ in size (used to hash only the common prefix).
+Unsure whether a host has what a run needs?  `bscp --check-tools SRC DST`
+(or add `-v` to any real run) reports `dd`/`b3sum` availability on both ends
+and the remote connection method before doing anything.
 
 **Runs almost anywhere.**  The remote side needs no installation and speaks
 the same protocol whether it runs under `python3`, `python2`/`python`, or
@@ -102,6 +105,8 @@ prefix that fits.
 | `--buffer`                    |          | Push: buffer differing blocks in memory during phase B instead of re-reading them from disk. | Higher memory use, fewer disk reads. Experimental. Auto-disabled if available memory is too low. |
 | `-T N` / `--hash-threads`     | `0`      | Threads used to hash blocks during the scan phase, on both client and remote (`0` = auto: `min(cores, 4)`). An explicit `N` is clamped to each side's own core count, so `-T 8` to a 4-core remote runs 4 threads there. | Speeds up scanning when hashing is CPU-bound (fast NVMe/local). python2 and Perl remotes stay single-threaded. |
 | `-q` / `--quiet`              |          | Suppress scan/copy progress lines. Errors and warnings are still shown.                                          |
+| `-v` / `--verbose`            |          | Report external-tool availability (`dd`, `b3sum`) on the local **and** remote ends, plus the remote connection method (`python3`/`python2`/`perl`), then proceed with the transfer. The remote findings are echoed to stderr by the SSH wrapper itself (no protocol change). Suppressed under `--batch`. |
+| `--check-tools`               |          | Like `-v`, but exit after reporting **without transferring anything** — a connection/tooling diagnostic. Honors `--batch` (silent; rely on the exit status: `0` = reported, `1` = connection failed). |
 | `--batch`                     |          | Suppress all stderr output; use the exit status to detect errors (implies `-q`). | Cannot convey a resume offset — use `-q` instead if a caller needs to parse the "Resume with:" stderr line. |
 | `-p PORT` / `--port`          | `22`     | SSH port.                                                                                                        |
 | `--verify`                    |          | After copying, run `b3sum` on the local and (when present) remote file **concurrently**, printing each digest the moment its side finishes (so the first hash is recorded without waiting on the slower side), with a live countdown between them (estimated from the scan time). Compare them and report OK / mismatch (**exit 4** on mismatch). Only the bytes bscp actually copied — the prefix `[0, sync_size)` — are compared: when the devices differ in size, or `-B` capped the copy, every side **larger** than that prefix is piped through `dd bs=… count=…` (block size chosen near 1&nbsp;MiB) so both ends hash the same bytes — the report shows the `dd … \| b3sum` form used. A `-B` copy that leaves source data uncopied also prints an **incomplete-backup warning**. A convenience BLAKE3 cross-check, independent of `-a`; warns and skips where `b3sum` is missing on either side, or the copied prefix admits no efficient `dd` block size (or `dd` is absent on a side that needs it). The remote `b3sum` runs under the same SSH keepalive as the transfer, so a long hash does not drop the connection. Under `-N` (dry-run) it runs only when the scan found zero diffs — an independent confirmation that source and destination already match. Under `--batch` a verify that cannot be performed exits `5` (so a suppressed-warning skip is not mistaken for success). |
@@ -121,6 +126,16 @@ bscp /dev/sda /mnt/backup-disk/sda.img
 
 # Dry-run: see how many blocks differ without copying
 bscp -N /dev/sda myhost:/dev/sda
+
+# Check which tools each end has (dd, b3sum) and how the remote is reached,
+# without transferring anything — a pre-flight diagnostic
+bscp --check-tools /dev/sda myhost:/dev/sda
+#   bscp-local:  dd=yes b3sum=yes
+#   bscp-remote: dd=yes b3sum=no
+#   bscp-remote: interpreter=python3 (multi-threaded, hash_threads=auto)
+
+# Or report the same up front, then run the copy anyway
+bscp -v --verify /dev/sda myhost:/dev/sda
 
 # Use a smaller section size to limit memory on a constrained host
 bscp -s 1G /dev/sda myhost:/dev/sda

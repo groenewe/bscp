@@ -910,6 +910,36 @@ def build_ssh_cmd(remote_host, args):
     remote_threads = (args.get('hash_threads') or 0)
     script_mt = remote_script_mt + '\n_remote(%d)\n' % remote_threads
     hex_mt    = script_mt.encode('utf-8').hex()
+
+    # --verbose / --check-tools: the remote side reports tool availability and
+    # its chosen interpreter via echoes injected into this shell wrapper (its
+    # stderr surfaces on the client terminal over ssh — no protocol change).
+    # Suppressed under --batch (which is exit-code-only).  `tag` distinguishes a
+    # real remote from the local destination of a local-to-local copy.
+    verbose = bool((args.get('verbose') or args.get('check_tools'))
+                   and not args.get('batch'))
+    tag = 'remote' if remote_host is not None else 'dst'
+
+    def _exec(cond, exec_stmt, desc):
+        # One interpreter-dispatch clause: `<cond> && exec ...;`.  When verbose,
+        # wrap the exec in a group that first echoes the chosen interpreter to
+        # stderr.  The hex/script payloads are substituted into exec_stmt by the
+        # caller (not deferred), so the assembled string carries no stray `%`
+        # and needs no later %-formatting — keeping the verbose echo text (which
+        # may contain arbitrary characters) safe from format interpretation.
+        if verbose:
+            return (cond + ' && { echo "bscp-' + tag + ': ' + desc + '" >&2; '
+                    + exec_stmt + '; } ; ')
+        return cond + ' && ' + exec_stmt + '; '
+
+    # Interpreter exec statements with their payloads already substituted.
+    mt_exec  = ('exec python3 -O -B -c "exec(bytes.fromhex(\'' + hex_mt
+                + '\').decode())" bscp-remote')
+    leg_exec = 'exec "$py" -O -B -c "' + script_py + '" bscp-remote'
+    perl_exec = "exec perl -e 'eval pack(qq{H*}, q{" + hex_pl + "})' bscp-remote"
+    mt_desc  = ('interpreter=python3 (multi-threaded, hash_threads='
+                + (str(remote_threads) if remote_threads else 'auto') + ')')
+
     # BSCP_FORCE_PERL skips both Python branches; BSCP_FORCE_PYTHON2 skips the
     # python3/remote_script_mt branch so the single-threaded legacy
     # remote_script is exercised even where python3 is present.  Both are
@@ -920,21 +950,31 @@ def build_ssh_cmd(remote_host, args):
     elif os.environ.get('BSCP_FORCE_PYTHON2'):
         py_branch = (
             'for py in python3 python2 python; do '
-            'command -v "$py" >/dev/null 2>&1 && exec "$py" -O -B -c "%s" bscp-remote; '
-            'done; ' % script_py)
+            + _exec('command -v "$py" >/dev/null 2>&1', leg_exec,
+                    'interpreter=$py (single-threaded)')
+            + 'done; ')
     else:
         py_branch = (
-            'command -v python3 >/dev/null 2>&1 && '
-            'exec python3 -O -B -c "exec(bytes.fromhex(\'%s\').decode())" bscp-remote; '
-            'for py in python2 python; do '
-            'command -v "$py" >/dev/null 2>&1 && exec "$py" -O -B -c "%s" bscp-remote; '
-            'done; ' % (hex_mt, script_py))
+            _exec('command -v python3 >/dev/null 2>&1', mt_exec, mt_desc)
+            + 'for py in python2 python; do '
+            + _exec('command -v "$py" >/dev/null 2>&1', leg_exec,
+                    'interpreter=$py (single-threaded)')
+            + 'done; ')
+
+    # When verbose, probe the non-interpreter helpers (dd, b3sum) up front so
+    # their availability is reported before the interpreter dispatch execs away.
+    probe = ''
+    if verbose:
+        probe = ('for t in dd b3sum; do command -v "$t" >/dev/null 2>&1 '
+                 '&& echo "bscp-' + tag + ': $t=yes" >&2 '
+                 '|| echo "bscp-' + tag + ': $t=no" >&2; done; ')
+
     wrapper = (
-        py_branch +
-        "command -v perl >/dev/null 2>&1 && "
-        "exec perl -e 'eval pack(qq{H*}, q{%s})' bscp-remote; "
-        'echo "bscp: no python or perl found on remote" >&2; exit 127'
-    ) % hex_pl
+        probe + py_branch
+        + _exec('command -v perl >/dev/null 2>&1', perl_exec,
+                'interpreter=perl (single-threaded)')
+        + 'echo "bscp: no python or perl found on remote" >&2; exit 127'
+    )
     # Local → local (remote_host is None): run the very same interpreter-probe
     # wrapper under a local shell instead of ssh, so the remote body operates
     # on `remote_file` as an ordinary local path.  The whole wire protocol is
@@ -1767,6 +1807,16 @@ if __name__ == '__main__':
     output = parser.add_argument_group('output')
     output.add_argument('-q', '--quiet',              action='store_true',
                         help='suppress scan/copy progress lines; errors and warnings are still shown')
+    output.add_argument('-v', '--verbose',            action='store_true',
+                        help='report external-tool availability (dd, b3sum) on the local and '
+                             'remote ends, plus the remote connection method '
+                             '(python3/python2/perl), then proceed with the transfer. Remote '
+                             'findings are echoed to stderr by the ssh wrapper (no protocol '
+                             'change); suppressed under --batch.')
+    output.add_argument('--check-tools',              action='store_true',
+                        help='like -v, but exit after reporting without transferring anything — a '
+                             'connection/tooling diagnostic. Honors --batch (silent; rely on the '
+                             'exit status: 0 = reported, 1 = connection failed).')
     output.add_argument('--batch',                    action='store_true',
                         help='suppress all stderr output; use exit status to detect errors (implies -q). '
                              'Exit 0=success, 1=fatal error, 2=bad arguments, 3=connection lost, '
@@ -1892,6 +1942,32 @@ if __name__ == '__main__':
     # is still surfaced after later attempts stall.
     initial_offset = start_offset
     progressed     = lambda offset: offset != initial_offset
+
+    # --verbose / --check-tools: report external-tool availability on both ends
+    # and the remote connection method.  Local tools are probed here; the remote
+    # side reports via echoes injected into the ssh wrapper by build_ssh_cmd()
+    # (surfacing on this terminal — no protocol change).  --check-tools then
+    # connects only far enough to trigger those echoes and exits without
+    # transferring; -v falls through to the normal transfer below.
+    if args.verbose or args.check_tools:
+        for tool in ('dd', 'b3sum'):
+            report('bscp-local: %s=%s\n' % (tool, 'yes' if shutil.which(tool) else 'no'))
+    if args.check_tools:
+        probe_cmd = build_ssh_cmd(remote_host, ssh_args)
+        try:
+            probe = subprocess.Popen(probe_cmd, stdin=subprocess.PIPE,
+                                     stdout=subprocess.DEVNULL)
+        except OSError as exc:
+            report('\nError: %s\n' % exc)
+            sys.exit(1)
+        # Close stdin so the remote's handshake read hits EOF and it exits
+        # cleanly right after printing its probe/interpreter lines.
+        probe.stdin.close()
+        probe.wait()
+        # The remote body always exits 1 on the induced EOF; ssh returns 255
+        # only when the connection itself failed, so treat that alone as our
+        # failure (local-to-local has no ssh, so 255 cannot arise there).
+        sys.exit(1 if (remote_host is not None and probe.returncode == 255) else 0)
 
     t_start  = time()
     attempt  = 0

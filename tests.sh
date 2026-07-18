@@ -15,12 +15,14 @@
 #   ./tests.sh --force-all          # run every test even under a python2 client
 #
 # When $BSCP runs under a Python 2 interpreter (e.g. bscp.python2 where
-# `python` resolves to Python 2.x), sixteen tests are skipped by default:
+# `python` resolves to Python 2.x), twenty tests are skipped by default:
 # the two --hash-threads tests (the option is python3-only by design), the
 # -a algorithm-rejection test (Py2's hashlib lacks the shake_* XOF functions
 # the test probes), the twelve --verify tests (the convenience b3sum
-# cross-check is not implemented in the python2 client), and the
-# --ignore-read-errors test (the flag is python3-only for now).  The
+# cross-check is not implemented in the python2 client), the
+# --ignore-read-errors test (the flag is python3-only for now), the two
+# local-to-local tests (that mode is python3-client only), and the two
+# -v/--check-tools tests (those flags are python3-client only).  The
 # BSCP_OPTIONS tests now run under python2 (the env var is honoured there
 # too).  Pass --force-all to run the skipped tests anyway.
 #
@@ -57,7 +59,8 @@ test_verify_size_mismatch_compares test_verify_dryrun_zero_diff_runs test_verify
 test_verify_batch_mismatch_exit4 test_verify_batch_size_mismatch_ok test_verify_batch_unavailable_exit5 \
 test_verify_blockcount_compares test_verify_batch_blockcount_ok \
 test_verify_dryrun_blockcount_no_warning test_ignore_read_errors_pull \
-test_local_to_local test_local_to_local_verify"
+test_local_to_local test_local_to_local_verify \
+test_verbose_reports_tools test_check_tools_no_copy"
 
 WORK=$(mktemp -d)
 SRC="$WORK/src.img"
@@ -589,6 +592,36 @@ test_local_to_local_verify() {
     cmp -s "$SRC" "$DST" && grep -q 'verify OK' <<<"$out"
 }
 
+test_verbose_reports_tools() {
+    # -v prints local- and remote-side tool availability (dd, b3sum) plus the
+    # remote interpreter, then proceeds with the copy.  The remote lines arrive
+    # over the ssh wrapper's stderr (no protocol change).
+    make_src 4
+    copy_src_to "$DST"
+    randomise_in "$DST" 8 100
+    local out
+    out=$("$BSCP" -v -s 2M "$SRC" "localhost:$DST" 2>&1) || return 1
+    cmp -s "$SRC" "$DST"                       || { echo "not copied: $out"; return 1; }
+    grep -q 'bscp-local: dd='          <<<"$out" || { echo "no local dd line"; return 1; }
+    grep -q 'bscp-local: b3sum='       <<<"$out" || { echo "no local b3sum line"; return 1; }
+    grep -q 'bscp-remote: dd='         <<<"$out" || { echo "no remote dd line"; return 1; }
+    grep -q 'bscp-remote: b3sum='      <<<"$out" || { echo "no remote b3sum line"; return 1; }
+    grep -q 'bscp-remote: interpreter=' <<<"$out"
+}
+
+test_check_tools_no_copy() {
+    # --check-tools reports availability and the connection method, then exits 0
+    # WITHOUT transferring: the destination must stay different from the source.
+    make_src 4
+    copy_src_to "$DST"
+    randomise_in "$DST" 8 100
+    local out rc
+    out=$("$BSCP" --check-tools "$SRC" "localhost:$DST" 2>&1); rc=$?
+    (( rc == 0 ))                              || { echo "exit $rc (expected 0): $out"; return 1; }
+    grep -q 'bscp-remote: interpreter=' <<<"$out" || { echo "no interpreter line: $out"; return 1; }
+    ! cmp -s "$SRC" "$DST"                     || { echo "destination was modified"; return 1; }
+}
+
 test_friendly_error_for_missing_local() {
     local out
     out=$("$BSCP" /nonexistent-bscp-test.img "localhost:$DST" 2>&1)
@@ -807,6 +840,8 @@ run "BSCP_OPTIONS overridden by explicit CLI option" test_bscp_options_cli_overr
 run "exit 2 for remote-to-remote (both HOST:path)"   test_exit2_remote_to_remote
 run "local-to-local copy (no ssh)"                   test_local_to_local
 run "local-to-local --verify (both b3sum local)"     test_local_to_local_verify
+run "-v reports local+remote tools and interpreter"  test_verbose_reports_tools
+run "--check-tools reports then exits without copy"  test_check_tools_no_copy
 run "friendly error when local file is missing"      test_friendly_error_for_missing_local
 run "reject unknown / zero-digest -a algorithm"      test_reject_bad_algorithm
 run "connection failure engages retries, exits 3"    test_conn_failure_retries_exit3

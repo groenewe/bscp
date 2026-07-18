@@ -168,6 +168,51 @@ otherwise never run:
 
 `BSCP_FORCE_PERL` takes precedence over `BSCP_FORCE_PYTHON2` if both are set.
 
+## Reporting the remote toolchain (`--verbose` / `--check-tools`)
+
+Some bscp behaviour depends on external helpers on the remote — `dd` and
+`b3sum` for the `--verify` cross-check — and on which interpreter the wrapper
+ends up choosing.  `--verbose` (`-v`) and `--check-tools` surface all three
+without a protocol change, by making the remote **report over its own
+stderr**, which ssh already forwards to the client terminal (the existing
+`echo "bscp: no python or perl found on remote" >&2` line proves the channel
+works).
+
+When either flag is set (and `--batch` is not), `build_ssh_cmd()` assembles
+the wrapper through an `_exec()` helper instead of the plain
+`<cond> && exec …;` clauses:
+
+- A **tool probe** is prepended:
+  `for t in dd b3sum; do command -v "$t" … && echo "bscp-<tag>: $t=yes" >&2 || echo "bscp-<tag>: $t=no" >&2; done;`
+- Each interpreter dispatch is wrapped so the chosen one announces itself just
+  before it `exec`s away:
+  `<cond> && { echo "bscp-<tag>: interpreter=… " >&2; exec …; };`
+
+`<tag>` is `remote` for a real ssh remote and `dst` for the local-to-local
+destination.  Because the echo happens *before* `exec` (and `exec` replaces
+the process), the reported interpreter is exactly the one that runs.
+
+Two constraints made this safe to inline:
+
+- The verbose wrapper embeds the hex/script payloads **immediately** (in
+  `_exec()`), not through a deferred `%`-format over the whole wrapper string,
+  so the injected echo text can contain arbitrary characters without risking
+  `%`-format interpretation.  The **non-verbose** wrapper is assembled the same
+  way and is byte-for-byte identical to the previous deferred-format version
+  (the payloads contain no `%`, which is also why the old deferred format
+  worked).
+- The wrapper shell text itself was never under the no-`$`/no-`%`/no-`"` rules
+  (those apply only to the embedded `remote_script` Python source), so `$t`,
+  `>&2`, and the quoted `echo` strings are all fine.
+
+`--check-tools` additionally short-circuits in `__main__`: it spawns that same
+wrapper, closes the subprocess stdin so the remote's handshake `rd()` hits EOF
+and it exits cleanly right after printing, and then exits **without
+transferring**.  Exit status is `0` once the report is produced, or `1` only
+when ssh itself failed to connect (returncode 255); the remote body's own
+EOF-driven `exit 1` is treated as success.  Local `dd`/`b3sum` availability is
+reported separately in `__main__` via `shutil.which()`.
+
 ## Local-to-local (no ssh)
 
 When neither `SRC` nor `DST` carries a `HOST:` prefix, `__main__` sets

@@ -202,6 +202,19 @@ bscp (single file)
 │                        so a dropped TCP connection surfaces as a
 │                        BrokenPipeError within ~60s instead of hanging.  User
 │                        `-o` wins because ssh applies the first matching `-o`.
+│                        When --verbose/--check-tools is set (and not --batch)
+│                        the wrapper is built through an _exec() helper that
+│                        prepends a `dd`/`b3sum` presence probe and wraps each
+│                        interpreter exec in `{ echo "bscp-<tag>: ..." >&2;
+│                        exec ...; }` — the chosen interpreter and remote tool
+│                        availability are echoed to the remote's stderr, which
+│                        ssh forwards to the client terminal (NO protocol
+│                        change; `tag` is `remote`, or `dst` for a
+│                        local-to-local copy).  The non-verbose wrapper is
+│                        byte-identical to before: _exec() substitutes the
+│                        hex/script payloads immediately (not via a deferred
+│                        `%`-format over the whole string), so the injected
+│                        echo text never risks `%`-format interpretation.
 ├── spawn_hash()       — the --verify BLAKE3 cross-check (out-of-band, NOT a
 │   / collect_hash()     protocol change).  b3sum_local_cmd() / b3sum_remote_
 │   / b3sum_*_cmd()      cmd() build the `b3sum LOCAL` and `ssh HOST b3sum
@@ -291,7 +304,16 @@ bscp (single file)
                          stalls without advancing.  BSCP_OPTIONS (shell-split) is
                          prepended to argv before parse_args() so it supplies
                          default options that an explicit flag still overrides
-                         (per-host tuning, e.g. `-T 8 -b 192K`).
+                         (per-host tuning, e.g. `-T 8 -b 192K`).  --verbose /
+                         --check-tools first print local `dd`/`b3sum`
+                         availability (via shutil.which); the remote side is
+                         reported by build_ssh_cmd's injected echoes.
+                         --check-tools then spawns that same wrapper, closes
+                         its stdin (so the remote handshake read hits EOF and
+                         it exits after echoing), and exits WITHOUT
+                         transferring — exit 0 on report, 1 only when ssh
+                         itself failed (returncode 255; the remote body's own
+                         EOF exit of 1 is treated as success).
 ```
 
 ## Module-level constants
@@ -444,6 +466,8 @@ to cover, plus a few that were easy to forget:
 | exit 2 for remote-to-remote (both HOST:path)     | argparse path: only one side may carry `HOST:`    |
 | local-to-local copy (no ssh)                     | neither side HOST:path → remote body as local subprocess; dst == src |
 | local-to-local `--verify` (both b3sum local)     | b3sum_remote_cmd → local b3sum; digests match, exit 0 |
+| `-v` reports local+remote tools and interpreter  | wrapper echoes `dd`/`b3sum` + `interpreter=` to stderr; copy still completes |
+| `--check-tools` reports then exits without copy  | probe-only diagnostic: exit 0, interpreter line present, destination untouched |
 | friendly error when local file is missing        | OSError → `Error: Cannot open local file ...`     |
 | reject unknown / zero-digest `-a` algorithm      | `parse_algorithm` guard: exit 2, names the algo   |
 | connection failure engages retries, exits 3 | handshake-stage conn loss → `ConnectionLost`, not fatal exit 1; no redundant `-r 0` printed when no section completed |
@@ -469,7 +493,7 @@ Prerequisites: `python3` on PATH, and passwordless `ssh localhost`.  Run:
 ./tests.sh
 # or, when testing a different binary (e.g. a Nuitka build):
 BSCP=./bscp.nuitka ./tests.sh
-# or the Py2 client (skips 14 py3-only tests when `python` is Python 2):
+# or the Py2 client (skips 20 py3-only tests when `python` is Python 2):
 BSCP=./bscp.python2 ./tests.sh
 ```
 
@@ -478,14 +502,15 @@ them on exit.  Exit status is `0` on success, `1` if any test failed (with
 the failing names listed at the end), or `2` on missing prerequisites.
 
 When `$BSCP` runs under a Python 2 interpreter (detected from its shebang
-plus `python -V`), eighteen tests are skipped by default and reported as
+plus `python -V`), twenty tests are skipped by default and reported as
 `skip`: the two `--hash-threads` tests (the option is python3-only), the
 `-a` algorithm-rejection test (Py2's `hashlib` lacks the `shake_*` XOF
 functions it probes), the twelve `--verify` tests (the convenience b3sum
 cross-check is not implemented in the python2 client, so the flag is
 unrecognised), the `--ignore-read-errors` test (the flag is python3-only
-for now), and the two local-to-local tests (that mode is python3-client only;
-the python2 fallback client still rejects a no-HOST invocation).  The
+for now), the two local-to-local tests (that mode is python3-client only;
+the python2 fallback client still rejects a no-HOST invocation), and the two
+`-v`/`--check-tools` tests (those flags are python3-client only).  The
 `exit 2 for remote-to-remote` test runs under both clients.  The two
 `BSCP_OPTIONS` tests run under the python2 client too (it now honours the
 env var).  Pass `--force-all` to run every test regardless of interpreter.
