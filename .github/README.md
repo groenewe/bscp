@@ -358,7 +358,8 @@ replacing failing hardware — many read errors mean the device is dying.  See
 | Push and pull          | ✓                | Push only    | ✓       |
 | Default hash           | SHA-256          | MD5          | MD4/MD5 |
 | Resume support         | ✓                | —            | Partial |
-| Memory bounded         | ✓ (section size) | —            | —       |
+| Memory bounded (default / pull) | ✓ (≈ section size ÷ 2048: only 32-byte hashes held, not blocks) | — | — |
+| Memory bounded (`--buffer` push) | ✓ (section size: diff blocks held in RAM) | — | — |
 
 ## Credits
 
