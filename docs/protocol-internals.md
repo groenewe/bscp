@@ -14,12 +14,19 @@ if mode == MODE_PUSH:
 else:
     src_label, src_size, dst_label, dst_size = 'remote', remote_size, 'local',  local_size
 
-if dst_size < src_size:
+eff_src = src_size                    # -B caps the source for this check —
+if block_count > 0:                   # a smaller destination only "truncates"
+    requested = start_offset + block_count * blocksize   # if even the
+    if requested <= src_size:                            # requested amount
+        eff_src = requested                              # does not fit
+    # (requested > src_size is an overshoot: warning only)
+
+if dst_size < eff_src:
     if not allow_truncate:
         fail('%s destination size %d (%d blocks) < %s source size %d (%d blocks); ...')
     report('Warning: %s destination (%s) smaller than %s source (%s); ...')
 
-sync_size = min(local_size, remote_size)
+sync_size = min(wire_size, remote_size)   # wire_size = -B-capped local size
 ```
 
 `fail()` is a closure that closes both `proc.stdin` and `proc.stdout` and
@@ -53,7 +60,8 @@ If you increase `blocksize` significantly (e.g. to 1 MiB), consider reducing
 `PULL_WINDOW` reduces round-trip overhead on high-latency links.
 
 The remote's pull-phase-B loop flushes stdout after **every** block write
-(both `remote_script` and `remote_perl`).  Per-block flush is a no-op when
+(all three remotes: `remote_script`, `remote_script_mt`, and `remote_perl`).
+Per-block flush is a no-op when
 `blocksize` ≥ Python's 8 KiB BufferedWriter buffer (the write already
 bypasses the buffer), so default `64 KiB` blocks pay no measurable cost.
 The flush exists to eliminate a latency-hiccup class where, with small

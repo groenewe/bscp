@@ -88,12 +88,12 @@ prefix that fits.
 
 | Flag                          | Default  | Description                                                                                                      |
 | ----------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------- |
-| `-b SIZE` / `--block-size`    | `64K`    | Comparison/transfer granularity. Supports `K`/`M`/`G` suffixes.                                                  |
+| `-b SIZE` / `--block-size`    | `64K`    | Comparison/transfer granularity. Supports `K`/`M`/`G`/`T` suffixes.                                              |
 | `-s SIZE` / `--section-size`  | `10G`    | File is processed in sections of this size. Bounds peak memory to roughly `diff_blocks_per_section × blocksize`. |
 | `-a ALGO` / `--algorithm`     | `sha256` | Hash algorithm. `md5`, `sha1`, `sha224`, `sha256`, `sha384`, `sha512` work on every remote (python3/python2/Perl). Other `hashlib` algorithms (`sha3_256`, `blake2b`, …) need a python3/python2 remote with that algorithm; the Perl remote supports only the six portable ones. `bscp -h` lists the full set available on the local host. |
 | `-r OFFSET` / `--resume-from` | `0`      | Skip ahead to this byte offset, or to `NN%` / `NN.N%` of the local file (rounded down to a section boundary).    |
 | `-R N` / `--retries`          | `3`      | Automatically retry on connection failure, up to N times, with exponential back-off (`0` disables).              |
-| `--io-timeout SECS`           | `0`      | Abort (engaging `--retries`) if no SSH-pipe I/O progress for SECS seconds. Catches stuck remote process or | hung disk while TCP is still alive. `0` disables, falling back to the SSH keepalive (~60s). |
+| `--io-timeout SECS`           | `0`      | Abort (engaging `--retries`) if no SSH-pipe I/O progress for SECS seconds. Catches stuck remote process or hung disk while TCP is still alive. `0` disables, falling back to the SSH keepalive (~60s). |
 | `--bwlimit RATE`              | `0`      | Limit network I/O to RATE bytes per second (`K`/`M`/`G`/`T` suffix accepted, e.g. `--bwlimit 5M`); both directions combined. `0` = unlimited. The rate is measured on the data handed to `ssh` (pre-compression), so with `-C` the actual wire usage stays at or below RATE — lower for compressible data. For raw block devices (incompressible) the two coincide. |
 | `-i FILE` / `--identity`      |          | SSH identity file (`-i FILE`).                                                                                   |
 | `-o OPT` / `--ssh-opt`        |          | Extra SSH option, repeatable (passed as `-o OPT`). Takes precedence over the defaults below.                     |
@@ -102,12 +102,12 @@ prefix that fits.
 | `-B N` / `--block-count`      | `0`      | Limit sync to the first N blocks (0 = no limit). A `K`/`M`/`G`/`T` suffix interprets the value as bytes, rounded up to whole blocks (e.g. `-B 4M`). A warning is printed if the limit exceeds the source size. |
 | `--allow-truncate`            |          | Allow the destination to be smaller than the source (or, with `-B`, smaller than the requested limit); only the bytes that fit are copied. |
 | `--ignore-read-errors`        |          | **Experimental, experts only. Pull only.** Do not abort when a block of the **local destination** cannot be read during the scan (`EIO`). The unreadable block is treated as a difference and overwritten from the readable remote source — on a copy-on-write filesystem (e.g. bcachefs) this rewrites a CRC-bad extent and makes the region readable again. One warning naming the block offset is printed per affected block. Scope is deliberately narrow: only **local reads**, only the **scan phase**, only **pull** (where the local file is the destination). Write errors stay fatal, and push (local is the source, with no good data to substitute) is unaffected. Meant to recover a handful of bad blocks; many errors mean a failing device, not a job for this flag. Re-run or add `--verify` afterwards to confirm the repair. |
-| `--buffer`                    |          | Push: buffer differing blocks in memory during phase B instead of re-reading them from disk. | Higher memory use, fewer disk reads. Experimental. Auto-disabled if available memory is too low. |
-| `-T N` / `--hash-threads`     | `0`      | Threads used to hash blocks during the scan phase, on both client and remote (`0` = auto: `min(cores, 4)`). An explicit `N` is clamped to each side's own core count, so `-T 8` to a 4-core remote runs 4 threads there. | Speeds up scanning when hashing is CPU-bound (fast NVMe/local). python2 and Perl remotes stay single-threaded. |
+| `--buffer`                    |          | Push: buffer differing blocks in memory during phase B instead of re-reading them from disk. Higher memory use, fewer disk reads. Experimental. Auto-disabled if available memory is too low. |
+| `-T N` / `--hash-threads`     | `0`      | Threads used to hash blocks during the scan phase, on both client and remote (`0` = auto: `min(cores, 4)`). An explicit `N` is clamped to each side's own core count, so `-T 8` to a 4-core remote runs 4 threads there. Speeds up scanning when hashing is CPU-bound (fast NVMe/local). python2 and Perl remotes stay single-threaded. |
 | `-q` / `--quiet`              |          | Suppress scan/copy progress lines. Errors and warnings are still shown.                                          |
 | `-v` / `--verbose`            |          | Report external-tool availability (`dd`, `b3sum`) on the local **and** remote ends, plus the remote connection method (`python3`/`python2`/`perl`), then proceed with the transfer. The remote findings are echoed to stderr by the SSH wrapper itself (no protocol change). Suppressed under `--batch`. |
 | `--check-tools`               |          | Like `-v`, but exit after reporting **without transferring anything** — a connection/tooling diagnostic. Honors `--batch` (silent; rely on the exit status: `0` = reported, `1` = connection failed). |
-| `--batch`                     |          | Suppress all stderr output; use the exit status to detect errors (implies `-q`). | Cannot convey a resume offset — use `-q` instead if a caller needs to parse the "Resume with:" stderr line. |
+| `--batch`                     |          | Suppress all stderr output; use the exit status to detect errors (implies `-q`). Cannot convey a resume offset — use `-q` instead if a caller needs to parse the "Resume with:" stderr line. |
 | `-p PORT` / `--port`          | `22`     | SSH port.                                                                                                        |
 | `--verify`                    |          | After copying, run `b3sum` on the local and (when present) remote file **concurrently**, printing each digest the moment its side finishes (so the first hash is recorded without waiting on the slower side), with a live countdown between them (estimated from the scan time). Compare them and report OK / mismatch (**exit 4** on mismatch). Only the bytes bscp actually copied — the prefix `[0, sync_size)` — are compared: when the devices differ in size, or `-B` capped the copy, every side **larger** than that prefix is piped through `dd bs=… count=…` (block size chosen near 1&nbsp;MiB) so both ends hash the same bytes — the report shows the `dd … \| b3sum` form used. A `-B` copy that leaves source data uncopied also prints an **incomplete-backup warning**. A convenience BLAKE3 cross-check, independent of `-a`; warns and skips where `b3sum` is missing on either side, or the copied prefix admits no efficient `dd` block size (or `dd` is absent on a side that needs it). The remote `b3sum` runs under the same SSH keepalive as the transfer, so a long hash does not drop the connection. Under `-N` (dry-run) it runs only when the scan found zero diffs — an independent confirmation that source and destination already match. Under `--batch` a verify that cannot be performed exits `5` (so a suppressed-warning skip is not mistaken for success). |
 
@@ -130,8 +130,10 @@ bscp -N /dev/sda myhost:/dev/sda
 # Check which tools each end has (dd, b3sum) and how the remote is reached,
 # without transferring anything — a pre-flight diagnostic
 bscp --check-tools /dev/sda myhost:/dev/sda
-#   bscp-local:  dd=yes b3sum=yes
-#   bscp-remote: dd=yes b3sum=no
+#   bscp-local: dd=yes
+#   bscp-local: b3sum=yes
+#   bscp-remote: dd=yes
+#   bscp-remote: b3sum=no
 #   bscp-remote: interpreter=python3 (multi-threaded, hash_threads=auto)
 
 # Or report the same up front, then run the copy anyway

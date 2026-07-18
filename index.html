@@ -104,10 +104,12 @@ local:  bscp local_src         local_dst</pre>
         After copying, an optional independent integrity cross-check
         (<code>--verify</code>) runs
         <a href="https://github.com/BLAKE3-team/BLAKE3">b3sum</a> (BLAKE3) on
-        both ends and compares the two whole-device digests — a fast,
-        externally re-checkable confirmation that the destination matches the
-        source, using an algorithm independent of the one used for block
-        comparison.
+        both ends and compares the two digests — whole-device for an
+        equal-size full copy, or limited (via <code>dd</code>) to exactly the
+        copied prefix when the device sizes differ or <code>-B</code> capped
+        the copy — a fast, externally re-checkable confirmation that the
+        destination matches the source, using an algorithm independent of the
+        one used for block comparison.
       </li>
     </ul>
     <h2>Portability</h2>

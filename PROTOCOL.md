@@ -58,7 +58,8 @@ Offset  Size  Field
      8     8  blocksize     — bytes per block (must be > 0)
     16     8  section_size  — bytes per section (0 = whole file in one pass)
     24     8  start_offset  — resume offset in bytes (0 for a fresh run;
-                              always a multiple of section_size)
+                              a multiple of section_size when section_size
+                              > 0, unrounded when section_size = 0)
     32     8  filename_len  — byte length of the remote filename
     40     8  hashname_len  — byte length of the hash algorithm name
     48     1  mode          — bit 0: 0 = push, 1 = pull
@@ -72,6 +73,15 @@ Immediately following the header, without padding:
 
 - `filename_len` bytes: UTF-8 encoded remote filename
 - `hashname_len` bytes: ASCII encoded hash algorithm name (e.g. `sha256`)
+
+When `-B`/`--block-count` caps the transfer, the client ships the capped
+value in `size` — `min(real_local_size, start_offset + block_count ×
+blocksize)` — and sets the ALLOW_TRUNCATE bit regardless of
+`--allow-truncate`: the server's size check compares the destination against
+the wire-side `size`, which the cap has shrunk, so it would otherwise refuse
+spuriously.  The client's own check remains authoritative (it sees the real
+local size and the requested limit) and still enforces the
+destination-smaller rule for `-B` runs.
 
 ### 3.2 Sanity check (server → client, then client → server)
 
@@ -202,11 +212,18 @@ The server's stdin read returns EOF and it exits normally.
 
 ## 6. Resume
 
-If a transfer is interrupted, the client prints:
+If a transfer is interrupted after at least one section completed, the
+client prints a full copy-pasteable resume command (rebuilt from its own
+argv by `build_resume_cmd()`), ending in `-r <last_section_start>`:
 
 ```
-connection lost — retry with: --resume-from <last_section_start>
+Connection lost - Resume with:
+  bscp ... -r 8G SRC DST
 ```
+
+If no section completed, the resume offset still equals the run's start
+offset, so only a bare `Connection lost` / `Interrupted` line is printed —
+re-running the original command is equivalent.
 
 Restarting with `--resume-from N` sets `start_offset = N` (rounded down
 to the nearest section boundary).  Both sides skip directly to that offset.
@@ -228,10 +245,13 @@ is simultaneously unable to read more offsets from stdin because it is blocked
 on the stdout write.  The windowed approach ensures that for each batch, the
 client is actively draining stdout before sending the next batch.
 
-**Why no threading?**  Sections provide sufficient memory bounds without
-requiring concurrent file I/O or message framing on either side.  The protocol
-is strictly sequential within each section, making it easy to reason about
+**Why no protocol-level concurrency?**  Sections provide sufficient memory
+bounds without requiring message framing on either side.  The protocol is
+strictly sequential within each section, making it easy to reason about
 correctness and to implement in a self-contained embedded script.
+(`--hash-threads` does not change this: either end may fan block *hashing*
+across a thread pool, but reads stay sequential and digests reach the wire
+in block order — nothing about parallelism crosses the wire.)
 
 **Why embed the server script?**  Embedding eliminates the need to install or
 update any software on the remote host.  The client and server are always the

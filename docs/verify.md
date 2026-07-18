@@ -20,7 +20,7 @@ are:
 
 A genuine post-copy check therefore needs a *fresh read* of the destination
 with an *independent* algorithm.  Rather than extend the wire protocol (and
-the four remote implementations) to carry a second hash phase, `--verify`
+the three remote implementations) to carry a second hash phase, `--verify`
 shells out to `b3sum`:
 
 - **Independent.** BLAKE3 is unrelated to the `sha*`/`md5` block-comparison

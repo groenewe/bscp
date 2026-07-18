@@ -867,7 +867,7 @@ def build_resume_cmd(argv0, args, src, dst, offset, block_count=None):
 
 def ssh_base(args):
     # The ssh flags shared by the bscp remote wrapper (build_ssh_cmd) and the
-    # --verify external-hash invocation (external_hash_remote): compression,
+    # --verify external-hash invocation (b3sum_remote_cmd): compression,
     # port, identity, the user's -o options, and the keepalive failsafe.
     # Returns the flag list only — no host, no remote command.
     #

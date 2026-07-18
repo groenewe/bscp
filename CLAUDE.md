@@ -179,7 +179,7 @@ bscp (single file)
 │                        it at all (see the `progressed()` gate below).
 ├── ssh_base()         — builds the shared ssh flag list (compress, port,
 │                        identity, user `-o`, keepalive).  Used by both
-│                        build_ssh_cmd() and external_hash_remote() so the
+│                        build_ssh_cmd() and b3sum_remote_cmd() so the
 │                        --verify cross-check reaches the remote over the same
 │                        connection options as the transfer.
 ├── build_ssh_cmd()    — assembles the ssh argv list from ssh_args dict.
@@ -373,12 +373,14 @@ See `PROTOCOL.md` for the full wire-format spec.  Short version:
 
 ### Critical: keep client and remote constants in sync
 
-`HEADER_FMT`, `MODE_PUSH`, `MODE_PULL`, `PUSH_PULL_MASK`, and
-`ALLOW_TRUNCATE` are defined in the client module **and** inside **both**
-remote Python strings (`remote_script` and `remote_script_mt`) **and** the
-`remote_perl` string.  Any protocol change must be made in **all four**
-places.  The `PULL_WINDOW` constant lives only in the client — the server is
-stateless with respect to window size.
+`HEADER_FMT`, `MODE_PUSH`, `MODE_PULL`, and `ALLOW_TRUNCATE` are defined in
+the client module **and** inside **both** remote Python strings
+(`remote_script` and `remote_script_mt`) **and** the `remote_perl` string.
+`PUSH_PULL_MASK` lives only in the three remote bodies — the client composes
+the mode byte (`mode | ALLOW_TRUNCATE`) and never needs to split it.  Any
+protocol change must be made in **all four** places.  The `PULL_WINDOW`
+constant lives only in the client — the server is stateless with respect to
+window size.
 
 ## Protocol invariants to preserve
 
@@ -463,6 +465,7 @@ to cover, plus a few that were easy to forget:
 | `-B` pull within dst size needs no truncate flag | -B does not spuriously trip the truncate check    |
 | `-B` beyond dst size still requires `--truncate` | -B and --allow-truncate stay independent          |
 | `-B` overshoot prints warning, exits 0           | calculated size > actual source warns, syncs rest |
+| `-B` overshoot + smaller dst exits without hang  | wire-side truncate bit + client refusal must not deadlock `proc.wait()` |
 | exit 2 for remote-to-remote (both HOST:path)     | argparse path: only one side may carry `HOST:`    |
 | local-to-local copy (no ssh)                     | neither side HOST:path → remote body as local subprocess; dst == src |
 | local-to-local `--verify` (both b3sum local)     | b3sum_remote_cmd → local b3sum; digests match, exit 0 |
@@ -472,6 +475,7 @@ to cover, plus a few that were easy to forget:
 | reject unknown / zero-digest `-a` algorithm      | `parse_algorithm` guard: exit 2, names the algo   |
 | connection failure engages retries, exits 3 | handshake-stage conn loss → `ConnectionLost`, not fatal exit 1; no redundant `-r 0` printed when no section completed |
 | `format_size` + `parse_size` unit tests          | display 4-digit cap rule + lossless round-trip    |
+| `resolve_hash_threads` clamps `-T N` to cores    | explicit N clamped to core count; auto = min(cores, CAP) |
 | `--verify` push, matching b3sum                  | local+remote b3sum run, compared, "verify OK"     |
 | `--verify` detects a mismatch, exits 4           | divergent digests → "VERIFY FAILED", exit 4       |
 | `--verify` skips gracefully when b3sum missing   | absent/failing b3sum warns, exit stays 0          |
