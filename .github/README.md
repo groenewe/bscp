@@ -342,7 +342,7 @@ extent and makes the region readable again.
 # the live source.  Each bad block prints a one-line warning with its offset.
 bscp --ignore-read-errors root@server:/dev/sda /tank/backups/server-sda.img
 # then confirm the repair held:
-bscp --verify root@server:/dev/sda /tank/backups/server-sda.img
+bscp --dry-run --verify root@server:/dev/sda /tank/backups/server-sda.img
 ```
 
 It is a recovery tool for a handful of bad blocks, not a substitute for
