@@ -96,6 +96,11 @@ MIN_MEMORY_PUSH    = 64 * DEFAULT_BLOCK
 DD_TARGET_IBS = 1 << 20   # 1 MiB
 DD_MIN_IBS    = 1 << 12   # 4 KiB
 
+# Alphabet verify_digest() uses to recognise a digest token amid PTY-merged
+# remote stderr.  Kept explicit rather than str.isalnum()/int(tok, 16) so a
+# leading sign, underscores, or a stray unicode digit cannot pass.
+HEXDIGITS = '0123456789abcdefABCDEF'
+
 # Hashing is single-core-bound on fast (NVMe) storage.  --hash-threads fans
 # the per-block hashing across a thread pool on both client and remote;
 # hashlib releases the GIL for blocks >= 2048 bytes, so threads give true
@@ -1161,10 +1166,46 @@ def build_ssh_cmd(remote_host, args):
 def verify_digest(output):
     # External hashers (b3sum, sha256sum, md5sum, b2sum, ...) print
     # "<hexdigest>  <path>".  The path differs between the local file and the
-    # remote one, so compare only the leading digest token.  Returns '' for
-    # empty output.
-    out = output.strip()
-    return out.split()[0] if out else ''
+    # remote one, so compare only the digest token.  Returns '' when no token
+    # in the output looks like a digest (collect_hash turns that into a skip).
+    #
+    # NOT simply output.split()[0]: the remote side runs under `ssh -tt`, whose
+    # PTY MERGES the remote's stderr into stdout, so any shell-startup noise on
+    # the remote (an rc-file echo, a locale warning, "mesg: ttyname failed")
+    # arrives ahead of the digest line.  Taking the first token blindly would
+    # then compare that noise against the local digest and report a false
+    # VERIFY FAILED, so scan for the first token that is actually digest-shaped
+    # and ignore whatever precedes it.  The path field follows the digest, so
+    # the first match is always the digest even when the path is itself hex.
+    for tok in output.split():
+        if len(tok) >= 32 and len(tok) % 2 == 0 and all(c in HEXDIGITS for c in tok):
+            return tok.lower()
+    return ''
+
+
+def hash_error(returncode, out, err):
+    # Render why an external hash process failed, for the --verify report.
+    #
+    # Both streams are needed, and that is the whole point: the remote runs
+    # under `ssh -tt`, and its PTY merges the remote's stderr into STDOUT.  The
+    # local `err` pipe then carries only ssh's own chatter ("Connection to HOST
+    # closed."), while the actual cause — "b3sum: command not found", "No such
+    # file or directory", "Killed" — lands in `out`.  Reading err alone (or
+    # dropping the text entirely) leaves a failure undiagnosable, which is
+    # exactly how a working b3sum can look "unavailable".
+    lines = []
+    for buf in (out, err):
+        text = (buf or b'').decode('utf-8', 'replace')
+        for line in text.replace('\r', '\n').split('\n'):
+            line = line.strip()
+            # ssh -tt always prints this on a PTY session; it says nothing
+            # about the failure, so keep it only if there is nothing else.
+            if line and not line.startswith('Connection to '):
+                lines.append(line)
+    detail = '; '.join(lines[:3])
+    if len(detail) > 200:
+        detail = detail[:197] + '...'
+    return 'exit %d%s' % (returncode, ': ' + detail if detail else '')
 
 
 def dd_hash_params(n):
@@ -1264,12 +1305,22 @@ def spawn_hash(cmd, stdin=None):
 
 def collect_hash(proc):
     # Wait for a spawn_hash() process and return (digest, error_text).  digest
-    # is None on any nonzero exit (missing/failing b3sum, unreadable device),
-    # in which case error_text carries the captured stderr for reporting.
+    # is None when no usable digest came back — a nonzero exit (missing/failing
+    # b3sum, unreadable device) or a clean exit whose output holds no
+    # digest-shaped token.  error_text then carries both streams (see
+    # hash_error) so the caller can say WHY.
+    #
+    # The exit-0-but-no-digest case is deliberately a failure, not an empty
+    # digest: an empty string would compare unequal to the other side and be
+    # reported as a VERIFY FAILED mismatch, which is a lie — nothing was
+    # actually hashed.  A skip is the honest outcome.
     out, err = proc.communicate()
     if proc.returncode != 0:
-        return None, err.decode('utf-8', 'replace').strip()
-    return verify_digest(out.decode('utf-8', 'replace')), ''
+        return None, hash_error(proc.returncode, out, err)
+    digest = verify_digest(out.decode('utf-8', 'replace'))
+    if not digest:
+        return None, hash_error(proc.returncode, out, err) + ' (no digest in output)'
+    return digest, ''
 
 
 def device_size(path):
@@ -2405,8 +2456,16 @@ if __name__ == '__main__':
             # the report shows how each side's b3sum was actually invoked.
             local_hash = remote_hash = None
             lerr = 'not found' if lp is None else ''
+            rerr = ''
             local_done  = lp is None
             remote_done = rp is None
+            if rp is None:
+                # The ssh (or, local-to-local, the b3sum) never started; the
+                # loop below would never report it, so say so here — same
+                # wording as the in-loop failure path.
+                rerr = 'could not start the remote hash command'
+                report('\rverify: remote b3sum failed on %s (%s)\n'
+                       % (remote_host or remote_file, rerr))
             try:
                 oldmsg = ''
                 # The final summary line above ended in '\n', so report() already
@@ -2427,9 +2486,18 @@ if __name__ == '__main__':
                         report('\rverify: local  %s = %s\n' % (hash_desc(local_file, local_ddp), local_hash))
                     if not remote_done and rp.poll() is not None:
                         remote_done = True
-                        remote_hash, _ = collect_hash(rp)
+                        remote_hash, rerr = collect_hash(rp)
                         if remote_hash is not None:
                             report('\rverify: remote %s = %s\n' % (hash_desc(remote_file, remote_ddp), remote_hash))
+                        else:
+                            # Report the failure the MOMENT it happens, not
+                            # after the loop.  The loop keeps running until the
+                            # local side finishes, so an early remote failure
+                            # would otherwise surface only once the local hash
+                            # completes — making a remote that died in seconds
+                            # look like one that hashed for the whole run.
+                            report('\rverify: remote b3sum failed on %s (%s)\n'
+                                   % (remote_host or remote_file, rerr))
                     if local_done and remote_done:
                         break
                     if verify_progress:

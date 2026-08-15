@@ -69,8 +69,35 @@ In `__main__`, after a successful copy:
    summary resets `quiet=False`, which must not un-silence it); all
    progress/outcome lines are `\r`-prefixed so each overwrites the live line.
 3. If the local hash fails, the remote process is killed rather than waited
-   on.  `verify_digest()` takes the leading hex token of each result (the
-   path field differs between the two sides, so only the digest is compared).
+   on.  `verify_digest()` picks the first **digest-shaped** token of each
+   result — an even-length run of at least 32 hex characters — because the
+   path field differs between the two sides, so only the digest is compared.
+   It scans for that token rather than taking `split()[0]`: the remote runs
+   under `ssh -tt`, whose PTY merges the remote's stderr into **stdout**, so
+   remote shell-startup noise (an rc-file `echo`, `mesg: ttyname failed`, a
+   `setlocale` warning) arrives *ahead* of the digest line.  Taking the first
+   token blindly compared that noise against the local digest and reported a
+   **false `VERIFY FAILED` (exit 4) on two identical files**.  The path
+   follows the digest, so the first match is the digest even when the path
+   itself looks hex.
+
+   The same PTY merge governs failure reporting.  `hash_error()` renders the
+   cause from **both** streams, because on a failure the useful text
+   (`b3sum: command not found`, `No such file or directory`, `Killed`) is on
+   stdout while the local `err` pipe holds only ssh's own `Connection to HOST
+   closed.` — which is filtered out unless it is all there is.  Reading
+   `err` alone left every remote failure as a bare "remote b3sum unavailable"
+   with no cause, the classic symptom being a remote where `b3sum` exists but
+   is not on the non-interactive `PATH`.  A clean exit whose output holds no
+   digest is likewise a **skip, not a mismatch**: an empty digest would
+   compare unequal and be reported as `VERIFY FAILED`, which would be a lie —
+   nothing was hashed.
+
+   A remote failure is printed *the moment it is collected*, not after the
+   loop.  The poll loop keeps running until the local side also finishes, so
+   a remote that died in seconds otherwise surfaced only once the local hash
+   completed — making the elapsed time look like the remote had been hashing
+   all along.
 4. The remote runs over the same `ssh_base()` options as the transfer,
    **including the `ServerAliveInterval=15` keepalive** — essential here,
    because `b3sum` can run for minutes with no channel data, and the
@@ -84,8 +111,8 @@ In `__main__`, after a successful copy:
    until the final digest line, so it never trips `SIGPIPE` either.  A
    controlling terminal closes that gap — the remote `b3sum` is `SIGHUP`'d
    when the channel's PTY is hung up, even over a persistent master.  (The
-   PTY merges remote stderr into stdout and adds CRs; `verify_digest()` reads
-   the leading hex token, so the digest parse is unaffected.)
+   PTY merges remote stderr into stdout and adds CRs — see step 3 for what
+   `verify_digest()` and `hash_error()` do about that.)
 5. Each digest is printed as soon as its side finishes (step 2); once both
    are in they are compared **only when the comparison is meaningful** (see
    the gate below), and the verdict (`verify OK` / `VERIFY FAILED`) is printed.

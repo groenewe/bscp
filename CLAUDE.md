@@ -248,9 +248,25 @@ bscp (single file)
 │                        command — no ssh); spawn_hash() starts
 │   / device_size()      each as a Popen so __main__ runs both CONCURRENTLY
 │   / dd_hash_params()   (wall-clock = slower side, not the sum); collect_hash()
-│   / hash_desc()        waits one and returns its digest.  verify_digest()
-│                        extracts the leading hex token (paths differ between
-│                        sides, so only the digest is compared).  --verify only
+│   / hash_desc()        waits one and returns (digest, error_text).
+│   / hash_error()       verify_digest() scans for the first digest-shaped
+│                        token — even-length, >= 32 hex chars — NOT split()[0]:
+│                        the remote's `ssh -tt` PTY merges its stderr into
+│                        stdout, so remote shell noise precedes the digest and a
+│                        blind first token made two IDENTICAL files report a
+│                        false VERIFY FAILED.  Same merge is why hash_error()
+│                        renders a failure from BOTH streams — the cause is on
+│                        stdout, while stderr holds only ssh's "Connection to
+│                        HOST closed." (filtered unless it is all there is).
+│                        Reading stderr alone left every remote failure as a
+│                        bare "remote b3sum unavailable" with no cause.  A clean
+│                        exit whose output holds no digest is a SKIP, not an
+│                        empty digest that would be reported as a mismatch.  A
+│                        remote failure is printed the moment it is collected,
+│                        not after the poll loop — the loop runs on until the
+│                        local side finishes, so an early remote death otherwise
+│                        surfaced with the local side's elapsed time.
+│                        --verify only
 │                        compares the bytes bscp copied — the prefix
 │                        [0, sync_size) — so EVERY side larger than that prefix
 │                        is dd-limited down to it (a size mismatch → the one
@@ -524,7 +540,8 @@ to cover, plus a few that were easy to forget:
 | `resolve_hash_threads` clamps `-T N` to cores    | explicit N clamped to core count; auto = min(cores, CAP) |
 | `--verify` push, matching b3sum                  | local+remote b3sum run, compared, "verify OK"     |
 | `--verify` detects a mismatch, exits 4           | divergent digests → "VERIFY FAILED", exit 4       |
-| `--verify` skips gracefully when b3sum missing   | absent/failing b3sum warns, exit stays 0          |
+| `--verify` skips gracefully when b3sum missing   | absent/failing b3sum warns (naming the exit status), exit stays 0 |
+| verify digest parse survives PTY-merged stderr   | `ssh -tt` merges remote stderr into stdout: noise before the digest must not read as a false mismatch; a failure must report the stdout cause, not ssh's "Connection closed"; exit 0 with no digest is a skip |
 | `--verify` compares common prefix on size mismatch | `--allow-truncate` smaller dst → dd-limit larger side, handshake note, "verify OK ... over the first N" |
 | `--verify` under `-N` runs when scan finds 0 diffs | dry-run + identical → b3sum confirms, "verify OK"  |
 | `--verify` under `-N` skips when diffs pending   | dry-run + diffs → skipped, destination untouched  |

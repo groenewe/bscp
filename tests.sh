@@ -399,7 +399,10 @@ test_verify_skips_when_b3sum_unusable() {
     rm -rf "$bad"
     cmp -s "$SRC" "$DST" || return 1
     (( rc == 0 )) || return 1
-    grep -q 'verify: skipped' <<<"$out"
+    # The message must name the exit status; a bare "skipped" with no cause is
+    # what made a working b3sum look mysteriously unavailable.
+    grep -q 'verify: skipped' <<<"$out" &&
+        grep -q 'exit 7' <<<"$out"
 }
 
 # Whole-device hashes legitimately differ when the destination is smaller, but
@@ -742,6 +745,81 @@ if errs:
 PY
 }
 
+# The --verify remote hash runs under `ssh -tt`, whose PTY MERGES the remote's
+# stderr into stdout.  Two consequences the parsing must survive:
+#   * remote shell noise (rc-file echo, "mesg: ttyname failed", locale warning)
+#     precedes the digest on stdout -- taking the first token blindly compared
+#     that noise and reported a FALSE "VERIFY FAILED" (exit 4) on identical
+#     files, so verify_digest() must find the digest-shaped token instead;
+#   * the reason a remote hash failed also lands on stdout, not stderr, so
+#     collect_hash() must report BOTH streams or the failure reads as a bare
+#     "remote b3sum unavailable" with no cause.
+# Also: a clean exit with no digest in the output is a skip, not a mismatch.
+test_verify_digest_capture_unit_tests() {
+    local mod_src=$BSCP
+    if ! head -1 "$BSCP" 2>/dev/null | grep -q '^#!.*python'; then
+        mod_src="$SCRIPT_DIR/bscp"
+    fi
+    cp "$mod_src" "$WORK/bscp_mod.py"
+    PYTHONPATH="$WORK" python3 - <<'PY'
+import bscp_mod as m
+if not hasattr(m, 'hash_error'):
+    raise SystemExit(0)            # python2 client: no --verify
+D = 'a311fa2ce3e4f1c1925dfa8ed3b348faab7cb3fcf532263a375ab8158423b402'
+errs = []
+
+# verify_digest: plain, PTY CRs, and noise ahead of the digest line.
+for out, exp in [
+    ('%s  /tmp/dst.img\n' % D,                                  D),
+    ('%s  /tmp/dst.img\r\n' % D,                                D),
+    ('mesg: ttyname failed\r\n%s  /tmp/dst.img\r\n' % D,        D),
+    ('bash: warning: setlocale: LC_ALL\n%s  /dev/sdb\n' % D,    D),
+    ('%s  /tmp/deadbeefcafe\n' % D.upper(),                     D),
+    ('',                                                        ''),
+    ('bash: line 1: b3sum: command not found\r\n',              ''),
+]:
+    got = m.verify_digest(out)
+    if got != exp:
+        errs.append('verify_digest(%r) = %r, expected %r' % (out, got, exp))
+
+class P(object):
+    def __init__(self, rc, out, err):
+        self.returncode, self._o, self._e = rc, out, err
+    def communicate(self):
+        return self._o, self._e
+
+# Nonzero exit: the cause is on stdout under -tt; ssh's own "Connection to ..."
+# chatter on stderr must not be what gets reported.
+h, e = m.collect_hash(P(127, b'bash: line 1: b3sum: command not found\r\n',
+                           b'Connection to host closed.\r\n'))
+if h is not None:
+    errs.append('collect_hash(rc=127) returned a digest %r' % (h,))
+if 'command not found' not in e or 'exit 127' not in e:
+    errs.append('collect_hash(rc=127) error %r lacks the stdout cause' % (e,))
+if 'Connection to' in e:
+    errs.append('collect_hash kept ssh chatter: %r' % (e,))
+
+# Nothing but ssh chatter: still name the exit status rather than say nothing.
+h, e = m.collect_hash(P(255, b'', b'Connection to host closed.\r\n'))
+if h is not None or 'exit 255' not in e:
+    errs.append('collect_hash(rc=255) = (%r, %r)' % (h, e))
+
+# Exit 0 with no digest is a SKIP, not an empty digest that would compare
+# unequal and be reported as a mismatch.
+h, e = m.collect_hash(P(0, b'hello there\r\n', b''))
+if h is not None or 'no digest' not in e:
+    errs.append('collect_hash(rc=0, no digest) = (%r, %r)' % (h, e))
+
+h, e = m.collect_hash(P(0, ('%s  /tmp/dst.img\r\n' % D).encode(), b''))
+if (h, e) != (D, ''):
+    errs.append('collect_hash(good) = (%r, %r)' % (h, e))
+
+if errs:
+    print('\n'.join(errs))
+    raise SystemExit(1)
+PY
+}
+
 # Shim for the two read-only-destination tests below.  RO_MODE=ioctl fakes a
 # BLKROGET answer of 1 (what `losetup -r` gives) on RO_PATH; RO_MODE=write lets
 # the device look writable and fails every write() with EPERM, which is what a
@@ -969,6 +1047,7 @@ run "reject unknown / zero-digest -a algorithm"      test_reject_bad_algorithm
 run "connection failure engages retries, exits 3"    test_conn_failure_retries_exit3
 run "format_size + parse_size unit tests"            test_format_size_unit_tests
 run "resolve_hash_threads clamps -T N to cores"      test_hash_threads_clamped_to_cores
+run "verify digest parse survives PTY-merged stderr" test_verify_digest_capture_unit_tests
 
 echo
 echo "$PASSED passed, $FAILED failed, $SKIPPED skipped"
