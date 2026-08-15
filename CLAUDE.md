@@ -100,7 +100,14 @@ bscp (single file)
 │                        and a failing phase-B write or per-section flush
 │                        reports offset+errno on stderr and leaves via
 │                        os._exit (exit 3).  Same in remote_script_mt and
-│                        remote_perl.  See docs/remote-execution.md.
+│                        remote_perl.  All three also ignore SIGINT: in a
+│                        local-to-local copy the body shares the client's
+│                        process group, so a terminal Ctrl+C would otherwise
+│                        raise KeyboardInterrupt out of a blocking read and
+│                        print a traceback (hex payload included) over the
+│                        client's own Interrupted message.  Shutdown stays
+│                        client-driven (stdin close → EOF).
+│                        See docs/remote-execution.md.
 ├── remote_script_mt   — python3-only multi-threaded twin of remote_script.
 │                        Phase-A hashing fans out over a ThreadPoolExecutor
 │                        (reads stay sequential; only hashing parallelises).
@@ -495,6 +502,7 @@ to cover, plus a few that were easy to forget:
 | `--ignore-read-errors` pull repairs bad block    | LD_PRELOAD EIO shim: fatal without flag; with flag pull overwrites the unreadable local block, warns, exits 0, dst == src |
 | read-only destination refused before scan        | LD_PRELOAD fakes BLKROGET=1: push exits 1 before writing anything, `-N` still scans (DRY_RUN bit) |
 | remote write failure is fatal, not retried       | LD_PRELOAD EPERM on write: remote names the offset, exits 3; client exits 1 without engaging `--retries` |
+| Ctrl+C on a local copy prints no traceback       | SIGINT to the whole process group: destination side ignores it, exit 130 + resume line, no KeyboardInterrupt spew |
 | `--allow-truncate` push (smaller dst)            | both refusal-without-flag and warning-with-flag   |
 | `--allow-truncate` pull (smaller dst)            | symmetric pull behaviour                          |
 | `--batch` is silent on success and exits 0       | no stderr leakage; exit-code-only contract        |
@@ -544,15 +552,15 @@ them on exit.  Exit status is `0` on success, `1` if any test failed (with
 the failing names listed at the end), or `2` on missing prerequisites.
 
 When `$BSCP` runs under a Python 2 interpreter (detected from its shebang
-plus `python -V`), twenty-two tests are skipped by default and reported as
+plus `python -V`), twenty-three tests are skipped by default and reported as
 `skip`: the two `--hash-threads` tests (the option is python3-only), the
 `-a` algorithm-rejection test (Py2's `hashlib` lacks the `shake_*` XOF
 functions it probes), the twelve `--verify` tests (the convenience b3sum
 cross-check is not implemented in the python2 client, so the flag is
 unrecognised), the `--ignore-read-errors` test (the flag is python3-only
-for now), the two read-only-destination tests and the two local-to-local
-tests (all four run local-to-local, which is python3-client only; the
-python2 fallback client still rejects a no-HOST invocation), and the two
+for now), the two read-only-destination tests, the Ctrl+C test and the two
+local-to-local tests (all five run local-to-local, which is python3-client
+only; the python2 fallback client still rejects a no-HOST invocation), and the two
 `-v`/`--check-tools` tests (those flags are python3-client only).  The
 `exit 2 for remote-to-remote` test runs under both clients.  The two
 `BSCP_OPTIONS` tests run under the python2 client too (it now honours the

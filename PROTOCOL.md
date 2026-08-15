@@ -216,7 +216,10 @@ the full window before responding.
 ## 5. Termination
 
 After the section loop completes, the client closes the SSH stdin pipe.
-The server's stdin read returns EOF and it exits normally.
+The server's stdin read returns EOF and it exits normally.  The same close
+is what ends an aborted transfer, so shutdown is always client-driven: the
+server ignores `SIGINT` (it would otherwise be interrupted directly in a
+local-to-local copy, where it shares the client's process group).
 
 ### 5.1 Server exit status
 

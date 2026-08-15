@@ -289,6 +289,24 @@ A same-physical-disk guard (`warn_same_disk()` / `backing_disk()`) warns —
 best-effort, Linux only — when `SRC` and `DST` resolve to one backing disk, so
 the operator is aware of the read/write head contention before a slow copy.
 
+### Ctrl+C in local mode
+
+One thing the local subprocess does *not* share with an ssh remote: signals.
+It is an ordinary child in the client's process group, so a terminal Ctrl+C is
+delivered to it as well as to the client (an ssh remote never sees the signal
+— the ssh client absorbs it and the channel simply closes).  Left to the
+default disposition, the destination side would abort its blocking `rd()` with
+an unhandled `KeyboardInterrupt` and print a traceback — which, because the
+body is run as `python3 -c "exec(bytes.fromhex('...'))"`, includes the entire
+hex payload — right across the client's own `Interrupted - Resume with:`
+message.
+
+All three bodies therefore ignore `SIGINT` (`signal.SIG_IGN`; Perl:
+`$SIG{INT} = 'IGNORE'`) as their first act.  Shutdown stays client-driven:
+the client's `_shutdown_proc()` closes stdin, the destination side reads EOF
+and exits, and `proc.wait()` returns as before.  This costs nothing on the ssh
+path, where the signal never arrives in the first place.
+
 When editing `remote_perl`, remember the file is read by Python first:
 backslashes that need to reach Perl (e.g. `\n`, `\&`, `\z` in regex)
 must be doubled (`\\n`, `\\&`, `\\z`) in the Python triple-quoted string

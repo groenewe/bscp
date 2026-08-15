@@ -15,14 +15,14 @@
 #   ./tests.sh --force-all          # run every test even under a python2 client
 #
 # When $BSCP runs under a Python 2 interpreter (e.g. bscp.python2 where
-# `python` resolves to Python 2.x), twenty-two tests are skipped by default:
+# `python` resolves to Python 2.x), twenty-three tests are skipped by default:
 # the two --hash-threads tests (the option is python3-only by design), the
 # -a algorithm-rejection test (Py2's hashlib lacks the shake_* XOF functions
 # the test probes), the twelve --verify tests (the convenience b3sum
 # cross-check is not implemented in the python2 client), the
 # --ignore-read-errors test (the flag is python3-only for now), the two
-# read-only-destination tests and the two local-to-local tests (both rely on
-# local-to-local mode, which is python3-client only), and the two
+# read-only-destination tests, the Ctrl+C test and the two local-to-local
+# tests (all rely on local-to-local mode, which is python3-client only), and the two
 # -v/--check-tools tests (those flags are python3-client only).  The
 # BSCP_OPTIONS tests now run under python2 (the env var is honoured there
 # too).  Pass --force-all to run the skipped tests anyway.
@@ -61,6 +61,7 @@ test_verify_batch_mismatch_exit4 test_verify_batch_size_mismatch_ok test_verify_
 test_verify_blockcount_compares test_verify_batch_blockcount_ok \
 test_verify_dryrun_blockcount_no_warning test_ignore_read_errors_pull \
 test_readonly_destination_refused test_remote_write_error_not_retried \
+test_local_interrupt_is_quiet \
 test_local_to_local test_local_to_local_verify \
 test_verbose_reports_tools test_check_tools_no_copy"
 
@@ -825,6 +826,38 @@ test_remote_write_error_not_retried() {
     return 0
 }
 
+# A local-to-local copy runs the destination-side body as an ordinary child of
+# the client, in the client's own process group — so a terminal Ctrl+C reaches
+# it directly (over ssh it never would).  It must ignore SIGINT and let the
+# client drive the shutdown by closing stdin, instead of aborting a blocking
+# read with an unhandled KeyboardInterrupt whose traceback prints the whole
+# hex-encoded payload over the client's own Interrupted message.
+test_local_interrupt_is_quiet() {
+    make_src 32
+    dd if=/dev/urandom of="$DST" bs=1M count=32 status=none   # every block differs
+    local out rc
+    out=$(python3 - "$BSCP" "$SRC" "$DST" <<'EOF' 2>&1
+import os, signal, subprocess, sys, time
+bscp, src, dst = sys.argv[1:4]
+p = subprocess.Popen([bscp, '-s', '8M', '--bwlimit', '4M', src, dst],
+                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                     start_new_session=True)
+time.sleep(1.5)
+os.killpg(os.getpgid(p.pid), signal.SIGINT)    # what a terminal Ctrl+C does
+sys.stdout.write(p.stdout.read().decode('utf-8', 'replace').replace('\r', '\n'))
+sys.exit(p.wait())
+EOF
+)
+    rc=$?
+    (( rc == 0 )) && return 0    # copy outran the signal on this machine
+    [[ $rc == 130 ]] || { echo "exit $rc (expected 130): $out"; return 1; }
+    grep -q 'Interrupted' <<<"$out" || { echo "no Interrupted line: $out"; return 1; }
+    if grep -qE 'Traceback|KeyboardInterrupt' <<<"$out"; then
+        echo "destination side spewed a traceback: $out"; return 1
+    fi
+    return 0
+}
+
 # --ignore-read-errors (experimental, pull only): a read error on the LOCAL
 # destination during the scan must NOT abort the pull — the unreadable block is
 # treated as a diff and overwritten from the (readable) remote source.  We
@@ -904,6 +937,7 @@ run "--allow-truncate pull (smaller dst)"            test_allow_truncate_pull
 run "--ignore-read-errors pull repairs bad block"    test_ignore_read_errors_pull
 run "read-only destination refused before scan"      test_readonly_destination_refused
 run "remote write failure is fatal, not retried"     test_remote_write_error_not_retried
+run "Ctrl+C on a local copy prints no traceback"     test_local_interrupt_is_quiet
 run "--batch is silent on success and exits 0"       test_batch_silent_success
 run "--block-count prints next-offset resume hint"   test_block_count_continue
 run "-B accepts K/M/G byte-size suffix"              test_block_count_size_suffix

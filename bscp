@@ -176,7 +176,18 @@ batch = False         # option --batch: suppress all stderr output, return only 
 # vim modeline at the end of the file renders the embedded tabs at width 4.
 remote_script = '''
 def _remote():
-	import hashlib, os, struct, sys
+	import hashlib, os, signal, struct, sys
+
+	# The client owns shutdown: it closes stdin, which lands here as EOF.  On a
+	# local-to-local copy this body runs in the client's own process group, so
+	# a terminal Ctrl+C is delivered to it directly and would otherwise abort a
+	# blocking read with an unhandled KeyboardInterrupt — printing a traceback
+	# (hex payload and all) over the client's own tidy Interrupted message.
+	# Over ssh the signal never reaches the remote at all.
+	try:
+		signal.signal(signal.SIGINT, signal.SIG_IGN)
+	except Exception:
+		pass
 
 	stdin  = getattr(sys.stdin,  'buffer', sys.stdin)
 	stdout = getattr(sys.stdout, 'buffer', sys.stdout)
@@ -351,9 +362,18 @@ def _remote():
 # places now — client, remote_script, remote_script_mt, and remote_perl.
 remote_script_mt = '''
 def _remote(nthreads):
-	import hashlib, os, struct, sys
+	import hashlib, os, signal, struct, sys
 	from collections import deque
 	from concurrent.futures import ThreadPoolExecutor
+
+	# See remote_script: the client drives shutdown by closing stdin, and a
+	# local-to-local copy puts this process in the client's process group,
+	# where a terminal Ctrl+C would otherwise raise KeyboardInterrupt out of a
+	# blocking read and spew a traceback across the client's own message.
+	try:
+		signal.signal(signal.SIGINT, signal.SIG_IGN)
+	except Exception:
+		pass
 
 	stdin  = sys.stdin.buffer
 	stdout = sys.stdout.buffer
@@ -525,6 +545,10 @@ remote_perl = '''
 use strict; use warnings;
 use IO::Handle;
 binmode STDIN; binmode STDOUT;
+
+# See remote_script: the client closes stdin to shut this side down, and on a
+# local-to-local copy a terminal Ctrl+C reaches this process directly.
+$SIG{INT} = 'IGNORE';
 
 my $HEADER_FMT     = 'Q< Q< Q< Q< Q< Q< C';
 my $HEADER_SIZE    = 49;
