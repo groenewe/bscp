@@ -28,7 +28,8 @@
 # Features: section-based processing to bound memory use, single-pass
 # scan+copy, optional multi-threaded block hashing on both ends
 # (--hash-threads; python3 only), windowed pull to avoid SSH pipe deadlock,
-# optional post-copy b3sum cross-check of both ends (--verify), resume on
+# optional post-copy b3sum cross-check of both ends (--verify), refusal of a
+# read-only destination block device before the scan starts, resume on
 # failure (byte offset or percentage of source), automatic retry
 # with exponential back-off, dry-run mode, and an experimental
 # --ignore-read-errors recovery mode (pull only) that overwrites unreadable
@@ -40,6 +41,7 @@
 from argparse import ArgumentParser, ArgumentTypeError
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+import fcntl
 import hashlib
 import math
 import os
@@ -57,6 +59,20 @@ HEADER_FMT  = '<QQQQQQB'
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 MODE_PUSH, MODE_PULL = 0, 1
 ALLOW_TRUNCATE = 2
+DRY_RUN        = 4
+
+# Exit statuses the remote body uses to say WHY it died, so a permanent
+# failure is not mistaken for a dropped connection (which would burn
+# --retries and exit 3).  ssh passes the remote status through unchanged;
+# 255 is ssh's own and 127 is the interpreter-probe wrapper's "no python
+# or perl on the remote".
+REMOTE_EXIT_WRITE_ERROR = 3
+REMOTE_EXIT_READONLY    = 4
+
+# Linux BLKROGET: reads the block device's read-only flag (1 = read-only).
+# Returns ENOTTY on anything that is not a block device, which is why no
+# S_ISBLK pre-check is needed before issuing it.
+BLKROGET = 0x125E
 
 # Number of diff-block requests sent per round-trip in pull phase B.
 # Larger = fewer round-trips; too large risks filling SSH stdout window before
@@ -160,7 +176,7 @@ batch = False         # option --batch: suppress all stderr output, return only 
 # vim modeline at the end of the file renders the embedded tabs at width 4.
 remote_script = '''
 def _remote():
-	import hashlib, os, struct, sys  # noqa: F401 (standalone on remote host)
+	import hashlib, os, struct, sys
 
 	stdin  = getattr(sys.stdin,  'buffer', sys.stdin)
 	stdout = getattr(sys.stdout, 'buffer', sys.stdout)
@@ -183,6 +199,7 @@ def _remote():
 	MODE_PUSH, MODE_PULL = 0, 1
 	PUSH_PULL_MASK = 1
 	ALLOW_TRUNCATE = 2
+	DRY_RUN        = 4
 
 	try:
 		data = rd(HEADER_SIZE)
@@ -191,6 +208,7 @@ def _remote():
 	(size, blocksize, section_size, start_offset,
 	 filename_len, hashname_len, mode) = struct.unpack(HEADER_FMT, data)
 	allow_truncate = mode & ALLOW_TRUNCATE
+	dry_run = mode & DRY_RUN
 	mode = mode & PUSH_PULL_MASK
 
 	try:
@@ -211,6 +229,37 @@ def _remote():
 		stdout.write(struct.pack('<Q', 0))
 		stdout.flush()
 		sys.exit(1)
+
+	# A Linux block device flagged read-only (losetup -r, blockdev --setro, a
+	# read-only dm/md target) still accepts open(O_RDWR) — every write then
+	# fails with EPERM.  Detect it up front: otherwise the failure only
+	# surfaces at the first block write, where a dead remote is
+	# indistinguishable from a dropped connection and the client retries a
+	# permanent error.  BLKROGET is ENOTTY on anything but a block device.
+	def ro_device(fd):
+		try:
+			import fcntl
+			if os.uname()[0] != 'Linux':
+				return 0
+			return struct.unpack('i', fcntl.ioctl(fd, 0x125E, struct.pack('i', 0)))[0]
+		except Exception:
+			return 0
+
+	# Exit 4 = read-only destination, exit 3 = write failure; the client maps
+	# both to a fatal error instead of a retryable connection loss.  A write
+	# failure has to leave via os._exit: a normal exit would re-raise the very
+	# same error out of the file object's close-time flush, burying the status
+	# under a traceback.
+	def die(status):
+		sys.stderr.flush()
+		os._exit(status)
+
+	if mode == MODE_PUSH and not dry_run and ro_device(fobj.fileno()):
+		sys.stderr.write('bscp-remote: ' + filename +
+			' is a read-only block device (BLKROGET); refusing to write\\n')
+		stdout.write(struct.pack('<Q', 0))
+		stdout.flush()
+		die(4)
 
 	with fobj as f:
 		f.seek(0, 2)
@@ -254,8 +303,22 @@ def _remote():
 					for _ in range(count):
 						(wpos,) = struct.unpack('<Q', rd(8))
 						bl = min(blocksize, sync_size - wpos)
-						f.seek(wpos)
-						f.write(rd(bl))
+						blk = rd(bl)
+						try:
+							f.seek(wpos)
+							f.write(blk)
+						except (IOError, OSError) as e:
+							sys.stderr.write('bscp-remote: write failed at offset ' +
+								str(wpos) + ': ' + str(e) + '\\n')
+							die(3)
+					# Blocks smaller than the buffer would otherwise sit in
+					# Python's writer until close(), where the error escapes
+					# this handler entirely (and, under --batch, silently).
+					try:
+						f.flush()
+					except (IOError, OSError) as e:
+						sys.stderr.write('bscp-remote: flush failed: ' + str(e) + '\\n')
+						die(3)
 				else:
 					for _ in range(count):
 						(rpos,) = struct.unpack('<Q', rd(8))
@@ -309,6 +372,7 @@ def _remote(nthreads):
 	MODE_PUSH, MODE_PULL = 0, 1
 	PUSH_PULL_MASK = 1
 	ALLOW_TRUNCATE = 2
+	DRY_RUN        = 4
 	HASH_THREADS_CAP = 4
 
 	# Resolve against THIS host's cores (mirrors the client's
@@ -328,6 +392,7 @@ def _remote(nthreads):
 	(size, blocksize, section_size, start_offset,
 	 filename_len, hashname_len, mode) = struct.unpack(HEADER_FMT, data)
 	allow_truncate = mode & ALLOW_TRUNCATE
+	dry_run = mode & DRY_RUN
 	mode = mode & PUSH_PULL_MASK
 
 	try:
@@ -347,6 +412,31 @@ def _remote(nthreads):
 		stdout.write(struct.pack("<Q", 0))
 		stdout.flush()
 		sys.exit(1)
+
+	# See remote_script: a read-only block device (losetup -r, blockdev
+	# --setro, read-only dm/md) opens fine for writing and fails every
+	# write with EPERM.  Refuse before the scan so the client gets a
+	# permanent error instead of a retryable-looking dead pipe.
+	def ro_device(fd):
+		try:
+			import fcntl
+			if os.uname()[0] != "Linux":
+				return 0
+			return struct.unpack("i", fcntl.ioctl(fd, 0x125E, struct.pack("i", 0)))[0]
+		except Exception:
+			return 0
+
+	# os._exit, not sys.exit: see remote_script's die().
+	def die(status):
+		sys.stderr.flush()
+		os._exit(status)
+
+	if mode == MODE_PUSH and not dry_run and ro_device(fobj.fileno()):
+		sys.stderr.write("bscp-remote: " + filename +
+			" is a read-only block device (BLKROGET); refusing to write\\n")
+		stdout.write(struct.pack("<Q", 0))
+		stdout.flush()
+		die(4)
 
 	def hashfn(block):
 		return hashlib.new(hashname, block).digest()
@@ -397,8 +487,21 @@ def _remote(nthreads):
 					for _ in range(count):
 						(wpos,) = struct.unpack("<Q", rd(8))
 						bl = min(blocksize, sync_size - wpos)
-						f.seek(wpos)
-						f.write(rd(bl))
+						blk = rd(bl)
+						try:
+							f.seek(wpos)
+							f.write(blk)
+						except OSError as e:
+							sys.stderr.write("bscp-remote: write failed at offset %d: %s\\n"
+								% (wpos, e))
+							die(3)
+					# Small blocks would otherwise linger in the writer until
+					# close(), past this handler (and silent under --batch).
+					try:
+						f.flush()
+					except OSError as e:
+						sys.stderr.write("bscp-remote: flush failed: %s\\n" % e)
+						die(3)
 				else:
 					for _ in range(count):
 						(rpos,) = struct.unpack("<Q", rd(8))
@@ -420,6 +523,7 @@ def _remote(nthreads):
 # an inline -c argument.
 remote_perl = '''
 use strict; use warnings;
+use IO::Handle;
 binmode STDIN; binmode STDOUT;
 
 my $HEADER_FMT     = 'Q< Q< Q< Q< Q< Q< C';
@@ -427,6 +531,8 @@ my $HEADER_SIZE    = 49;
 my ($MODE_PUSH, $MODE_PULL) = (0, 1);
 my $PUSH_PULL_MASK = 1;
 my $ALLOW_TRUNCATE = 2;
+my $DRY_RUN        = 4;
+my $BLKROGET       = 0x125E;
 
 sub r {
 	my $n = shift;
@@ -459,6 +565,7 @@ eval {
 	my ($size, $blocksize, $section_size, $start_offset,
 		$filename_len, $hashname_len, $mode_byte) = unpack($HEADER_FMT, $data);
 	my $allow_truncate = $mode_byte & $ALLOW_TRUNCATE;
+	my $dry_run        = $mode_byte & $DRY_RUN;
 	my $mode           = $mode_byte & $PUSH_PULL_MASK;
 
 	my $fn_bytes = r($filename_len);
@@ -474,6 +581,21 @@ eval {
 	unless (open($fh, $mode == $MODE_PUSH ? '+<:raw' : '<:raw', $fn_bytes)) {
 		print STDOUT pack('Q<', 0); STDOUT->flush; exit 1;
 	}
+
+	# See remote_script: a read-only block device opens for writing and then
+	# fails every write with EPERM.  BLKROGET is ENOTTY (undef here) on
+	# anything that is not a block device, so no S_ISBLK pre-check is needed.
+	if ($mode == $MODE_PUSH && !$dry_run && $^O eq 'linux') {
+		my $ro = pack('i', 0);
+		if (ioctl($fh, $BLKROGET, $ro) && unpack('i', $ro)) {
+			print STDERR "bscp-remote: $fn_bytes is a read-only block device (BLKROGET); refusing to write\\n";
+			print STDOUT pack('Q<', 0); STDOUT->flush; exit 4;
+		}
+	}
+	# Unbuffered writes so a failing device raises at the print below rather
+	# than at an unchecked implicit close.
+	$fh->autoflush(1) if $mode == $MODE_PUSH;
+
 	seek($fh, 0, 2);
 	my $remote_size = tell($fh);
 	print STDOUT pack('Q<', $remote_size); STDOUT->flush;
@@ -509,7 +631,13 @@ eval {
 				my $bl = $blocksize < $sync_size - $wpos ? $blocksize : $sync_size - $wpos;
 				my $blk = r($bl);
 				seek($fh, $wpos, 0);
-				print $fh $blk;
+				print $fh $blk or do {
+					print STDERR "bscp-remote: write failed at offset $wpos: $!\\n";
+					# Explicit close: the implicit one at exit would re-report
+					# the same failure as a perl warning on top of the message.
+					close($fh);
+					exit 3;
+				};
 			}
 		} else {
 			for (1..$count) {
@@ -727,6 +855,25 @@ def available_memory():
     except (AttributeError, ValueError, OSError):
         pass
     return 0
+
+
+def device_readonly(fileobj):
+    """True when `fileobj` is a Linux block device flagged read-only.
+
+    `losetup -r`, `blockdev --setro`, a read-only dm/md target or read-only
+    media all set this flag.  Such a device still accepts open(O_RDWR) —
+    only the writes fail, with EPERM — so the destination has to be probed
+    explicitly rather than trusting a successful open.  BLKROGET returns
+    ENOTTY for anything that is not a block device, hence no S_ISBLK
+    pre-check; any error at all means "cannot tell", i.e. proceed.
+    """
+    try:
+        if os.uname().sysname != 'Linux':
+            return False
+        res = fcntl.ioctl(fileobj.fileno(), BLKROGET, struct.pack('i', 0))
+        return struct.unpack('i', res)[0] != 0
+    except (AttributeError, OSError, struct.error):
+        return False
 
 
 def backing_disk(path):
@@ -1139,6 +1286,14 @@ def do_sync(local_file, remote_host, remote_file, mode,
         if block_count > 0:
             wire_size = min(wire_size, start_offset + block_count * blocksize)
 
+        # Symmetric with the remote's own check (see remote_script): on pull
+        # the local file is the destination, and a read-only block device
+        # would open fine and then fail every phase-B write with EPERM.
+        if mode == MODE_PULL and not dry_run and device_readonly(f):
+            raise RuntimeError('Local destination %s is a read-only block device '
+                               '(losetup -r / blockdev --setro); refusing to pull'
+                               % local_file)
+
         cmd  = build_ssh_cmd(remote_host, ssh_args)
         # bufsize=0 only when the watchdog is active: it bypasses Python's
         # BufferedReader on proc.stdout so select() on the raw fd is
@@ -1156,7 +1311,8 @@ def do_sync(local_file, remote_host, remote_file, mode,
         # authoritative (it sees the real local_size and the requested limit),
         # so set the wire-side ALLOW_TRUNCATE bit whenever -B caps wire_size.
         wire_truncate = allow_truncate or block_count > 0
-        mode_byte = mode | (ALLOW_TRUNCATE if wire_truncate else 0)
+        mode_byte = (mode | (ALLOW_TRUNCATE if wire_truncate else 0)
+                          | (DRY_RUN if dry_run else 0))
 
         def fail(msg):
             # Closing stdout too unblocks the remote if it is mid-stream on
@@ -1201,6 +1357,14 @@ def do_sync(local_file, remote_host, remote_file, mode,
             lost('Connection lost during handshake')
         (remote_size,) = struct.unpack('<Q', size_bytes)
         if remote_size == 0:
+            # The remote signals every open-stage refusal as size 0; its exit
+            # status says which one, so the read-only case gets its own
+            # message instead of the generic "not found".
+            _shutdown_proc(proc)
+            if proc.returncode == REMOTE_EXIT_READONLY:
+                raise RuntimeError('Remote destination %s is a read-only block device '
+                                   '(losetup -r / blockdev --setro); refusing to push'
+                                   % remote_file)
             fail('Remote file not found or inaccessible')
 
         # In push, remote is destination; in pull, remote is source.
@@ -1694,6 +1858,14 @@ def do_sync(local_file, remote_host, remote_file, mode,
             # addition to stdin unblocks the remote if it was stuck mid-write
             # — same rationale as fail() above.
             _shutdown_proc(proc)
+            # A remote that died on its own write is a permanent failure, not
+            # a dropped link: retrying re-scans the whole file and fails the
+            # same way.  The remote already named the offset and errno on its
+            # stderr, which ssh forwarded to this terminal.
+            if proc.returncode == REMOTE_EXIT_WRITE_ERROR:
+                raise RuntimeError('Remote write to %s failed (see the bscp-remote message '
+                                   'above) — destination read-only or failing; not retrying'
+                                   % remote_file) from exc
             raise ConnectionLost(last_sec_start) from exc
         except KeyboardInterrupt:
             # Mirror the BrokenPipeError path: close stdout too, otherwise a
@@ -1705,6 +1877,15 @@ def do_sync(local_file, remote_host, remote_file, mode,
             ex_hash.shutdown(wait=False)
 
         _shutdown_proc(proc)
+
+        # In push the client never reads during phase B, so a remote that dies
+        # on its own write goes unnoticed whenever the outstanding blocks still
+        # fit in the SSH pipe buffer — the transfer would be reported as a
+        # success.  Its exit status is the only evidence; check it before
+        # claiming the copy is done.
+        if proc.returncode == REMOTE_EXIT_WRITE_ERROR:
+            raise RuntimeError('Remote write to %s failed (see the bscp-remote message '
+                               'above) — destination read-only or failing' % remote_file)
 
     return io.in_total, io.out_total, sync_size, total_diffs, total_written, remote_size, total_scan_time, read_errors
 

@@ -66,6 +66,10 @@ Offset  Size  Field
                               bit 1: ALLOW_TRUNCATE flag (destination may
                                      be smaller than source; sync only the
                                      bytes that fit, i.e. use min size)
+                              bit 2: DRY_RUN flag (client will send a diff
+                                     count of 0 for every section; the
+                                     server writes nothing, and skips its
+                                     read-only-destination refusal)
 Total: 49 bytes
 ```
 
@@ -102,6 +106,12 @@ The server opens the remote file, seeks to the end, and writes its size as a
   means a legitimately empty (0-byte) remote file is indistinguishable from
   "not found" — known limitation.  The client treats `remote_size == 0` as
   an error and prints `Remote file not found or inaccessible`.
+- On push, the server also writes `0` and exits **4** when the destination is
+  a Linux block device flagged read-only (`BLKROGET`), unless `DRY_RUN` is
+  set.  Such a device accepts `open(O_RDWR)` and fails every write with
+  `EPERM`, so the check cannot be left to the open.  The exit status is what
+  distinguishes this from "not found" — it is out-of-band, not part of the
+  wire format (see §7).
 - In **push** the remote is the destination; in **pull** the remote is the
   source.  Without `ALLOW_TRUNCATE`, the server exits if the destination is
   smaller than the source (`dst_size < src_size`).
@@ -207,6 +217,31 @@ the full window before responding.
 
 After the section loop completes, the client closes the SSH stdin pipe.
 The server's stdin read returns EOF and it exits normally.
+
+### 5.1 Server exit status
+
+Failures the wire format cannot express are signalled by the server's exit
+status, which ssh passes through unchanged.  The client reads it after the
+pipes are closed:
+
+| Status | Meaning                                                          |
+| ------ | ---------------------------------------------------------------- |
+| `0`    | Normal completion                                                |
+| `1`    | Any other failure (bad handshake, size refusal, EOF, I/O error)  |
+| `3`    | A destination write (or the flush that follows it) failed        |
+| `4`    | Push refused: the destination is a read-only block device        |
+| `127`  | No python or perl on the remote (from the interpreter wrapper)   |
+| `255`  | ssh's own failure, never the server's                            |
+
+Statuses 3 and 4 are *permanent* failures: the client reports them as fatal
+errors rather than routing them through the connection-loss retry path.
+Status 3 has to be checked even after an apparently complete push — the
+client never reads during push phase B, so a server that died on its own
+write goes unnoticed whenever the outstanding blocks still fit in the SSH
+pipe buffer.  Because status 3 leaves the destination partially written, the
+server exits via `os._exit()` (Perl: an explicit `close`) so the failure is
+not re-raised by the interpreter's own close-time flush and buried under a
+traceback.
 
 ---
 

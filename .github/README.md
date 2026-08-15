@@ -212,7 +212,7 @@ tradeoff in mind.
 | Code  | Meaning                                                                  |
 | ----- | -------------------------------------------------------------------------|
 | `0`   | Transfer completed successfully (or dry-run finished).                   |
-| `1`   | Fatal error — remote file not accessible, size mismatch, or SSH failure. |
+| `1`   | Fatal error — remote file not accessible, destination read-only, size mismatch, failing write, or SSH failure. |
 | `2`   | Bad arguments or usage error.                                            |
 | `3`   | Connection lost — transfer incomplete; re-run with `--resume-from`.      |
 | `4`   | Verification mismatch — `--verify` found the local and remote b3sum digests differ. |
@@ -244,6 +244,29 @@ multi-threaded on both ends when the remote runs Python 3 (see
 
 The remote helper process is tagged `bscp-remote` on its command line, so
 `ps aux | grep bscp-remote` (or an htop search) finds it on the remote host.
+
+### Read-only destinations
+
+A Linux block device can be flagged read-only — `losetup -r`, `blockdev
+--setro`, a read-only device-mapper or MD target, read-only media — while its
+file permissions still say `rw`.  Such a device *opens* for writing without
+complaint and then fails every write with `EPERM`, so a permissions check is
+not enough.  Before the scan starts, the destination side asks the kernel
+directly (`BLKROGET`) and refuses up front:
+
+```
+bscp-remote: /dev/loop3 is a read-only block device (BLKROGET); refusing to write
+Error: Remote destination /dev/loop3 is a read-only block device
+       (losetup -r / blockdev --setro); refusing to push
+```
+
+`--dry-run` is exempt — it writes nothing, so it still reports the block
+difference against a read-only device.
+
+Should a write fail anyway (a device that turns read-only mid-transfer, a
+full thin pool, a dying disk), the destination side reports the offset and
+errno and exits; that is a **fatal** error, not a connection loss, so
+`--retries` does not re-scan the whole file only to fail the same way.
 
 See [PROTOCOL.md](../PROTOCOL.md) for the full wire-format specification.
 

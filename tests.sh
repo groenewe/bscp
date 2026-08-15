@@ -15,13 +15,14 @@
 #   ./tests.sh --force-all          # run every test even under a python2 client
 #
 # When $BSCP runs under a Python 2 interpreter (e.g. bscp.python2 where
-# `python` resolves to Python 2.x), twenty tests are skipped by default:
+# `python` resolves to Python 2.x), twenty-two tests are skipped by default:
 # the two --hash-threads tests (the option is python3-only by design), the
 # -a algorithm-rejection test (Py2's hashlib lacks the shake_* XOF functions
 # the test probes), the twelve --verify tests (the convenience b3sum
 # cross-check is not implemented in the python2 client), the
 # --ignore-read-errors test (the flag is python3-only for now), the two
-# local-to-local tests (that mode is python3-client only), and the two
+# read-only-destination tests and the two local-to-local tests (both rely on
+# local-to-local mode, which is python3-client only), and the two
 # -v/--check-tools tests (those flags are python3-client only).  The
 # BSCP_OPTIONS tests now run under python2 (the env var is honoured there
 # too).  Pass --force-all to run the skipped tests anyway.
@@ -59,6 +60,7 @@ test_verify_size_mismatch_compares test_verify_dryrun_zero_diff_runs test_verify
 test_verify_batch_mismatch_exit4 test_verify_batch_size_mismatch_ok test_verify_batch_unavailable_exit5 \
 test_verify_blockcount_compares test_verify_batch_blockcount_ok \
 test_verify_dryrun_blockcount_no_warning test_ignore_read_errors_pull \
+test_readonly_destination_refused test_remote_write_error_not_retried \
 test_local_to_local test_local_to_local_verify \
 test_verbose_reports_tools test_check_tools_no_copy"
 
@@ -739,6 +741,90 @@ if errs:
 PY
 }
 
+# Shim for the two read-only-destination tests below.  RO_MODE=ioctl fakes a
+# BLKROGET answer of 1 (what `losetup -r` gives) on RO_PATH; RO_MODE=write lets
+# the device look writable and fails every write() with EPERM, which is what a
+# read-only Linux block device actually does.  Both run against a local-to-local
+# copy, the only mode where the destination-side process inherits LD_PRELOAD
+# (ssh would not forward it).  Echoes the shim path; non-zero when unavailable.
+_ro_shim() {
+    command -v cc >/dev/null || return 1
+    local shim="$WORK/ro.so"
+    if [[ ! -f $shim ]]; then
+        cat > "$WORK/ro.c" <<'EOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <sys/ioctl.h>
+static int tgt_fd=-1; static char*tp; static char*tm;
+static void ini(void){static int d;if(d)return;d=1;tp=getenv("RO_PATH");tm=getenv("RO_MODE")?:"ioctl";}
+static int cap(const char*p,int fd){ini();if(fd>=0&&tp&&p&&!strcmp(p,tp))tgt_fd=fd;return fd;}
+int open64(const char*p,int fl,...){static int(*r)(const char*,int,...);if(!r)r=dlsym(RTLD_NEXT,"open64");mode_t m=0;if(fl&O_CREAT){va_list a;va_start(a,fl);m=va_arg(a,int);va_end(a);}return cap(p,r(p,fl,m));}
+int open(const char*p,int fl,...){static int(*r)(const char*,int,...);if(!r)r=dlsym(RTLD_NEXT,"open");mode_t m=0;if(fl&O_CREAT){va_list a;va_start(a,fl);m=va_arg(a,int);va_end(a);}return cap(p,r(p,fl,m));}
+int openat(int d,const char*p,int fl,...){static int(*r)(int,const char*,int,...);if(!r)r=dlsym(RTLD_NEXT,"openat");mode_t m=0;if(fl&O_CREAT){va_list a;va_start(a,fl);m=va_arg(a,int);va_end(a);}return cap(p,r(d,p,fl,m));}
+int openat64(int d,const char*p,int fl,...){static int(*r)(int,const char*,int,...);if(!r)r=dlsym(RTLD_NEXT,"openat64");mode_t m=0;if(fl&O_CREAT){va_list a;va_start(a,fl);m=va_arg(a,int);va_end(a);}return cap(p,r(d,p,fl,m));}
+int ioctl(int fd,unsigned long rq,...){static int(*r)(int,unsigned long,...);if(!r)r=dlsym(RTLD_NEXT,"ioctl");va_list a;va_start(a,rq);void*p=va_arg(a,void*);va_end(a);ini();if(fd==tgt_fd&&fd>=0&&rq==0x125E&&!strcmp(tm,"ioctl")){*(int*)p=1;return 0;}return r(fd,rq,p);}
+ssize_t write(int fd,const void*b,size_t n){static ssize_t(*r)(int,const void*,size_t);if(!r)r=dlsym(RTLD_NEXT,"write");ini();if(fd==tgt_fd&&fd>=0&&!strcmp(tm,"write")){errno=EPERM;return -1;}return r(fd,b,n);}
+EOF
+        cc -shared -fPIC -o "$shim" "$WORK/ro.c" -ldl 2>/dev/null || return 1
+    fi
+    echo "$shim"
+}
+
+# A read-only block device (losetup -r, blockdev --setro) still accepts
+# open(O_RDWR), so the destination side probes it with BLKROGET and refuses
+# before the scan.  A dry run must still be allowed through — it writes
+# nothing, which is what the DRY_RUN mode bit tells the remote.
+test_readonly_destination_refused() {
+    local shim; shim=$(_ro_shim) || return 0
+    make_src 4
+    copy_src_to "$DST"
+    randomise_in "$DST" 8 200
+    local before out rc
+    before=$(md5sum "$DST" | cut -d' ' -f1)
+    out=$(LD_PRELOAD="$shim" RO_PATH="$DST" RO_MODE=ioctl "$BSCP" "$SRC" "$DST" 2>&1)
+    rc=$?
+    out=${out//$'\r'/$'\n'}      # progress lines would overwrite the diagnostic
+    (( rc == 0 )) && return 0    # shim did not take effect on this libc
+    [[ $rc == 1 ]] || { echo "exit $rc (expected 1): $out"; return 1; }
+    grep -q 'read-only block device' <<<"$out" \
+        || { echo "no read-only message: $out"; return 1; }
+    [[ $before == $(md5sum "$DST" | cut -d' ' -f1) ]] \
+        || { echo "destination was written"; return 1; }
+    LD_PRELOAD="$shim" RO_PATH="$DST" RO_MODE=ioctl "$BSCP" -N "$SRC" "$DST" >/dev/null 2>&1 \
+        || { echo "dry run refused on a read-only destination"; return 1; }
+}
+
+# A write that fails mid-copy is permanent: the remote reports the offset and
+# errno on stderr and exits 3, and the client must turn that into a fatal
+# error instead of a retryable connection loss (which would re-scan the whole
+# file and fail identically, --retries times over).
+test_remote_write_error_not_retried() {
+    local shim; shim=$(_ro_shim) || return 0
+    make_src 4
+    copy_src_to "$DST"
+    randomise_in "$DST" 8 200
+    local out rc
+    out=$(LD_PRELOAD="$shim" RO_PATH="$DST" RO_MODE=write "$BSCP" -R 2 "$SRC" "$DST" 2>&1)
+    rc=$?
+    out=${out//$'\r'/$'\n'}      # progress lines would overwrite the diagnostic
+    (( rc == 0 )) && return 0    # shim did not take effect on this libc
+    [[ $rc == 1 ]] || { echo "exit $rc (expected fatal 1, not connection-lost 3): $out"; return 1; }
+    # Whether the failure lands on the write or on the flush that follows it
+    # depends on how much of the block the writer still held.
+    grep -qE 'bscp-remote: (write failed at offset|flush failed)' <<<"$out" \
+        || { echo "remote did not report the write failure: $out"; return 1; }
+    if grep -q 'retrying' <<<"$out"; then
+        echo "a permanent write failure was retried: $out"; return 1
+    fi
+    return 0
+}
+
 # --ignore-read-errors (experimental, pull only): a read error on the LOCAL
 # destination during the scan must NOT abort the pull — the unreadable block is
 # treated as a diff and overwritten from the (readable) remote source.  We
@@ -816,6 +902,8 @@ run "--hash-threads 1 pull (serial pool path)"       test_hash_threads_single_pu
 run "--allow-truncate push (smaller dst)"            test_allow_truncate_push
 run "--allow-truncate pull (smaller dst)"            test_allow_truncate_pull
 run "--ignore-read-errors pull repairs bad block"    test_ignore_read_errors_pull
+run "read-only destination refused before scan"      test_readonly_destination_refused
+run "remote write failure is fatal, not retried"     test_remote_write_error_not_retried
 run "--batch is silent on success and exits 0"       test_batch_silent_success
 run "--block-count prints next-offset resume hint"   test_block_count_continue
 run "-B accepts K/M/G byte-size suffix"              test_block_count_size_suffix

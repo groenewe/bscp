@@ -93,6 +93,14 @@ bscp (single file)
 │                        works under Nuitka onefile builds.  It runs on
 │                        python2/python and on a python3 reached only via the
 │                        `python` name (rare: no `python3` binary present).
+│                        On push it guards the destination twice, both via the
+│                        exit status (PROTOCOL.md §5.1, no wire change): a
+│                        BLKROGET probe before the scan refuses a read-only
+│                        block device (exit 4, skipped under the DRY_RUN bit),
+│                        and a failing phase-B write or per-section flush
+│                        reports offset+errno on stderr and leaves via
+│                        os._exit (exit 3).  Same in remote_script_mt and
+│                        remote_perl.  See docs/remote-execution.md.
 ├── remote_script_mt   — python3-only multi-threaded twin of remote_script.
 │                        Phase-A hashing fans out over a ThreadPoolExecutor
 │                        (reads stay sequential; only hashing parallelises).
@@ -141,6 +149,16 @@ bscp (single file)
 ├── ConnectionLost     — RuntimeError subclass carrying the section start
 │                        offset and an `interrupted` flag (True on Ctrl+C,
 │                        False on pipe error).  Used for resume reporting.
+├── device_readonly()  — BLKROGET (`ioctl 0x125E`) probe: True when the fd is a
+│                        Linux block device flagged read-only (losetup -r,
+│                        blockdev --setro, read-only dm/md/media).  Such a
+│                        device accepts open(O_RDWR) and fails every write with
+│                        EPERM, so a successful open proves nothing.  ENOTTY on
+│                        non-block fds (hence no S_ISBLK pre-check) and any
+│                        error means "cannot tell — proceed".  Used by do_sync
+│                        for the local destination on PULL; the three remote
+│                        bodies carry their own copy for the push destination.
+│                        See docs/remote-execution.md.
 ├── parse_size()       — converts "64K" / "10G" strings to integer bytes.
 ├── available_memory() — queries OS for available physical RAM via sysconf;
 │                        used to cap section size when --buffer is active.
@@ -282,6 +300,17 @@ bscp (single file)
 │                        element) for the closing note.  Push (local is source)
 │                        and write errors stay fatal; no protocol change — see
 │                        docs/ignore-read-errors.md.
+│                        On PULL the local file is the destination, so
+│                        device_readonly() refuses a read-only local block
+│                        device before the ssh spawn (the mirror of the
+│                        remote's own push-side check).  Both remote exit
+│                        statuses 3 and 4 are mapped to RuntimeError, never
+│                        ConnectionLost, so `--retries` cannot spin on a
+│                        permanent failure; status 3 is re-checked after the
+│                        section loop as well, because push never reads during
+│                        phase B and a remote that died on its own write is
+│                        otherwise invisible whenever the outstanding blocks
+│                        still fit in the SSH pipe buffer.
 └── __main__           — argparse, push/pull/local auto-detection, retry loop,
                          and the post-copy --verify orchestration (exit 4 on a
                          confirmed mismatch).  Direction is inferred from which
@@ -332,14 +361,19 @@ helper; the remote receives the raw `--hash-threads` value baked into its
 `-T 8` to a 4-core remote runs 4 threads there (and up to 8 on an 8-core
 client), and `0` lets each side auto-detect independently.
 
-`MODE_PUSH`, `MODE_PULL`, and `ALLOW_TRUNCATE` are also defined at module
-level for use throughout the client.  Because the remote runs from a string
+`MODE_PUSH`, `MODE_PULL`, `ALLOW_TRUNCATE`, and `DRY_RUN` are also defined at
+module level for use throughout the client.  `REMOTE_EXIT_WRITE_ERROR` (3) and
+`REMOTE_EXIT_READONLY` (4) name the remote exit statuses that mean "permanent
+failure" (see PROTOCOL.md §5.1); `BLKROGET` (`0x125E`) is the read-only ioctl.  Because the remote runs from a string
 literal extracted standalone on the remote host, any constants the remote
 needs must be **duplicated inside the script body** — the client module
 scope is not available there.  `HEADER_FMT`, `HEADER_SIZE`, `MODE_PUSH`,
-`MODE_PULL`, `PUSH_PULL_MASK`, and `ALLOW_TRUNCATE` are duplicated this way.
-The mask byte is split client-side into `mode | ALLOW_TRUNCATE`; the remote
-reverses this with `mode & PUSH_PULL_MASK` and `mode & ALLOW_TRUNCATE`.
+`MODE_PULL`, `PUSH_PULL_MASK`, `ALLOW_TRUNCATE`, and `DRY_RUN` are duplicated
+this way.  The mask byte is composed client-side as `mode | ALLOW_TRUNCATE |
+DRY_RUN`; the remote reverses this with `mode & PUSH_PULL_MASK`, `mode &
+ALLOW_TRUNCATE`, and `mode & DRY_RUN`.  The remote needs `DRY_RUN` only to
+skip its read-only-destination refusal — a dry run writes nothing, so it must
+still be able to scan a read-only device.
 
 ## Key protocol constants
 
@@ -350,7 +384,9 @@ reverses this with `mode & PUSH_PULL_MASK` and `mode & ALLOW_TRUNCATE`.
 | `MODE_PULL`      | `1`          | Push/pull bit in mode byte (bit 0)                                   |
 | `PUSH_PULL_MASK` | `1`          | Mask to extract push/pull bit from mode byte                         |
 | `ALLOW_TRUNCATE` | `2`          | Flag bit in mode byte (bit 1): allow destination smaller than source |
+| `DRY_RUN`        | `4`          | Flag bit in mode byte (bit 2): no writes coming; remote skips its read-only refusal |
 | `PULL_WINDOW`    | `128`        | Batch size for pull phase B (see docs/protocol-internals.md)         |
+| `BLKROGET`       | `0x125E`     | Linux ioctl: block device read-only flag (client + all three remotes) |
 
 ## Protocol summary
 
@@ -373,8 +409,8 @@ See `PROTOCOL.md` for the full wire-format spec.  Short version:
 
 ### Critical: keep client and remote constants in sync
 
-`HEADER_FMT`, `MODE_PUSH`, `MODE_PULL`, and `ALLOW_TRUNCATE` are defined in
-the client module **and** inside **both** remote Python strings
+`HEADER_FMT`, `MODE_PUSH`, `MODE_PULL`, `ALLOW_TRUNCATE`, and `DRY_RUN` are
+defined in the client module **and** inside **both** remote Python strings
 (`remote_script` and `remote_script_mt`) **and** the `remote_perl` string.
 `PUSH_PULL_MASK` lives only in the three remote bodies — the client composes
 the mode byte (`mode | ALLOW_TRUNCATE`) and never needs to split it.  Any
@@ -457,6 +493,8 @@ to cover, plus a few that were easy to forget:
 | `--hash-threads 4` push (multi-section)          | threaded phase-A feed/drain, digest wire order    |
 | `--hash-threads 1` pull (serial pool path)       | threaded path correct when degenerate to 1 worker |
 | `--ignore-read-errors` pull repairs bad block    | LD_PRELOAD EIO shim: fatal without flag; with flag pull overwrites the unreadable local block, warns, exits 0, dst == src |
+| read-only destination refused before scan        | LD_PRELOAD fakes BLKROGET=1: push exits 1 before writing anything, `-N` still scans (DRY_RUN bit) |
+| remote write failure is fatal, not retried       | LD_PRELOAD EPERM on write: remote names the offset, exits 3; client exits 1 without engaging `--retries` |
 | `--allow-truncate` push (smaller dst)            | both refusal-without-flag and warning-with-flag   |
 | `--allow-truncate` pull (smaller dst)            | symmetric pull behaviour                          |
 | `--batch` is silent on success and exits 0       | no stderr leakage; exit-code-only contract        |
@@ -506,14 +544,15 @@ them on exit.  Exit status is `0` on success, `1` if any test failed (with
 the failing names listed at the end), or `2` on missing prerequisites.
 
 When `$BSCP` runs under a Python 2 interpreter (detected from its shebang
-plus `python -V`), twenty tests are skipped by default and reported as
+plus `python -V`), twenty-two tests are skipped by default and reported as
 `skip`: the two `--hash-threads` tests (the option is python3-only), the
 `-a` algorithm-rejection test (Py2's `hashlib` lacks the `shake_*` XOF
 functions it probes), the twelve `--verify` tests (the convenience b3sum
 cross-check is not implemented in the python2 client, so the flag is
 unrecognised), the `--ignore-read-errors` test (the flag is python3-only
-for now), the two local-to-local tests (that mode is python3-client only;
-the python2 fallback client still rejects a no-HOST invocation), and the two
+for now), the two read-only-destination tests and the two local-to-local
+tests (all four run local-to-local, which is python3-client only; the
+python2 fallback client still rejects a no-HOST invocation), and the two
 `-v`/`--check-tools` tests (those flags are python3-client only).  The
 `exit 2 for remote-to-remote` test runs under both clients.  The two
 `BSCP_OPTIONS` tests run under the python2 client too (it now honours the

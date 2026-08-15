@@ -58,6 +58,45 @@ htop search locates the remote process on the destination host.  It applies
 to all three variants (python3/MT, python2/legacy, perl).  Keep it the last
 token of each branch; a protocol/dispatch change must preserve it.
 
+## Read-only destinations and write failures
+
+All three remote bodies run the same two guards on a push, and both are
+reported through the exit status (see PROTOCOL.md §5.1) rather than the wire
+format, so no protocol version is involved:
+
+- **Before the scan** (exit **4**): a Linux block device carrying the
+  read-only flag — `losetup -r`, `blockdev --setro`, a read-only dm/MD
+  target, read-only media — still returns a usable fd from
+  `open(O_RDWR)`; `blkdev_write_iter()` rejects the *writes* with `EPERM`.
+  A successful open therefore proves nothing, and the destination has to be
+  asked directly: `ioctl(fd, BLKROGET)` (`0x125E`), non-zero meaning
+  read-only.  The ioctl returns `ENOTTY` on anything that is not a block
+  device, which is why no `S_ISBLK` pre-check is needed, and any error at
+  all is read as "cannot tell — proceed".  The probe is Linux-only
+  (`uname` / `$^O`) so the number is never issued to a foreign kernel's
+  ioctl table.  It is skipped when the `DRY_RUN` mode bit is set: a dry run
+  writes nothing, so it must still be able to report the block difference
+  against a read-only device.  A regular file on a read-only mount needs no
+  probe — there the `open('rb+')` itself fails, which is the pre-existing
+  exit-1 path.
+- **During phase B** (exit **3**): the write, and the per-section `flush()`
+  that follows it (a block smaller than the writer's buffer would otherwise
+  surface its error only at close, past every handler and silent under
+  `--batch`), report the offset and errno on stderr — which ssh forwards to
+  the client terminal — and leave via `os._exit()`.  A plain `sys.exit()`
+  would re-raise the same error out of the file object's close-time flush
+  and bury the status under a traceback; the Perl body closes the handle
+  explicitly for the same reason, since its implicit close would otherwise
+  print a second warning over the message.
+
+Both statuses mean "permanent": the client turns them into fatal errors
+instead of `ConnectionLost`, so `--retries` does not re-scan the whole
+device only to fail identically at the same offset.
+
+The client applies the same `BLKROGET` probe to *its* side (`device_readonly()`)
+when the local file is the destination — i.e. on pull — mirroring the
+symmetric size checks.
+
 ## Multi-threaded hashing (`--hash-threads`)
 
 On fast storage (NVMe, or any local/loopback transfer) the scan phase is
