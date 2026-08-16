@@ -86,10 +86,21 @@ prefix that fits.
 
 ### Options
 
-| Flag                          | Default  | Description                                                                                                      |
+<!-- The &nbsp; run padding the "Flag" header is deliberate — please keep it.
+     GFM has no column-width syntax, and GitHub's sanitizer strips `style`,
+     `<colgroup>`/`<col>`, and width attributes, so there is no supported way
+     to size a column.  GitHub renders tables as `width: max-content;
+     max-width: 100%`, so the very long Description cells squeeze the Flag
+     column until flag names wrap mid-word.  An unbreakable run of &nbsp; in
+     the header raises that column's min-content width, which auto table
+     layout must honour.  The padding is in the header on purpose: putting
+     non-breaking characters inside the flag names themselves would look the
+     same but break copy-pasting a flag into a shell. -->
+
+| Flag&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; | Default  | Description                                                                                                      |
 | ----------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------- |
 | `-b SIZE` / `--block-size`    | `64K`    | Comparison/transfer granularity. Supports `K`/`M`/`G`/`T` suffixes.                                              |
-| `-s SIZE` / `--section-size`  | `10G`    | File is processed in sections of this size. Bounds peak memory to roughly `diff_blocks_per_section × blocksize`. |
+| `-s SIZE` / `--section-size`  | `10G`    | File is processed in sections of this size. This is a real memory knob **only under `--buffer`** (push), where peak memory is roughly `diff_blocks_per_section × blocksize`. By default — and always on pull — a section retains just the 8-byte *offsets* of its differing blocks, so section size has almost no effect on memory; see [Memory use](#memory-use). |
 | `-a ALGO` / `--algorithm`     | `sha256` | Hash algorithm. `md5`, `sha1`, `sha224`, `sha256`, `sha384`, `sha512` work on every remote (python3/python2/Perl). Other `hashlib` algorithms (`sha3_256`, `blake2b`, …) need a python3/python2 remote with that algorithm; the Perl remote supports only the six portable ones. `bscp -h` lists the full set available on the local host. |
 | `-r OFFSET` / `--resume-from` | `0`      | Skip ahead to this byte offset, or to `NN%` / `NN.N%` of the local file (rounded down to a section boundary).    |
 | `-R N` / `--retries`          | `3`      | Automatically retry on connection failure, up to N times, with exponential back-off (`0` disables).              |
@@ -140,7 +151,8 @@ bscp --check-tools /dev/sda myhost:/dev/sda
 bscp -v /dev/sda myhost:/dev/sda
 
 # Use a smaller section size to limit memory on a constrained host
-bscp -s 1G /dev/sda myhost:/dev/sda
+# (only matters with --buffer; the default scan is already frugal)
+bscp --buffer -s 1G /dev/sda myhost:/dev/sda
 
 # Resume an interrupted push from where it failed
 bscp --resume-from 42949672960 /dev/sda myhost:/dev/sda
@@ -234,9 +246,7 @@ For each **section** of the file:
      reads and streams back the corresponding blocks; the local side writes
      them.
 
-Only differing blocks are transferred.  The section loop keeps peak memory
-proportional to the number of differing blocks in one section rather than
-the entire file.
+Only differing blocks are transferred.
 
 Block hashing — the CPU-bound part of the scan on fast storage — is
 multi-threaded on both ends when the remote runs Python 3 (see
@@ -244,6 +254,28 @@ multi-threaded on both ends when the remote runs Python 3 (see
 
 The remote helper process is tagged `bscp-remote` on its command line, so
 `ps aux | grep bscp-remote` (or an htop search) finds it on the remote host.
+
+### Memory use
+
+Phase A never accumulates hashes.  Each remote digest is read off the pipe,
+compared against the locally computed one, and dropped, so a section's size
+does not translate into a table of digests.  What survives the comparison
+differs by mode:
+
+| Mode                        | Retained per section                | 10 G section, 64 K blocks       |
+| --------------------------- | ----------------------------------- | ------------------------------- |
+| Push (default) and **pull** | the offset of each differing block  | ~65 KiB at 1 % diff; ~6 MiB if *every* block differs |
+| Push with `--buffer`        | offset **and block** of each differing block | up to the whole section (10 G) |
+
+On top of that, the scan holds a fixed window of in-flight blocks —
+`2 × --hash-threads` of them, so at most 512 KiB with the default 64 K block
+size and the auto thread cap of 4.  It does not grow with the section size.
+
+So `-s` is a memory knob only under `--buffer`, which is also the only mode
+that clamps it automatically (to half of available RAM, and off entirely
+below 4 MiB free).  Otherwise `-s` is a *resume granularity* knob: `-r`
+rounds down to a section boundary, so a smaller section loses less work when
+a transfer is interrupted, at the cost of one extra round trip per section.
 
 ### Read-only destinations
 
@@ -381,8 +413,8 @@ replacing failing hardware — many read errors mean the device is dying.  See
 | Push and pull          | ✓                | Push only    | ✓       |
 | Default hash           | SHA-256          | MD5          | MD4/MD5 |
 | Resume support         | ✓                | —            | Partial |
-| Memory bounded (default / pull) | ✓ (≈ section size ÷ 2048: only 32-byte hashes held, not blocks) | — | — |
-| Memory bounded (`--buffer` push) | ✓ (section size: diff blocks held in RAM) | — | — |
+| Memory bounded (default / pull) | ✓ (only the offsets of differing blocks — hashes are compared and dropped) | — | — |
+| Memory bounded (`--buffer` push) | ✓ (up to section size: diff blocks held in RAM) | — | — |
 
 ## Credits
 
